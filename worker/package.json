@@ -1,0 +1,8 @@
+{
+  "name": "worker",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "echo 'Worker has not been implemented yet.' && exit 1"
+  }
+}
