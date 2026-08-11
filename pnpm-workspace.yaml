@@ -2,3 +2,5 @@ packages:
   - "apps/*"
   - "packages/*"
   - "worker"
+allowBuilds:
+  sharp: true

@@ -6,8 +6,10 @@
     "docker:up": "docker compose -f infra/docker-compose.yml up -d",
     "docker:down": "docker compose -f infra/docker-compose.yml down",
     "docker:logs": "docker compose -f infra/docker-compose.yml logs -f",
-    "dev": "echo 'Next.js web app has not been scaffolded yet.' && exit 1",
-    "worker": "echo 'Worker has not been implemented yet.' && exit 1",
-    "typecheck": "echo 'Typecheck has not been configured yet.' && exit 1"
+    "dev": "pnpm --filter @analytics/web dev",
+    "build": "pnpm --filter @analytics/web build",
+    "start": "pnpm --filter @analytics/web start",
+    "typecheck": "pnpm --filter @analytics/web typecheck",
+    "worker": "echo 'Worker has not been implemented yet.' && exit 1"
   }
 }
