@@ -2,21 +2,33 @@
   "name": "@analytics/web",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "payload": "payload",
+    "generate:importmap": "payload generate:importmap",
+    "generate:types": "payload generate:types",
+    "seed:admin": "node --env-file=.env.local --import tsx scripts/seed-admin.ts"
   },
   "dependencies": {
-    "next": "^15.1.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "@payloadcms/db-postgres": "3.87.1",
+    "@payloadcms/next": "3.87.1",
+    "@payloadcms/ui": "3.87.1",
+    "graphql": "^16.8.1",
+    "next": "~15.4.11",
+    "payload": "3.87.1",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.0"
   }
 }

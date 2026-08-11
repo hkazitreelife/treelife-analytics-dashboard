@@ -3,6 +3,8 @@ dist/
 build/
 .next/
 .payload/
+apps/web/media/
+apps/web/.payload/
 .env
 .env.local
 .env.production
