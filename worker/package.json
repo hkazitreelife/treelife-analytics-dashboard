@@ -2,7 +2,25 @@
   "name": "worker",
   "private": true,
   "version": "0.1.0",
+  "type": "module",
   "scripts": {
-    "dev": "echo 'Worker has not been implemented yet.' && exit 1"
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@analytics/shared": "workspace:*",
+    "@payloadcms/db-postgres": "3.87.1",
+    "bullmq": "^6.0.10",
+    "dotenv": "^17.4.2",
+    "ioredis": "^6.0.0",
+    "payload": "3.87.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
   }
 }

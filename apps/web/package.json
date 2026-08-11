@@ -14,15 +14,19 @@
     "seed:admin": "node --env-file=.env.local --import tsx scripts/seed-admin.ts"
   },
   "dependencies": {
+    "@analytics/shared": "workspace:*",
     "@payloadcms/db-postgres": "3.87.1",
     "@payloadcms/next": "3.87.1",
     "@payloadcms/ui": "3.87.1",
+    "bullmq": "^6.0.10",
     "graphql": "^16.8.1",
+    "ioredis": "^6.0.0",
     "next": "~15.4.11",
     "payload": "3.87.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-    "sharp": "^0.34.5"
+    "sharp": "^0.34.5",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

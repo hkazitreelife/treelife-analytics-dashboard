@@ -4,4 +4,7 @@ packages:
   - "worker"
 allowBuilds:
   esbuild: true
+  # Optional native accelerator for msgpackr (pulled in by bullmq). The pure-JS
+  # path is functionally identical, so the native build is declined.
+  msgpackr-extract: false
   sharp: true

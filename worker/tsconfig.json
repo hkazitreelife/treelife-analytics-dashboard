@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    // The worker imports apps/web/payload.config.ts so both processes share one
+    // Payload config. That file is outside this package, so no rootDir is set
+    // and nothing is emitted; the worker runs from source via tsx.
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@payload-config": ["../apps/web/payload.config.ts"]
+    }
+  },
+  "include": ["src"]
+}
