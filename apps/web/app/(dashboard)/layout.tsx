@@ -8,6 +8,10 @@ import "./globals.css";
  * (payload)/layout.tsx's Payload RootLayout already renders a full
  * <html>/<body> on its own, and a shared root layout on top of that
  * produced a nested <html> hydration error on every /admin page.
+ *
+ * suppressHydrationWarning on both tags: same reasoning as
+ * (site)/layout.tsx -- browser extensions inject attributes into
+ * <html>/<body> before React hydrates, which isn't a real mismatch.
  */
 
 export const metadata = {
@@ -21,8 +25,8 @@ export default function DashboardLayout({
   children: ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body>
+    <html lang="en" suppressHydrationWarning>
+      <body suppressHydrationWarning>
         <div className="dashboard-root">{children}</div>
       </body>
     </html>

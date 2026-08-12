@@ -13,6 +13,15 @@ import type { ReactNode } from "react";
  * styles only), the same convention it already used before this fix.
  * (dashboard)'s Tailwind globals.css is scoped to (dashboard) only, exactly
  * as its own comment already documented -- unrelated to this fix.
+ *
+ * suppressHydrationWarning on both tags: browser extensions (seen so far --
+ * a "data-qb-installed" attribute, Grammarly's data-gr-ext-installed /
+ * data-new-gr-c-s-check-loaded on other pages) inject attributes into
+ * <html>/<body> before React hydrates. That's not a real mismatch -- it's
+ * not code here doing a server/client branch, random values, or bad
+ * nesting -- so it's suppressed at the two elements extensions actually
+ * touch, the same fix (payload.config.ts's admin.suppressHydrationWarning)
+ * already applies to Payload's own <html> tag on /admin.
  */
 
 export const metadata = {
@@ -22,8 +31,8 @@ export const metadata = {
 
 export default function SiteLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="en" suppressHydrationWarning>
+      <body suppressHydrationWarning>{children}</body>
     </html>
   );
 }
