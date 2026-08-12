@@ -6,7 +6,7 @@ import {
   redisConnectionOptions,
   type IngestionJobData,
 } from "@analytics/shared";
-import { Worker, type Job } from "bullmq";
+import { Worker } from "bullmq";
 import dotenv from "dotenv";
 import { Redis } from "ioredis";
 
@@ -34,46 +34,45 @@ const requireEnv = (name: string): string => {
 // bullmq 6 treats ioredis as an optional peer and cannot require it lazily from
 // a native ESM context, so the client is constructed here and passed in.
 const connection = new Redis(requireEnv("REDIS_URL"), redisConnectionOptions);
+const geminiApiKey = requireEnv("GEMINI_API_KEY");
 
 const { getPayload } = await import("payload");
 const { default: config } = await import("@payload-config");
+const { createGeminiClient } = await import("./services/gemini");
+const { processIngestionJob } = await import("./processors/ingestion");
 
 const payload = await getPayload({ config });
+const gemini = createGeminiClient(geminiApiKey);
 
-const process_ = async (job: Job<IngestionJobData>): Promise<void> => {
-  const { jobId } = job.data;
-
-  await payload.update({
-    collection: "jobs",
-    id: jobId,
-    data: { status: "processing" },
-  });
-
-  // Placeholder for the ingestion pipeline. Gemini extraction, validation and
-  // Claude config generation are added in later phases.
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-  await payload.update({
-    collection: "jobs",
-    id: jobId,
-    data: {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-    },
-  });
-
-  const jobRecord = await payload.findByID({
-    collection: "jobs",
-    id: jobId,
-    depth: 0,
-  });
-
-  if (jobRecord.dataset !== null && jobRecord.dataset !== undefined) {
+const recordFailure = async (
+  data: IngestionJobData,
+  message: string,
+): Promise<void> => {
+  try {
     await payload.update({
-      collection: "datasets",
-      id: jobRecord.dataset as number | string,
-      data: { status: "ready" },
+      collection: "jobs",
+      id: data.jobId,
+      data: { status: "failed", error: message },
     });
+
+    const jobRecord = await payload.findByID({
+      collection: "jobs",
+      id: data.jobId,
+      depth: 0,
+    });
+
+    // The Dataset is marked failed so nothing presents as complete, but its
+    // data, tableNames and totalRows are deliberately left untouched. A failed
+    // parse must never overwrite a working dataset.
+    if (jobRecord.dataset !== null && jobRecord.dataset !== undefined) {
+      await payload.update({
+        collection: "datasets",
+        id: jobRecord.dataset,
+        data: { status: "failed" },
+      });
+    }
+  } catch (updateError: unknown) {
+    payload.logger.error({ err: updateError }, "Could not record job failure.");
   }
 };
 
@@ -81,45 +80,19 @@ const worker = new Worker<IngestionJobData>(
   INGESTION_QUEUE_NAME,
   async (job) => {
     try {
-      await process_(job);
+      await processIngestionJob(job.data, { payload, gemini });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 
-      // A failed job must stay visible and must never leave a dataset looking
-      // complete. The previous dataset data is left untouched.
-      try {
-        await payload.update({
-          collection: "jobs",
-          id: job.data.jobId,
-          data: { status: "failed", error: message },
-        });
-
-        const jobRecord = await payload.findByID({
-          collection: "jobs",
-          id: job.data.jobId,
-          depth: 0,
-        });
-
-        if (jobRecord.dataset !== null && jobRecord.dataset !== undefined) {
-          await payload.update({
-            collection: "datasets",
-            id: jobRecord.dataset as number | string,
-            data: { status: "failed" },
-          });
-        }
-      } catch (updateError: unknown) {
-        payload.logger.error(
-          { err: updateError },
-          "Could not record job failure.",
-        );
-      }
+      await recordFailure(job.data, message);
 
       throw error;
     }
   },
   {
     connection,
-    // One job at a time keeps two uploads for the same dataset from racing.
+    // One job at a time. Note: this is process-level serialization, not a
+    // per-dataset lock. See report notes for Phase 4.
     concurrency: 1,
   },
 );

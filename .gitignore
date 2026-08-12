@@ -15,3 +15,7 @@ coverage/
 pnpm-debug.log*
 postgres_data/
 redis_data/
+
+# Local acceptance fixture and transient process logs
+treelife-fy27-demo-dataset-v2.xlsx
+*.pid

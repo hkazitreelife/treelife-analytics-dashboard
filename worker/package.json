@@ -11,11 +11,13 @@
   },
   "dependencies": {
     "@analytics/shared": "workspace:*",
+    "@google/genai": "^2.16.0",
     "@payloadcms/db-postgres": "3.87.1",
     "bullmq": "^6.0.10",
     "dotenv": "^17.4.2",
     "ioredis": "^6.0.0",
     "payload": "3.87.1",
+    "xlsx": "^0.18.5",
     "zod": "^4.4.3"
   },
   "devDependencies": {

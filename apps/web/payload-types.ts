@@ -190,6 +190,18 @@ export interface Dataset {
       }[]
     | null;
   totalRows?: number | null;
+  /**
+   * The normalized dataset: exactly the tables[] and relationships[] arrays from the Section 14 contract. Written only after full validation succeeds.
+   */
+  data?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
   createdBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;
@@ -388,6 +400,7 @@ export interface DatasetsSelect<T extends boolean = true> {
         id?: T;
       };
   totalRows?: T;
+  data?: T;
   createdBy?: T;
   updatedAt?: T;
   createdAt?: T;

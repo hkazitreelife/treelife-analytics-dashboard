@@ -51,6 +51,14 @@ export const Datasets: CollectionConfig = {
       defaultValue: 0,
     },
     {
+      name: "data",
+      type: "json",
+      admin: {
+        description:
+          "The normalized dataset: exactly the tables[] and relationships[] arrays from the Section 14 contract. Written only after full validation succeeds.",
+      },
+    },
+    {
       name: "createdBy",
       type: "relationship",
       relationTo: "users",

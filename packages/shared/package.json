@@ -7,5 +7,8 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "echo 'Shared typecheck will be configured after TypeScript dependencies are added.' && exit 0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }

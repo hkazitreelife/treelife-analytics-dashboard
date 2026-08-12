@@ -71,34 +71,45 @@ export async function POST(request: Request): Promise<Response> {
   const datasetName = baseNameWithoutExtension(uploaded.name);
 
   try {
-    const duplicate = await payload.find({
+    // A matching hash alone is not a duplicate. The prior upload counts only if
+    // it actually finished: a completed Job with a Dataset attached. An
+    // abandoned collision flow leaves a File row behind with no completed Job,
+    // and that must be treated as a fresh candidate rather than silently
+    // short-circuited into a duplicate.
+    const hashMatches = await payload.find({
       collection: "files",
       where: { sha256: { equals: hash } },
-      limit: 1,
+      limit: 100,
       depth: 0,
     });
 
-    const duplicateFile = duplicate.docs[0];
-
-    if (duplicateFile) {
-      const owningDataset = await payload.find({
-        collection: "datasets",
-        where: { currentFileHash: { equals: hash } },
+    for (const candidate of hashMatches.docs) {
+      const completedJob = await payload.find({
+        collection: "jobs",
+        where: {
+          and: [
+            { file: { equals: candidate.id } },
+            { status: { equals: "completed" } },
+            { dataset: { exists: true } },
+          ],
+        },
         limit: 1,
         depth: 0,
       });
 
-      return Response.json(
-        {
-          status: "duplicate_noop",
-          fileId: String(duplicateFile.id),
-          existingDatasetId: owningDataset.docs[0]
-            ? String(owningDataset.docs[0].id)
-            : null,
-          message: "File already processed.",
-        },
-        { status: 200 },
-      );
+      const job = completedJob.docs[0];
+
+      if (job?.dataset !== null && job?.dataset !== undefined) {
+        return Response.json(
+          {
+            status: "duplicate_noop",
+            fileId: String(candidate.id),
+            existingDatasetId: String(job.dataset),
+            message: "File already processed.",
+          },
+          { status: 200 },
+        );
+      }
     }
 
     const created = await payload.create({
