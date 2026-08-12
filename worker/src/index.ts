@@ -35,14 +35,17 @@ const requireEnv = (name: string): string => {
 // a native ESM context, so the client is constructed here and passed in.
 const connection = new Redis(requireEnv("REDIS_URL"), redisConnectionOptions);
 const geminiApiKey = requireEnv("GEMINI_API_KEY");
+const anthropicApiKey = requireEnv("ANTHROPIC_API_KEY");
 
 const { getPayload } = await import("payload");
 const { default: config } = await import("@payload-config");
 const { createGeminiClient } = await import("./services/gemini");
+const { createClaudeConfigClient } = await import("./services/claudeConfig");
 const { processIngestionJob } = await import("./processors/ingestion");
 
 const payload = await getPayload({ config });
 const gemini = createGeminiClient(geminiApiKey);
+const claude = createClaudeConfigClient(anthropicApiKey);
 
 const recordFailure = async (
   data: IngestionJobData,
@@ -80,7 +83,7 @@ const worker = new Worker<IngestionJobData>(
   INGESTION_QUEUE_NAME,
   async (job) => {
     try {
-      await processIngestionJob(job.data, { payload, gemini });
+      await processIngestionJob(job.data, { payload, gemini, claude });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 

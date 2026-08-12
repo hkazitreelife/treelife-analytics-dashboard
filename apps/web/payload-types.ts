@@ -235,7 +235,8 @@ export interface Config1 {
     | number
     | boolean
     | null;
-  generatedBy?: (number | null) | User;
+  generatedBy: 'initial_auto_generation' | 'prompt_edit';
+  editedBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;
 }
@@ -415,6 +416,7 @@ export interface ConfigsSelect<T extends boolean = true> {
   config?: T;
   insights?: T;
   generatedBy?: T;
+  editedBy?: T;
   updatedAt?: T;
   createdAt?: T;
 }

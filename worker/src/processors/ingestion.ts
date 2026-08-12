@@ -3,11 +3,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  CONFIG_SOURCE,
+  dashboardConfigSchema,
   readIngestionLimits,
+  type DashboardConfigShape,
   type IngestionJobData,
   type NormalizedDatasetShape,
+  type NormalizedTableShape,
 } from "@analytics/shared";
 import type { Payload } from "payload";
+
+import {
+  buildDatasetMetadata,
+  ClaudeBillingError,
+  ClaudeValidationError,
+  findUnknownReferences,
+  type ClaudeConfigClient,
+} from "../services/claudeConfig";
 
 import {
   GeminiBillingError,
@@ -59,11 +71,14 @@ const MEDIA_DIR = path.resolve(
  * notably GeminiBillingError, network failures and invalid keys, is not.
  */
 export const isOutputQualityFailure = (error: unknown): boolean =>
-  error instanceof GeminiValidationError || error instanceof MergeError;
+  error instanceof GeminiValidationError ||
+  error instanceof MergeError ||
+  error instanceof ClaudeValidationError;
 
 export type IngestionDeps = {
   payload: Payload;
   gemini: GeminiClient;
+  claude: ClaudeConfigClient;
   mediaDir?: string;
 };
 
@@ -159,11 +174,115 @@ const inferAndMerge = async (
   }
 };
 
+/**
+ * Config generation, with the same error-type discipline as the Gemini step: a
+ * schema or reference violation earns one stronger retry, a request or billing
+ * failure fails fast.
+ */
+const generateConfig = async (
+  claude: ClaudeConfigClient,
+  datasetId: string,
+  datasetName: string,
+  tables: NormalizedTableShape[],
+  relationships: unknown[],
+  logger: Payload["logger"],
+): Promise<DashboardConfigShape> => {
+  // Rows are read only to compute aggregates; only aggregates leave this call.
+  const metadata = buildDatasetMetadata(
+    datasetId,
+    datasetName,
+    tables,
+    relationships,
+  );
+
+  /**
+   * Validated here as well as inside the client. The client validates so a bad
+   * response never escapes it; this validates so nothing invalid can reach the
+   * Configs write regardless of which client implementation is in use. Storage
+   * is the invariant that matters, so the check belongs next to it too.
+   */
+  const attempt = async (
+    stricterInstruction?: string,
+  ): Promise<DashboardConfigShape> => {
+    const raw = await claude.generateConfig(
+      metadata,
+      tables,
+      stricterInstruction ? { stricterInstruction } : undefined,
+    );
+
+    const parsed = dashboardConfigSchema.safeParse(raw);
+
+    if (!parsed.success) {
+      throw new ClaudeValidationError(
+        `Config failed schema validation before storage: ${JSON.stringify(parsed.error.issues)}`,
+      );
+    }
+
+    const problems = findUnknownReferences(parsed.data, tables);
+
+    if (problems.length > 0) {
+      throw new ClaudeValidationError(
+        `Config references names absent from the dataset: ${problems.join("; ")}`,
+      );
+    }
+
+    return parsed.data;
+  };
+
+  try {
+    return await attempt();
+  } catch (firstError: unknown) {
+    if (!isOutputQualityFailure(firstError)) {
+      if (firstError instanceof ClaudeBillingError) {
+        throw firstError;
+      }
+
+      throw new IngestionError(
+        `Config generation first-call failure, no retry attempted: ${
+          firstError instanceof Error ? firstError.message : String(firstError)
+        }`,
+      );
+    }
+
+    const violation =
+      firstError instanceof Error ? firstError.message : String(firstError);
+
+    logger.warn(
+      `Config failed validation, retrying once on model "${claude.retryModelName}". Violation: ${violation}`,
+    );
+
+    const stricter = [
+      `The exact violation was: ${violation}`,
+      "Every sourceTable must be a table name from the metadata, verbatim.",
+      "Every entry in fields must be a column name that exists in that table,",
+      "verbatim. Emit no keys beyond those in the tool schema. Provide at least",
+      "one tab. Call emit_dashboard_config exactly once.",
+    ].join(" ");
+
+    try {
+      return await attempt(stricter);
+    } catch (secondError: unknown) {
+      if (secondError instanceof ClaudeBillingError) {
+        throw secondError;
+      }
+
+      const detail =
+        secondError instanceof Error
+          ? secondError.message
+          : String(secondError);
+
+      throw new IngestionError(
+        `Config generation failed validation twice, second attempt used ANTHROPIC_RETRY_MODEL "${claude.retryModelName || "unset, fell back to the primary model"}". First violation: ${violation} Second failure: ${detail}`,
+      );
+    }
+  }
+};
+
 export const processIngestionJob = async (
   data: IngestionJobData,
   deps: IngestionDeps,
 ): Promise<void> => {
-  const { payload, gemini } = deps;
+  const { payload, gemini, claude } = deps;
   const mediaDir = deps.mediaDir ?? MEDIA_DIR;
   const limits = readIngestionLimits();
 
@@ -247,6 +366,36 @@ export const processIngestionJob = async (
       currentFile: fileRecord.id,
       currentFileHash: data.fileHash,
       status: "ready",
+    },
+  });
+
+  // Config generation is part of this pipeline, not a separate trigger, so the
+  // job stays open until a Config exists. A dataset that is ready with no
+  // dashboard is exactly the half-finished state Section 7.6 forbids presenting
+  // as complete.
+  const datasetRecord = await payload.findByID({
+    collection: "datasets",
+    id: datasetId,
+    depth: 0,
+  });
+
+  const config = await generateConfig(
+    claude,
+    datasetId,
+    datasetRecord.name,
+    normalized.tables,
+    normalized.relationships,
+    payload.logger,
+  );
+
+  await payload.create({
+    collection: "configs",
+    data: {
+      dataset: Number(datasetId),
+      version: 1,
+      config,
+      insights: config.insights,
+      generatedBy: CONFIG_SOURCE.initialAutoGeneration,
     },
   });
 

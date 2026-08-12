@@ -112,6 +112,15 @@ const main = async (): Promise<void> => {
         payload,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         gemini: brokenGemini as any,
+        // Never reached: the merge fails before config generation starts.
+        claude: {
+          primaryModel: "unused",
+          retryModelName: "unused",
+          generateConfig: async () => {
+            throw new Error("Claude must not be called when the merge fails.");
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         mediaDir: path.resolve(process.cwd(), "media"),
       },
     );

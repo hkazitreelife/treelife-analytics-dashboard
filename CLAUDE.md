@@ -49,7 +49,19 @@ This split is structural, not stylistic. Changing it requires approval.
 
 Gemini does extraction only: file type, tables, header rows, column types, sample values, rows, candidate relationships. It emits the normalized JSON contract (spec 14) and nothing else. No chart recommendations, no insights, no markdown, no code fences.
 
-Claude does interpretation only: dashboard config generation (spec 15 contract), insights, chat answers, and prompt-driven config edits. Claude never parses raw files and never writes to `Datasets`, `Files`, `Jobs`, or `Users`. Claude normally receives metadata (table names, column names, inferred types, sample values, row counts, relationships, aggregates), not full raw rows.
+Claude does interpretation only: dashboard config generation (spec 15 contract), insights, chat answers, and prompt-driven config edits. Claude never parses raw files and never writes to `Datasets`, `Files`, `Jobs`, or `Users`. Claude receives metadata (table names, column names, inferred types, sample values, row counts, table roles, relationships, aggregates), never full raw rows. There is no preview-row exception for Claude: it has no structural need to see rows.
+
+### The previewRows exception, and its exact limits
+
+Gemini's structural inference call may receive up to 6 raw preview rows per table (`PREVIEW_ROW_COUNT` in `worker/src/services/spreadsheetParser.ts`), in addition to the column-name and up-to-five-sample-value payload. Locating the header row is impossible without seeing rows, because real files put titles and prose above the header, so row 1 cannot be assumed to be the header.
+
+This is the sole permitted exception to "Gemini never receives row data". Its limits are deliberate and narrow:
+
+- The preview is used only to determine `headerRowIndex`. Nothing else may read it.
+- It stays a small fixed constant. It must never scale with table size, row count, or column count.
+- It does not extend to Claude, to the chat pathway, or to any other model call.
+
+Any future change that sends more rows to any model, for any reason, requires editing this paragraph deliberately. Do not widen the exception silently, and do not treat "the model would classify better with more rows" as sufficient justification.
 
 ### The two contracts
 
