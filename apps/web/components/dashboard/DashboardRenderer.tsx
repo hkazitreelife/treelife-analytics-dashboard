@@ -188,6 +188,18 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     | { kind: "error"; message: string }
   >({ kind: "idle" });
 
+  // Section 17: read-only chat. Same minimal shape as the prompt-edit
+  // control above -- an input, a submit, a pending/result state -- with no
+  // SSE involvement, since a chat answer changes nothing that needs
+  // re-rendering elsewhere.
+  const [chatMessage, setChatMessage] = useState("");
+  const [chatStatus, setChatStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "pending" }
+    | { kind: "answered"; answer: string; sources: string[] }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
   useEffect(() => {
     let cancelled = false;
 
@@ -448,6 +460,55 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     }
   };
 
+  const handleChatSubmit = async (
+    event: React.FormEvent<HTMLFormElement>,
+  ): Promise<void> => {
+    event.preventDefault();
+
+    const trimmed = chatMessage.trim();
+
+    if (!trimmed || chatStatus.kind === "pending") {
+      return;
+    }
+
+    setChatStatus({ kind: "pending" });
+
+    try {
+      const response = await fetch(`/api/datasets/${datasetId}/chat`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: trimmed }),
+      });
+
+      const body = (await response.json()) as {
+        answer?: string;
+        sources?: string[];
+        error?: string;
+      };
+
+      if (!response.ok) {
+        setChatStatus({
+          kind: "error",
+          message: body.error ?? `Request returned ${response.status}.`,
+        });
+
+        return;
+      }
+
+      setChatStatus({
+        kind: "answered",
+        answer: body.answer ?? "",
+        sources: body.sources ?? [],
+      });
+    } catch (error: unknown) {
+      setChatStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   if (phase.kind === "loading") {
     return (
       <div className="space-y-4" aria-busy="true" aria-live="polite">
@@ -593,6 +654,56 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
           Insights
         </h2>
         <InsightsPanel insights={config.insights} />
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
+          Ask about this data
+        </h2>
+        <form
+          onSubmit={handleChatSubmit}
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-[color:var(--color-cloud)] bg-white p-3"
+        >
+          <label htmlFor="dashboard-chat" className="sr-only">
+            Ask a question about this dataset
+          </label>
+          <input
+            id="dashboard-chat"
+            type="text"
+            value={chatMessage}
+            onChange={(event) => setChatMessage(event.target.value)}
+            placeholder='e.g. "What is the gap to commit?"'
+            disabled={chatStatus.kind === "pending"}
+            className="min-w-64 flex-1 rounded-md border border-[color:var(--color-cloud)] px-3 py-1.5 text-sm text-[color:var(--color-ink)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-cobalt)] disabled:opacity-60"
+          />
+          <button
+            type="submit"
+            disabled={
+              chatStatus.kind === "pending" || chatMessage.trim().length === 0
+            }
+            className="rounded-md bg-[color:var(--color-forest)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {chatStatus.kind === "pending" ? "Asking…" : "Ask"}
+          </button>
+        </form>
+        {chatStatus.kind === "answered" ? (
+          <div
+            role="status"
+            className="rounded-lg border border-[color:var(--color-cloud)] bg-white p-3 text-sm text-[color:var(--color-ink)]"
+          >
+            <p>{chatStatus.answer}</p>
+            {chatStatus.sources.length > 0 ? (
+              <p className="mt-2 text-xs text-[color:var(--color-steel)]">
+                Source: {chatStatus.sources.join(", ")}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+        {chatStatus.kind === "error" ? (
+          <p role="alert" className="text-xs text-[color:var(--color-risk-high)]">
+            {chatStatus.message}
+          </p>
+        ) : null}
       </section>
     </div>
   );

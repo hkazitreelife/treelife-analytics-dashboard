@@ -147,6 +147,60 @@ export const buildDatasetMetadata = (
 });
 
 /**
+ * Section 17.3/17.4. How much a table contributes to the chat agent's
+ * bounded context: the same numeric aggregates every table gets (from
+ * buildDatasetMetadata), plus full rows -- but only for tables at or under
+ * this row count. Aggregates alone lose row-level facts a labeled total or a
+ * specific record carries (e.g. a "Gap to commit" row sitting inside an
+ * otherwise-numeric table); full rows preserve that, but only safely for a
+ * table small enough that "all of it" is still a bounded, small payload.
+ * Fixed, not env-configurable, same precedent as PREVIEW_ROW_COUNT in
+ * worker/src/services/spreadsheetParser.ts: a deliberately narrow exception,
+ * not something that scales with dataset size.
+ */
+export const CHAT_FULL_ROWS_TABLE_ROW_CEILING = 50;
+
+export type ChatTableContext = TableMetadataForClaude & {
+  /** Present only when this table's row count is at or under the ceiling. */
+  rows?: Record<string, unknown>[];
+};
+
+export type ChatDatasetContext = {
+  datasetId: string;
+  datasetName: string;
+  tables: ChatTableContext[];
+  relationships: unknown[];
+};
+
+/**
+ * Builds the chat agent's bounded context. Never full raw access to every
+ * table: a table over CHAT_FULL_ROWS_TABLE_ROW_CEILING contributes only its
+ * aggregates, exactly like the config-generation/edit metadata. The backend
+ * performs this lookup; Claude is never given a tool to fetch more.
+ */
+export const buildChatContext = (
+  datasetId: string,
+  datasetName: string,
+  tables: NormalizedTableShape[],
+  relationships: unknown[],
+): ChatDatasetContext => {
+  const base = buildDatasetMetadata(datasetId, datasetName, tables, relationships);
+
+  return {
+    ...base,
+    tables: base.tables.map((tableMeta, index) => {
+      const table = tables[index]!;
+
+      if (table.rows.length > CHAT_FULL_ROWS_TABLE_ROW_CEILING) {
+        return tableMeta;
+      }
+
+      return { ...tableMeta, rows: table.rows };
+    }),
+  };
+};
+
+/**
  * Rejects a config that references a table or column which does not exist.
  * Schema validation cannot catch this, because an invented name is a
  * well-formed string. Returns the list of problems, empty when clean.
