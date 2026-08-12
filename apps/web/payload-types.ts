@@ -202,6 +202,10 @@ export interface Dataset {
     | number
     | boolean
     | null;
+  /**
+   * The technical error from the most recent failed Job against this dataset, denormalized here so the dashboard route can show why an upload failed without a second query. Cleared whenever a job against this dataset next reaches ready/completed.
+   */
+  lastError?: string | null;
   createdBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;
@@ -402,6 +406,7 @@ export interface DatasetsSelect<T extends boolean = true> {
       };
   totalRows?: T;
   data?: T;
+  lastError?: T;
   createdBy?: T;
   updatedAt?: T;
   createdAt?: T;

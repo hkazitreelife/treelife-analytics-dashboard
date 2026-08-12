@@ -138,18 +138,41 @@ export const buildCategorySeries = (
   });
 };
 
+/**
+ * Result of a kpi_card computation. "not-numeric" is a distinct, explicit
+ * state rather than a number: sum/avg must refuse to run on a field whose
+ * inferredType is not numeric, regardless of what the config asked for, and
+ * the caller must render that refusal visibly rather than a fabricated value
+ * or a silent blank.
+ */
+export type KpiResult =
+  | { kind: "value"; value: number; field: string | null; usedRows: number }
+  | { kind: "not-numeric"; field: string };
+
 /** Single scalar for a kpi_card. */
 export const computeKpi = (
   rows: DataRow[],
   fields: string[],
   columns: DataColumn[],
   aggregation: AggregationTypeValue,
-): { value: number; field: string | null; usedRows: number } => {
+): KpiResult => {
   const { measureFields } = resolveChartFields(fields, columns);
-  const field = measureFields[0] ?? fields[0] ?? null;
 
-  if (aggregation === "count" || !field) {
-    return { value: rows.length, field, usedRows: rows.length };
+  if (aggregation === "count") {
+    return { kind: "value", value: rows.length, field: null, usedRows: rows.length };
+  }
+
+  if (fields.length === 0) {
+    return { kind: "value", value: rows.length, field: null, usedRows: rows.length };
+  }
+
+  const field = measureFields[0] ?? null;
+
+  // sum/avg/none on a field that isn't numeric would otherwise fall through to
+  // toNumber, which strips non-digit characters from strings such as ids and
+  // returns a fabricated number. Refuse instead of guessing.
+  if (!field) {
+    return { kind: "not-numeric", field: fields[0]! };
   }
 
   const values = rows
@@ -157,6 +180,7 @@ export const computeKpi = (
     .filter((value): value is number => value !== null);
 
   return {
+    kind: "value",
     value: applyAggregation(values, aggregation, rows.length),
     field,
     usedRows: values.length,

@@ -30,7 +30,13 @@ pnpm dev
 pnpm worker
 ```
 
-Web runs on localhost:3000 with Payload embedded. The worker is a separate process; both must be running for uploads to complete. Test commands are not yet defined; when you add a runner, record the single-test invocation here.
+Web runs on localhost:3000 with Payload embedded. The worker is a separate process; both must be running for uploads to complete.
+
+```bash
+pnpm --filter @analytics/web acceptance:phase7
+```
+
+Phase 7 renderer acceptance check (`apps/web/scripts/acceptance-phase7.ts`). Requires the web process running on `PUBLIC_APP_URL` (default `localhost:3000`) plus `ADMIN_EMAIL`/`ADMIN_PASSWORD` in `apps/web/.env.local`, and at least one dataset with status `ready` and a generated config. No other test runner is defined yet; record its invocation here when one is added.
 
 ## Architecture
 

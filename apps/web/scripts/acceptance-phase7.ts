@@ -14,6 +14,7 @@ import config from "../payload.config";
 import {
   buildCategorySeries,
   computeKpi,
+  isBlank,
   resolveChartFields,
   toNumber,
   type DataColumn,
@@ -110,6 +111,48 @@ const main = async (): Promise<void> => {
     }[];
   };
 
+  // Collected across every probe in this script, not just the widget-render
+  // loop below, so any check can report a failure without its own ad hoc
+  // pass/fail plumbing.
+  const failures: string[] = [];
+
+  // ---------------------------------------------------------- config version
+  console.log("\n=== config version is never hardcoded to 1 ===");
+
+  const allConfigsForDataset = await payload.find({
+    collection: "configs",
+    where: { dataset: { equals: dataset.id } },
+    limit: 1000,
+    depth: 0,
+  });
+
+  const versions = allConfigsForDataset.docs.map((c) => c.version);
+  const versionsUnique = versions.length === new Set(versions).size;
+
+  say("configs stored for this dataset", allConfigsForDataset.docs.length);
+  say("versions found", versions);
+  say("every version for this dataset is unique", versionsUnique);
+
+  // Replicates the exact query worker/src/processors/ingestion.ts now runs
+  // before writing a new config: max existing version for the dataset, + 1.
+  // A hardcoded-1 bug would show up here as this disagreeing with reality
+  // once more than one config row exists.
+  const maxVersion = Math.max(...versions);
+  const nextVersionWouldBe = maxVersion + 1;
+  const nextVersionIsNotHardcodedOne =
+    allConfigsForDataset.docs.length <= 1 || nextVersionWouldBe > 1;
+
+  say(
+    `next write for this dataset would take version ${nextVersionWouldBe}`,
+    nextVersionIsNotHardcodedOne,
+  );
+
+  if (!versionsUnique) {
+    failures.push(
+      `config version probe: dataset ${datasetId} has duplicate config versions ${JSON.stringify(versions)}`,
+    );
+  }
+
   // ------------------------------------------------------------------ endpoint
   console.log("=== GET /api/datasets/:id/data ===");
 
@@ -179,7 +222,7 @@ const main = async (): Promise<void> => {
   let chartsWithRealValues = 0;
   let tablesRendered = 0;
   let kpisRendered = 0;
-  const failures: string[] = [];
+  let kpisNotNumeric = 0;
 
   for (const widget of allWidgets) {
     const source = tableByName.get(widget.sourceTable);
@@ -224,7 +267,7 @@ const main = async (): Promise<void> => {
     }
 
     if (widget.type === "kpi_card") {
-      const { value } = computeKpi(
+      const result = computeKpi(
         rows,
         widget.fields.filter((f) =>
           source.columns.some((c) => c.name === f),
@@ -232,6 +275,26 @@ const main = async (): Promise<void> => {
         source.columns,
         widget.aggregation,
       );
+
+      if (result.kind === "not-numeric") {
+        // A real Claude-generated widget landing here means the config asked
+        // to sum/avg a non-numeric field. That must render the explicit
+        // refusal, never a number.
+        if (html.includes("is not a numeric field")) {
+          kpisNotNumeric += 1;
+          console.log(
+            `  kpi "${widget.title}" -> refused: "${result.field}" is not numeric`,
+          );
+        } else {
+          failures.push(
+            `${widget.widgetId}: not-numeric KPI did not render the explicit refusal state`,
+          );
+        }
+
+        continue;
+      }
+
+      const { value } = result;
 
       // The formatted number must appear in the rendered HTML.
       const formatted = Number.isInteger(value)
@@ -406,6 +469,222 @@ const main = async (): Promise<void> => {
 
   say("in-flight widget shows skeleton", loadingOk);
 
+  // --------------------------------------------------- kpi non-numeric field
+  console.log("\n=== kpi_card pointed at a non-numeric field ===");
+
+  // firstTable.columns[0] is whatever column the source happens to put
+  // first; find an explicitly non-numeric one so this probe means something
+  // regardless of table shape.
+  const nonNumericColumn = firstTable.columns.find(
+    (c) => c.inferredType !== "numeric",
+  );
+
+  let kpiNonNumericOk = false;
+
+  if (nonNumericColumn) {
+    const kpiHtml = renderToStaticMarkup(
+      WidgetRenderer({
+        widget: {
+          widgetId: "non-numeric-kpi-probe",
+          type: "kpi_card",
+          title: "Non-numeric KPI probe",
+          sourceTable: firstTable.tableName,
+          fields: [nonNumericColumn.name],
+          aggregation: "sum",
+          position: { row: 0, col: 0, w: 3, h: 2 },
+        },
+        state: {
+          status: "ready",
+          columns: firstTable.columns,
+          rows: firstTable.rows,
+          totalRows: firstTable.rows.length,
+        },
+      }) as React.ReactElement,
+    );
+
+    kpiNonNumericOk =
+      kpiHtml.includes("is not a numeric field") &&
+      !/\d[\d,.]*<\/p>/.test(kpiHtml.replace(/&[a-z]+;/g, ""));
+
+    say(
+      `sum("${nonNumericColumn.name}") [${nonNumericColumn.inferredType}] shows explicit refusal, not a number`,
+      kpiNonNumericOk,
+    );
+
+    if (!kpiNonNumericOk) {
+      failures.push(
+        "kpi non-numeric probe: sum on a non-numeric field did not render the explicit refusal state",
+      );
+    }
+  } else {
+    say(
+      "kpi non-numeric probe",
+      "skipped: every column in the first table is numeric",
+    );
+  }
+
+  // ------------------------------------------------- full-table aggregation
+  console.log("\n=== chart aggregation over the full table, not 100 rows ===");
+
+  const bigTable = stored.tables.find(
+    (t) =>
+      t.rows.length > 100 &&
+      t.columns.some((c) => c.inferredType === "numeric") &&
+      t.columns.some((c) =>
+        ["categorical", "date", "id"].includes(c.inferredType),
+      ),
+  );
+
+  let fullAggregationOk = false;
+
+  if (!bigTable) {
+    say(
+      "full-table aggregation probe",
+      "skipped: no stored table has both >100 rows and a numeric+groupable column pair",
+    );
+  } else {
+    const numericCol = bigTable.columns.find(
+      (c) => c.inferredType === "numeric",
+    )!.name;
+    const groupCol = bigTable.columns.find((c) =>
+      ["categorical", "date", "id"].includes(c.inferredType),
+    )!.name;
+
+    const previewSeries = buildCategorySeries(
+      bigTable.rows.slice(0, 100),
+      groupCol,
+      [numericCol],
+      "sum",
+    );
+    const fullSeries = buildCategorySeries(
+      bigTable.rows,
+      groupCol,
+      [numericCol],
+      "sum",
+    );
+
+    const previewTotal = Number(
+      previewSeries.reduce((acc, s) => acc + Number(s[numericCol]), 0).toFixed(6),
+    );
+    const fullTotal = Number(
+      fullSeries.reduce((acc, s) => acc + Number(s[numericCol]), 0).toFixed(6),
+    );
+    // buildCategorySeries excludes rows with a blank category rather than
+    // bucketing them under an empty label (see its own doc comment), so the
+    // independent recompute must apply that same exclusion to be comparable,
+    // not sum every row in the table regardless of grouping.
+    const independentFullTotal = Number(
+      bigTable.rows
+        .filter((row) => !isBlank(row[groupCol]))
+        .map((row) => toNumber(row[numericCol]))
+        .filter((v): v is number => v !== null)
+        .reduce((a, b) => a + b, 0)
+        .toFixed(6),
+    );
+
+    say(`sum("${numericCol}") over first 100 of ${bigTable.rows.length} rows`, previewTotal);
+    say(`sum("${numericCol}") over all ${bigTable.rows.length} rows`, fullTotal);
+
+    const numbersActuallyDiffer = previewTotal !== fullTotal;
+    const fullMatchesIndependentRecompute = fullTotal === independentFullTotal;
+
+    say("the two totals differ (proves the 100-row cap was material)", numbersActuallyDiffer);
+    say("full total matches an independent full recompute", fullMatchesIndependentRecompute);
+
+    // Confirm the endpoint itself now serves enough rows to make the fix
+    // possible: the previous 1000-row API cap is gone, replaced by the
+    // ingestion-time per-table limit.
+    const fullFetch = await fetch(
+      `${APP}/api/datasets/${datasetId}/data?table=${encodeURIComponent(bigTable.tableName)}&limit=${bigTable.rows.length}`,
+      { headers: { cookie } },
+    );
+    const fullFetchBody = (await fullFetch.json()) as { rows: DataRow[] };
+    const endpointServesFullTable = fullFetchBody.rows.length === bigTable.rows.length;
+
+    say(
+      `GET .../data?limit=${bigTable.rows.length} returns all rows, not capped at 1000`,
+      endpointServesFullTable,
+    );
+
+    fullAggregationOk =
+      numbersActuallyDiffer &&
+      fullMatchesIndependentRecompute &&
+      endpointServesFullTable;
+
+    if (!fullAggregationOk) {
+      failures.push("full-table chart aggregation probe did not pass");
+    }
+  }
+
+  // ------------------------------------------- failed status, good data kept
+  console.log("\n=== dataset marked failed while good data and config survive ===");
+
+  let failedWithDataOk = false;
+
+  try {
+    await payload.update({
+      collection: "datasets",
+      id: dataset.id,
+      data: {
+        status: "failed",
+        lastError: "ACCEPTANCE PROBE: simulated re-upload failure, not a real error.",
+      },
+    });
+
+    const datasetResp = await fetch(`${APP}/api/datasets/${datasetId}`, {
+      headers: { cookie },
+    });
+    const datasetBody = (await datasetResp.json()) as {
+      status: string;
+      lastError: string | null;
+    };
+
+    const configResp = await fetch(`${APP}/api/datasets/${datasetId}/config`, {
+      headers: { cookie },
+    });
+
+    const dataResp = await fetch(
+      `${APP}/api/datasets/${datasetId}/data?table=${encodeURIComponent(firstTable.tableName)}`,
+      { headers: { cookie } },
+    );
+
+    const statusReportsFailed = datasetBody.status === "failed";
+    const realErrorSurfaced = datasetBody.lastError?.includes(
+      "ACCEPTANCE PROBE",
+    );
+    const configStillServed = configResp.status === 200;
+    const dataStillServed = dataResp.status === 200;
+
+    say("dataset endpoint reports status failed", statusReportsFailed);
+    say("dataset endpoint surfaces the real error text", realErrorSurfaced);
+    say("config endpoint still serves the last good config", configStillServed);
+    say("data endpoint still serves the stored rows", dataStillServed);
+
+    // This is exactly the contract DashboardRenderer.tsx's load() depends on:
+    // status failed + config still fetchable => render ready, with the real
+    // lastError as the failure banner, never a blank "no data" screen.
+    failedWithDataOk =
+      statusReportsFailed &&
+      Boolean(realErrorSurfaced) &&
+      configStillServed &&
+      dataStillServed;
+
+    if (!failedWithDataOk) {
+      failures.push(
+        "failed-dataset-with-good-data probe: the API contract DashboardRenderer relies on did not hold",
+      );
+    }
+  } finally {
+    // Always restore, whether the assertions above passed or threw.
+    await payload.update({
+      collection: "datasets",
+      id: dataset.id,
+      data: { status: "ready", lastError: null },
+    });
+  }
+
+  say("failed status with surviving good data renders instead of going blank", failedWithDataOk);
+
   // ------------------------------------------------------------------ insights
   console.log("\n=== insights with severity styling ===");
 
@@ -442,8 +721,13 @@ const main = async (): Promise<void> => {
   console.log("\n=== SUMMARY ===");
   say("widgets rendered without throwing", `${renderedWidgets}/${allWidgets.length}`);
   say("kpi widgets with verified values", kpisRendered);
+  say("kpi widgets that correctly refused a non-numeric field", kpisNotNumeric);
   say("table widgets rendered", tablesRendered);
   say("charts with independently verified series", chartsWithRealValues);
+  say("non-numeric-kpi probe", nonNumericColumn ? (kpiNonNumericOk ? "pass" : "fail") : "skipped");
+  say("full-table chart aggregation probe", bigTable ? (fullAggregationOk ? "pass" : "fail") : "skipped");
+  say("failed-status-with-good-data probe", failedWithDataOk ? "pass" : "fail");
+  say("config version probe", versionsUnique ? "pass" : "fail");
   say("failures", failures.length === 0 ? "none" : failures);
 
   const passed =

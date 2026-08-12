@@ -59,6 +59,14 @@ export const Datasets: CollectionConfig = {
       },
     },
     {
+      name: "lastError",
+      type: "textarea",
+      admin: {
+        description:
+          "The technical error from the most recent failed Job against this dataset, denormalized here so the dashboard route can show why an upload failed without a second query. Cleared whenever a job against this dataset next reaches ready/completed.",
+      },
+    },
+    {
       name: "createdBy",
       type: "relationship",
       relationTo: "users",

@@ -366,6 +366,10 @@ export const processIngestionJob = async (
       currentFile: fileRecord.id,
       currentFileHash: data.fileHash,
       status: "ready",
+      // A successful parse clears any error recorded by a previous failed
+      // job against this dataset, so the dashboard never shows a stale
+      // failure banner once the data has actually recovered.
+      lastError: null,
     },
   });
 
@@ -388,11 +392,24 @@ export const processIngestionJob = async (
     payload.logger,
   );
 
+  // Version is never hardcoded: re-ingesting the same dataset (a corrected
+  // re-upload after an earlier failure, or any future re-run) must not create
+  // a second tied version, which the config-fetch route could then return
+  // nondeterministically instead of the newest one.
+  const priorConfigs = await payload.find({
+    collection: "configs",
+    where: { dataset: { equals: Number(datasetId) } },
+    limit: 1,
+    depth: 0,
+    sort: "-version",
+  });
+  const nextVersion = (priorConfigs.docs[0]?.version ?? 0) + 1;
+
   await payload.create({
     collection: "configs",
     data: {
       dataset: Number(datasetId),
-      version: 1,
+      version: nextVersion,
       config,
       insights: config.insights,
       generatedBy: CONFIG_SOURCE.initialAutoGeneration,

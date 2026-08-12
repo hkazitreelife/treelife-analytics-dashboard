@@ -1,6 +1,6 @@
 "use client";
 
-import type { DashboardConfigShape } from "@analytics/shared";
+import { DEFAULT_LIMITS, type DashboardConfigShape, type DashboardWidgetShape } from "@analytics/shared";
 import { useEffect, useMemo, useState } from "react";
 
 import { InsightsPanel } from "@/components/dashboard/InsightsPanel";
@@ -34,18 +34,144 @@ type DatasetSummary = {
   name: string;
   status: string;
   totalRows: number;
+  lastError: string | null;
 };
 
 type Phase =
   | { kind: "loading" }
   | { kind: "error"; title: string; detail?: string | null }
-  | { kind: "ready"; dataset: DatasetSummary; config: DashboardConfigShape; version: number };
+  | {
+      kind: "ready";
+      dataset: DatasetSummary;
+      config: DashboardConfigShape;
+      version: number;
+      // Set when status is "failed" but a previous successful ingestion left
+      // good data and config in place (PRD 11.3): the dashboard renders as
+      // normal, with this banner on top, rather than going blank.
+      failureBanner: string | null;
+    };
 
 const ROW_LIMIT = 100;
+
+// Chart aggregation (sum/avg/count) must reflect the whole table, not the
+// 100-row preview used for the table widget and for computing what to
+// display. The cap here matches the ingestion-time per-table row limit: a
+// table can never have stored more rows than this, so requesting up to it is
+// requesting "all of it", not an arbitrary larger preview.
+const AGGREGATE_ROW_LIMIT = DEFAULT_LIMITS.maxRowsPerTable;
+
+const CHART_WIDGET_TYPES = new Set<DashboardWidgetShape["type"]>([
+  "bar",
+  "line",
+  "pie",
+]);
+
+/** Whether a widget's displayed number depends on seeing every row, not just a preview. */
+const needsFullTableAggregation = (widget: DashboardWidgetShape): boolean =>
+  CHART_WIDGET_TYPES.has(widget.type) && widget.aggregation !== "none";
+
+type SetTableState = (
+  updater: (current: Record<string, TableState>) => Record<string, TableState>,
+) => void;
+
+/**
+ * Fetches each named table's rows into a state map, up to `limit` rows.
+ * Shared by the 100-row preview fetch (table/kpi widgets, and charts with no
+ * aggregation) and the full-table fetch (aggregating charts only). Returns
+ * the cleanup function a useEffect should return.
+ */
+const loadTablesInto = (
+  datasetId: string,
+  tableNames: string[],
+  limit: number,
+  setState: SetTableState,
+): (() => void) => {
+  let cancelled = false;
+
+  if (tableNames.length === 0) {
+    return () => {
+      cancelled = true;
+    };
+  }
+
+  setState((current) => {
+    const next = { ...current };
+
+    for (const name of tableNames) {
+      next[name] ??= { status: "loading" };
+    }
+
+    return next;
+  });
+
+  const loadTable = async (tableName: string): Promise<void> => {
+    try {
+      const response = await fetch(
+        `/api/datasets/${datasetId}/data?table=${encodeURIComponent(tableName)}&limit=${limit}`,
+        { credentials: "include" },
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      if (!response.ok) {
+        const body = (await response.json()) as { error?: string };
+
+        setState((current) => ({
+          ...current,
+          [tableName]: {
+            status: "error",
+            message: body.error ?? `Request returned ${response.status}.`,
+          },
+        }));
+
+        return;
+      }
+
+      const body = (await response.json()) as {
+        columns: { name: string; inferredType: string }[];
+        rows: Record<string, unknown>[];
+        totalRows: number;
+      };
+
+      setState((current) => ({
+        ...current,
+        [tableName]: {
+          status: "ready",
+          columns: body.columns,
+          rows: body.rows,
+          totalRows: body.totalRows,
+        },
+      }));
+    } catch (error: unknown) {
+      if (!cancelled) {
+        setState((current) => ({
+          ...current,
+          [tableName]: {
+            status: "error",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        }));
+      }
+    }
+  };
+
+  void Promise.all(tableNames.map((name) => loadTable(name)));
+
+  return () => {
+    cancelled = true;
+  };
+};
 
 export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [tables, setTables] = useState<Record<string, TableState>>({});
+  // Separate from `tables`: only populated for tables that back a chart
+  // widget with a non-none aggregation, fetched up to AGGREGATE_ROW_LIMIT
+  // instead of ROW_LIMIT, so that aggregation math is correct rather than
+  // computed over the first 100 rows.
+  const [aggregateData, setAggregateData] = useState<Record<string, TableState>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -85,34 +211,25 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
         const dataset = (await datasetResponse.json()) as DatasetSummary;
 
-        // A failed dataset must say so, with its stored error, not render blank.
-        if (dataset.status === "failed") {
-          const jobs = await fetch(
-            `/api/datasets/${datasetId}/data`,
-            { credentials: "include" },
-          );
-          const body = (await jobs.json()) as { error?: string };
-
-          setPhase({
-            kind: "error",
-            title: `Dataset "${dataset.name}" failed to process`,
-            detail:
-              body.error ??
-              "No stored data is available for this dataset. Check the job record for the technical error.",
-          });
-
-          return;
-        }
-
+        // No config has ever been generated for this dataset (the pipeline
+        // creates a Config only after a Dataset's data write succeeds, so
+        // this means no ingestion has ever completed successfully). There is
+        // nothing to render.
         if (!configResponse.ok) {
           const body = (await configResponse.json()) as { error?: string };
 
           setPhase({
             kind: "error",
-            title: "No dashboard configuration",
+            title:
+              dataset.status === "failed"
+                ? `Dataset "${dataset.name}" failed to process`
+                : "No dashboard configuration",
             detail:
-              body.error ??
-              `GET /api/datasets/${datasetId}/config returned ${configResponse.status}.`,
+              dataset.status === "failed"
+                ? (dataset.lastError ??
+                  "No stored data or dashboard configuration is available for this dataset.")
+                : (body.error ??
+                  `GET /api/datasets/${datasetId}/config returned ${configResponse.status}.`),
           });
 
           return;
@@ -120,11 +237,21 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
         const configBody = (await configResponse.json()) as ConfigResponse;
 
+        // status "failed" with a config already in hand means a later job
+        // (a bad re-upload, or a config-generation failure after a good
+        // re-parse) failed, but a working dashboard from an earlier success
+        // is still on record. Render it, with the real error as a banner,
+        // rather than presenting a blank "no data" screen (PRD 11.3).
         setPhase({
           kind: "ready",
           dataset,
           config: configBody.config,
           version: configBody.version,
+          failureBanner:
+            dataset.status === "failed"
+              ? (dataset.lastError ??
+                "The most recent update to this dataset failed. Showing the last successful version.")
+              : null,
         });
       } catch (error: unknown) {
         if (!cancelled) {
@@ -161,82 +288,39 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     return Array.from(names);
   }, [phase]);
 
-  useEffect(() => {
-    if (requiredTables.length === 0) {
-      return;
+  // The subset of requiredTables that back a chart widget with a non-none
+  // aggregation, and therefore need every row, not the 100-row preview.
+  const aggregateTables = useMemo(() => {
+    if (phase.kind !== "ready") {
+      return [] as string[];
     }
 
-    let cancelled = false;
+    const names = new Set<string>();
 
-    setTables((current) => {
-      const next = { ...current };
-
-      for (const name of requiredTables) {
-        next[name] ??= { status: "loading" };
-      }
-
-      return next;
-    });
-
-    const loadTable = async (tableName: string): Promise<void> => {
-      try {
-        const response = await fetch(
-          `/api/datasets/${datasetId}/data?table=${encodeURIComponent(tableName)}&limit=${ROW_LIMIT}`,
-          { credentials: "include" },
-        );
-
-        if (cancelled) {
-          return;
-        }
-
-        if (!response.ok) {
-          const body = (await response.json()) as { error?: string };
-
-          setTables((current) => ({
-            ...current,
-            [tableName]: {
-              status: "error",
-              message: body.error ?? `Request returned ${response.status}.`,
-            },
-          }));
-
-          return;
-        }
-
-        const body = (await response.json()) as {
-          columns: { name: string; inferredType: string }[];
-          rows: Record<string, unknown>[];
-          totalRows: number;
-        };
-
-        setTables((current) => ({
-          ...current,
-          [tableName]: {
-            status: "ready",
-            columns: body.columns,
-            rows: body.rows,
-            totalRows: body.totalRows,
-          },
-        }));
-      } catch (error: unknown) {
-        if (!cancelled) {
-          setTables((current) => ({
-            ...current,
-            [tableName]: {
-              status: "error",
-              message: error instanceof Error ? error.message : String(error),
-            },
-          }));
+    for (const tab of phase.config.tabs) {
+      for (const widget of tab.widgets) {
+        if (needsFullTableAggregation(widget)) {
+          names.add(widget.sourceTable);
         }
       }
-    };
+    }
 
-    void Promise.all(requiredTables.map((name) => loadTable(name)));
+    return Array.from(names);
+  }, [phase]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [datasetId, requiredTables]);
+  // Preview fetch: 100 rows, used by table/kpi widgets and by charts with no
+  // aggregation. Unchanged behaviour.
+  useEffect(
+    () => loadTablesInto(datasetId, requiredTables, ROW_LIMIT, setTables),
+    [datasetId, requiredTables],
+  );
+
+  // Full-table fetch: only for tables backing an aggregating chart, so the
+  // sum/avg/count shown reflects the whole table rather than the preview.
+  useEffect(
+    () => loadTablesInto(datasetId, aggregateTables, AGGREGATE_ROW_LIMIT, setAggregateData),
+    [datasetId, aggregateTables],
+  );
 
   if (phase.kind === "loading") {
     return (
@@ -259,7 +343,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     return <ErrorState title={phase.title} detail={phase.detail} />;
   }
 
-  const { config, dataset, version } = phase;
+  const { config, dataset, version, failureBanner } = phase;
   const firstTab = config.tabs[0];
 
   if (!firstTab) {
@@ -273,6 +357,13 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
   return (
     <div className="space-y-6">
+      {failureBanner ? (
+        <ErrorState
+          title={`The most recent update to "${dataset.name}" failed. Showing the last successful version.`}
+          detail={failureBanner}
+        />
+      ) : null}
+
       <header>
         <h1 className="text-xl font-semibold text-[color:var(--color-forest)]">
           {config.title}
@@ -310,15 +401,21 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
                       a.position.row - b.position.row ||
                       a.position.col - b.position.col,
                   )
-                  .map((widget) => (
-                    <WidgetRenderer
-                      key={widget.widgetId}
-                      widget={widget}
-                      state={
-                        tables[widget.sourceTable] ?? { status: "loading" }
-                      }
-                    />
-                  ))}
+                  .map((widget) => {
+                    const source = needsFullTableAggregation(widget)
+                      ? aggregateData
+                      : tables;
+
+                    return (
+                      <WidgetRenderer
+                        key={widget.widgetId}
+                        widget={widget}
+                        state={
+                          source[widget.sourceTable] ?? { status: "loading" }
+                        }
+                      />
+                    );
+                  })}
               </div>
             )}
           </TabsContent>

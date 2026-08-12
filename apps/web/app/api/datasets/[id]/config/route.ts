@@ -25,7 +25,12 @@ export async function GET(
       where: { dataset: { equals: id } },
       limit: 1,
       depth: 0,
-      sort: "-version",
+      // -createdAt is a tiebreaker: version is written as (max existing
+      // version for this dataset) + 1, so it should already be unique per
+      // dataset, but this keeps the query deterministic even against rows
+      // written before that fix, or against any future write path that
+      // doesn't go through it.
+      sort: "-version,-createdAt",
     });
 
     const latest = result.docs[0];

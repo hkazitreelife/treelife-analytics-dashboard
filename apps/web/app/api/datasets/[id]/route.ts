@@ -29,6 +29,10 @@ export async function GET(
       totalRows: dataset.totalRows ?? 0,
       tableNames: (dataset.tableNames ?? []).map((entry) => entry.tableName),
       currentFileHash: dataset.currentFileHash ?? null,
+      // The real technical error from the most recent failed job against this
+      // dataset, so the dashboard can show why an upload failed instead of a
+      // generic canned string. Null once a later job succeeds.
+      lastError: dataset.lastError ?? null,
       createdAt: dataset.createdAt,
       updatedAt: dataset.updatedAt,
     });

@@ -11,7 +11,8 @@
     "payload": "payload",
     "generate:importmap": "payload generate:importmap",
     "generate:types": "payload generate:types",
-    "seed:admin": "node --env-file=.env.local --import tsx scripts/seed-admin.ts"
+    "seed:admin": "node --env-file=.env.local --import tsx scripts/seed-admin.ts",
+    "acceptance:phase7": "tsx --tsconfig tsconfig.scripts.json --env-file=.env.local scripts/acceptance-phase7.ts"
   },
   "dependencies": {
     "@analytics/shared": "workspace:*",
@@ -20,7 +21,6 @@
     "@payloadcms/ui": "3.87.1",
     "@radix-ui/react-tabs": "^1.1.21",
     "bullmq": "^6.0.10",
-    "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "graphql": "^16.8.1",
     "ioredis": "^6.0.0",

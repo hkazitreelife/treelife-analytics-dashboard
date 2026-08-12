@@ -66,12 +66,14 @@ const recordFailure = async (
 
     // The Dataset is marked failed so nothing presents as complete, but its
     // data, tableNames and totalRows are deliberately left untouched. A failed
-    // parse must never overwrite a working dataset.
+    // parse must never overwrite a working dataset. lastError is denormalized
+    // here so the dashboard can show the real technical reason instead of a
+    // generic canned string, whether or not a previous good dataset survives.
     if (jobRecord.dataset !== null && jobRecord.dataset !== undefined) {
       await payload.update({
         collection: "datasets",
         id: jobRecord.dataset,
-        data: { status: "failed" },
+        data: { status: "failed", lastError: message },
       });
     }
   } catch (updateError: unknown) {

@@ -52,17 +52,20 @@ export type TableState =
       totalRows: number;
     };
 
+// References the same CSS variables globals.css defines from the brand theme
+// (@theme block), rather than duplicating their hex values, so a future
+// palette change there does not leave charts on stale colours.
 const SERIES_COLOURS = [
-  "#1a5c3a",
-  "#5b8db8",
-  "#d4a843",
-  "#c05e3c",
-  "#6b5ea8",
-  "#2e8b57",
-  "#3d5166",
+  "var(--color-forest-mid)",
+  "var(--color-cobalt)",
+  "var(--color-gold)",
+  "var(--color-terracotta)",
+  "var(--color-grape)",
+  "var(--color-forest-bright)",
+  "var(--color-steel)",
 ];
 
-const axisStyle = { fontSize: 11, fill: "#3d5166" } as const;
+const axisStyle = { fontSize: 11, fill: "var(--color-steel)" } as const;
 
 /** Matches Recharts' wide ValueType so the signature stays assignable. */
 const tooltipFormatter = (
@@ -135,12 +138,21 @@ const WidgetBody = ({
   }
 
   if (widget.type === "kpi_card") {
-    const { value, field, usedRows } = computeKpi(
-      rows,
-      knownFields,
-      columns,
-      widget.aggregation,
-    );
+    const result = computeKpi(rows, knownFields, columns, widget.aggregation);
+
+    // The config asked for sum/avg on a field that isn't numeric. Refuse to
+    // show a number built by stripping letters out of an id or a category,
+    // and say so visibly rather than rendering nothing.
+    if (result.kind === "not-numeric") {
+      return (
+        <ErrorState
+          title={`"${result.field}" is not a numeric field`}
+          detail={`Cannot compute ${widget.aggregation} on "${result.field}" in "${widget.sourceTable}": its inferred type is not numeric.`}
+        />
+      );
+    }
+
+    const { value, field, usedRows } = result;
 
     return (
       <div className="flex h-full flex-col justify-center">
@@ -267,7 +279,7 @@ const WidgetBody = ({
     return (
       <ChartFrame>
         <LineChart data={series} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-          <CartesianGrid stroke="#e8eef4" />
+          <CartesianGrid stroke="var(--color-cloud)" />
           <XAxis dataKey="category" tick={axisStyle} />
           <YAxis tick={axisStyle} />
           <Tooltip formatter={tooltipFormatter} />
@@ -290,7 +302,7 @@ const WidgetBody = ({
   return (
     <ChartFrame>
       <BarChart data={series} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-        <CartesianGrid stroke="#e8eef4" />
+        <CartesianGrid stroke="var(--color-cloud)" />
         <XAxis dataKey="category" tick={axisStyle} />
         <YAxis tick={axisStyle} />
         <Tooltip formatter={tooltipFormatter} />
@@ -326,7 +338,7 @@ export const WidgetRenderer = ({
       <CardTitle>{widget.title}</CardTitle>
       <p className="mt-0.5 text-xs text-[color:var(--color-steel)]">
         {widget.sourceTable}
-        {widget.aggregation !== "none" ? ` Â· ${widget.aggregation}` : ""}
+        {widget.aggregation !== "none" ? ` · ${widget.aggregation}` : ""}
       </p>
     </CardHeader>
     <CardBody className={widget.type === "table" ? "overflow-hidden p-0" : ""}>

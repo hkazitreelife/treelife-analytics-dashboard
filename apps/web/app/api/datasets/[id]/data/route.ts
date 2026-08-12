@@ -1,10 +1,18 @@
+import { readIngestionLimits } from "@analytics/shared";
+
 import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
 /** Section 23.3: tables should not render more than 100 rows unless paginated. */
 const DEFAULT_LIMIT = 100;
-const MAX_LIMIT = 1000;
+
+// The renderer's chart-aggregation fetch (DashboardRenderer.tsx) needs up to
+// one full table's worth of rows to compute a correct sum/avg/count, so the
+// cap here must reach the ingestion-time per-table row limit, not an
+// arbitrarily smaller number. A table can never have stored more rows than
+// that limit, so this is "at most everything", never a true unbounded fetch.
+const MAX_LIMIT = readIngestionLimits().maxRowsPerTable;
 
 type StoredTable = {
   tableName: string;
