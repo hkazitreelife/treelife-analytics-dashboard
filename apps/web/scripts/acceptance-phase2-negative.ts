@@ -121,6 +121,11 @@ const main = async (): Promise<void> => {
           },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any,
+        // No contention to exercise here: always succeeds, and the requeue
+        // path (which needs a real queue) is never reached.
+        datasetLock: { acquireLock: async () => true, releaseLock: async () => true },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        queue: { add: async () => undefined } as any,
         mediaDir: path.resolve(process.cwd(), "media"),
       },
     );

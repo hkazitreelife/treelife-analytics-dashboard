@@ -222,6 +222,11 @@ const main = async (): Promise<void> => {
     gemini: workingGemini as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     claude: validClaude as any,
+    // No contention to exercise here: always succeeds, and the requeue path
+    // (which needs a real queue) is never reached.
+    datasetLock: { acquireLock: async () => true, releaseLock: async () => true },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    queue: { add: async () => undefined } as any,
     mediaDir,
   });
 
@@ -329,6 +334,11 @@ const main = async (): Promise<void> => {
       gemini: workingGemini as any,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       claude: brokenClaude as any,
+      // No contention to exercise here: always succeeds, and the requeue path
+      // (which needs a real queue) is never reached.
+      datasetLock: { acquireLock: async () => true, releaseLock: async () => true },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      queue: { add: async () => undefined } as any,
       mediaDir,
     });
 

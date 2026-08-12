@@ -6,7 +6,7 @@ import {
   redisConnectionOptions,
   type IngestionJobData,
 } from "@analytics/shared";
-import { Worker } from "bullmq";
+import { Queue, Worker } from "bullmq";
 import dotenv from "dotenv";
 import { Redis } from "ioredis";
 
@@ -41,11 +41,20 @@ const { getPayload } = await import("payload");
 const { default: config } = await import("@payload-config");
 const { createGeminiClient } = await import("./services/gemini");
 const { createClaudeConfigClient } = await import("./services/claudeConfig");
+const { createDatasetLock } = await import("./services/datasetLock");
 const { processIngestionJob } = await import("./processors/ingestion");
 
 const payload = await getPayload({ config });
 const gemini = createGeminiClient(geminiApiKey);
 const claude = createClaudeConfigClient(anthropicApiKey);
+const datasetLock = createDatasetLock(connection);
+
+// Shares `connection` rather than opening a second Redis connection: BullMQ
+// supports a Queue (producer) and a Worker (consumer) on the same client.
+// Used only to requeue a job that lost a per-dataset lock race, with a delay.
+const ingestionQueue = new Queue<IngestionJobData>(INGESTION_QUEUE_NAME, {
+  connection,
+});
 
 const recordFailure = async (
   data: IngestionJobData,
@@ -85,7 +94,13 @@ const worker = new Worker<IngestionJobData>(
   INGESTION_QUEUE_NAME,
   async (job) => {
     try {
-      await processIngestionJob(job.data, { payload, gemini, claude });
+      await processIngestionJob(job.data, {
+        payload,
+        gemini,
+        claude,
+        datasetLock,
+        queue: ingestionQueue,
+      });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 
@@ -96,8 +111,10 @@ const worker = new Worker<IngestionJobData>(
   },
   {
     connection,
-    // One job at a time. Note: this is process-level serialization, not a
-    // per-dataset lock. See report notes for Phase 4.
+    // One job at a time. This is process-level serialization; the per-dataset
+    // Redis lock in services/datasetLock.ts is what actually protects against
+    // two jobs writing to the same Dataset if concurrency is ever raised
+    // above 1.
     concurrency: 1,
   },
 );
@@ -121,6 +138,7 @@ const shutdown = async (signal: string): Promise<void> => {
   payload.logger.info(`Received ${signal}. Shutting down worker.`);
 
   await worker.close();
+  await ingestionQueue.close();
   connection.disconnect();
   await payload.db.destroy?.();
 

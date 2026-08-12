@@ -11,6 +11,7 @@ import {
   type NormalizedDatasetShape,
   type NormalizedTableShape,
 } from "@analytics/shared";
+import type { Queue } from "bullmq";
 import type { Payload } from "payload";
 
 import {
@@ -21,6 +22,7 @@ import {
   type ClaudeConfigClient,
 } from "../services/claudeConfig";
 
+import { type DatasetLock } from "../services/datasetLock";
 import {
   GeminiBillingError,
   GeminiValidationError,
@@ -79,8 +81,18 @@ export type IngestionDeps = {
   payload: Payload;
   gemini: GeminiClient;
   claude: ClaudeConfigClient;
+  datasetLock: DatasetLock;
+  queue: Queue<IngestionJobData>;
   mediaDir?: string;
 };
+
+/**
+ * How long a lock-contention requeue waits before the worker tries this job
+ * again. Comfortably shorter than LOCK_TTL_MS (5 minutes), so a dataset whose
+ * other job finishes quickly doesn't sit needlessly delayed, but long enough
+ * not to hammer the queue with retries for a job that's likely still running.
+ */
+const LOCK_RETRY_DELAY_MS = 20_000;
 
 const loadFileBytes = async (
   mediaDir: string,
@@ -282,7 +294,7 @@ export const processIngestionJob = async (
   data: IngestionJobData,
   deps: IngestionDeps,
 ): Promise<void> => {
-  const { payload, gemini, claude } = deps;
+  const { payload, gemini, claude, datasetLock, queue } = deps;
   const mediaDir = deps.mediaDir ?? MEDIA_DIR;
   const limits = readIngestionLimits();
 
@@ -338,93 +350,139 @@ export const processIngestionJob = async (
       ? data.datasetId
       : String(jobRecord.dataset);
 
-  const { dataset: normalized, totalDataRows } = await inferAndMerge(
-    gemini,
-    parsed,
-    datasetId,
-    {
-      name: fileRecord.filename,
-      type: fileType,
-      hash: data.fileHash,
-    },
-    payload.logger,
-  );
+  // Per-dataset lock (PRD 11.4), acquired the moment datasetId is known and
+  // before any Gemini/Claude call, so contention is discovered before this
+  // attempt has spent anything on a model request. jobId doubles as the
+  // lock token: unique per job, and already the identifier this job is
+  // known by everywhere else.
+  const lockToken = data.jobId;
+  const lockAcquired = await datasetLock.acquireLock(datasetId, lockToken);
 
-  // Only now, after full validation, is stored data replaced.
-  await payload.update({
-    collection: "datasets",
-    id: datasetId,
-    data: {
-      data: {
-        tables: normalized.tables,
-        relationships: normalized.relationships,
+  if (!lockAcquired) {
+    // Contention, not failure: another job is already ingesting into this
+    // dataset. Requeue this job with a delay instead of failing it, and log
+    // it distinctly so it never reads as a real ingestion error.
+    payload.logger.warn(
+      `Dataset ${datasetId} is locked by another in-flight job; requeuing job ${data.jobId} in ${LOCK_RETRY_DELAY_MS}ms instead of failing it (lock contention, not an error).`,
+    );
+
+    await queue.add(
+      "ingest",
+      data,
+      {
+        // A fresh id per retry attempt: the original BullMQ job id
+        // (job-${jobId}) is kept by removeOnComplete:false/removeOnFail:false
+        // policy elsewhere, so reusing it here would collide instead of
+        // scheduling a new attempt.
+        jobId: `job-${data.jobId}-lock-retry-${Date.now()}`,
+        delay: LOCK_RETRY_DELAY_MS,
+        removeOnComplete: false,
+        removeOnFail: false,
       },
-      tableNames: normalized.tables.map((table) => ({
-        tableName: table.tableName,
-      })),
-      totalRows: totalDataRows,
-      currentFile: fileRecord.id,
-      currentFileHash: data.fileHash,
-      status: "ready",
-      // A successful parse clears any error recorded by a previous failed
-      // job against this dataset, so the dashboard never shows a stale
-      // failure banner once the data has actually recovered.
-      lastError: null,
-    },
-  });
+    );
 
-  // Config generation is part of this pipeline, not a separate trigger, so the
-  // job stays open until a Config exists. A dataset that is ready with no
-  // dashboard is exactly the half-finished state Section 7.6 forbids presenting
-  // as complete.
-  const datasetRecord = await payload.findByID({
-    collection: "datasets",
-    id: datasetId,
-    depth: 0,
-  });
+    // Back to "queued": ingestion has not actually progressed, so neither
+    // "completed" nor "failed" would be accurate.
+    await payload.update({
+      collection: "jobs",
+      id: data.jobId,
+      data: { status: "queued" },
+    });
 
-  const config = await generateConfig(
-    claude,
-    datasetId,
-    datasetRecord.name,
-    normalized.tables,
-    normalized.relationships,
-    payload.logger,
-  );
+    return;
+  }
 
-  // Version is never hardcoded: re-ingesting the same dataset (a corrected
-  // re-upload after an earlier failure, or any future re-run) must not create
-  // a second tied version, which the config-fetch route could then return
-  // nondeterministically instead of the newest one.
-  const priorConfigs = await payload.find({
-    collection: "configs",
-    where: { dataset: { equals: Number(datasetId) } },
-    limit: 1,
-    depth: 0,
-    sort: "-version",
-  });
-  const nextVersion = (priorConfigs.docs[0]?.version ?? 0) + 1;
+  try {
+    const { dataset: normalized, totalDataRows } = await inferAndMerge(
+      gemini,
+      parsed,
+      datasetId,
+      {
+        name: fileRecord.filename,
+        type: fileType,
+        hash: data.fileHash,
+      },
+      payload.logger,
+    );
 
-  await payload.create({
-    collection: "configs",
-    data: {
-      dataset: Number(datasetId),
-      version: nextVersion,
-      config,
-      insights: config.insights,
-      generatedBy: CONFIG_SOURCE.initialAutoGeneration,
-    },
-  });
+    // Only now, after full validation, is stored data replaced.
+    await payload.update({
+      collection: "datasets",
+      id: datasetId,
+      data: {
+        data: {
+          tables: normalized.tables,
+          relationships: normalized.relationships,
+        },
+        tableNames: normalized.tables.map((table) => ({
+          tableName: table.tableName,
+        })),
+        totalRows: totalDataRows,
+        currentFile: fileRecord.id,
+        currentFileHash: data.fileHash,
+        status: "ready",
+        // A successful parse clears any error recorded by a previous failed
+        // job against this dataset, so the dashboard never shows a stale
+        // failure banner once the data has actually recovered.
+        lastError: null,
+      },
+    });
 
-  await payload.update({
-    collection: "jobs",
-    id: data.jobId,
-    data: {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      error: null,
-    },
-  });
+    // Config generation is part of this pipeline, not a separate trigger, so
+    // the job stays open until a Config exists. A dataset that is ready with
+    // no dashboard is exactly the half-finished state Section 7.6 forbids
+    // presenting as complete.
+    const datasetRecord = await payload.findByID({
+      collection: "datasets",
+      id: datasetId,
+      depth: 0,
+    });
+
+    const config = await generateConfig(
+      claude,
+      datasetId,
+      datasetRecord.name,
+      normalized.tables,
+      normalized.relationships,
+      payload.logger,
+    );
+
+    // Version is never hardcoded: re-ingesting the same dataset (a corrected
+    // re-upload after an earlier failure, or any future re-run) must not
+    // create a second tied version, which the config-fetch route could then
+    // return nondeterministically instead of the newest one.
+    const priorConfigs = await payload.find({
+      collection: "configs",
+      where: { dataset: { equals: Number(datasetId) } },
+      limit: 1,
+      depth: 0,
+      sort: "-version",
+    });
+    const nextVersion = (priorConfigs.docs[0]?.version ?? 0) + 1;
+
+    await payload.create({
+      collection: "configs",
+      data: {
+        dataset: Number(datasetId),
+        version: nextVersion,
+        config,
+        insights: config.insights,
+        generatedBy: CONFIG_SOURCE.initialAutoGeneration,
+      },
+    });
+
+    await payload.update({
+      collection: "jobs",
+      id: data.jobId,
+      data: {
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        error: null,
+      },
+    });
+  } finally {
+    await datasetLock.releaseLock(datasetId, lockToken);
+  }
 };
 
 export {
