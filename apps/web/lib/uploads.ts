@@ -3,9 +3,16 @@ import path from "node:path";
 
 import type { SupportedFileType } from "@analytics/shared";
 
+import { EXTENSION_TO_TYPE, supportedExtensions } from "./uploadValidation";
+
+export { supportedExtensions };
+
 /**
  * MIME type to normalized file type. Nothing here describes any particular
  * dataset; it only decides which formats the parser is allowed to accept.
+ * The extension table lives in uploadValidation.ts (browser-safe, no
+ * node:crypto/node:path) so the client-side pre-check and this server-side
+ * check never disagree about which extensions exist.
  */
 const MIME_TO_TYPE: Record<string, SupportedFileType> = {
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
@@ -16,16 +23,6 @@ const MIME_TO_TYPE: Record<string, SupportedFileType> = {
   "image/jpeg": "image",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation":
     "pptx",
-};
-
-const EXTENSION_TO_TYPE: Record<string, SupportedFileType> = {
-  ".xlsx": "xlsx",
-  ".csv": "csv",
-  ".pdf": "pdf",
-  ".png": "image",
-  ".jpg": "image",
-  ".jpeg": "image",
-  ".pptx": "pptx",
 };
 
 export const readPositiveIntEnv = (name: string, fallback: number): number => {
@@ -66,6 +63,3 @@ export const resolveFileType = (
 
   return byMime;
 };
-
-export const supportedExtensions = (): string[] =>
-  Object.keys(EXTENSION_TO_TYPE);
