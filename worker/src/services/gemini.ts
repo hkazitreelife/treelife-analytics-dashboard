@@ -38,6 +38,18 @@ export class GeminiBillingError extends Error {
 }
 
 /**
+ * The model answered, but the answer was unusable: not JSON, empty, or failing
+ * the schema. This is the only Gemini-side failure worth retrying, because it is
+ * the only one a different model could plausibly fix.
+ */
+export class GeminiValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GeminiValidationError";
+  }
+}
+
+/**
  * Concrete model ids, not "-latest" aliases, so structural inference stays
  * reproducible across runs.
  *
@@ -52,6 +64,11 @@ const DEFAULT_RETRY_MODEL = "gemini-3.1-pro-preview";
  * Recognises a tier or billing rejection from the API error text. Google
  * signals these as 429 RESOURCE_EXHAUSTED or 403 PERMISSION_DENIED with
  * billing- or quota-flavoured wording, rather than with a dedicated code.
+ *
+ * Brittle by necessity: this matches Google's current message wording because
+ * there is no structural error code to key on. The ten-case test suite in the
+ * repo is the signal to watch, since it will start failing if Google rewords
+ * these responses, at which point the markers below need updating.
  */
 export const isBillingOrTierRejection = (message: string): boolean => {
   const text = message.toLowerCase();
@@ -212,6 +229,10 @@ export type InferMetadataOptions = {
 };
 
 export type GeminiClient = {
+  /** Model used for the first call. */
+  primaryModel: string;
+  /** Model used for the single retry after a validation failure. */
+  retryModelName: string;
   inferMetadata: (
     parsed: ParsedFile,
     options?: InferMetadataOptions,
@@ -237,8 +258,12 @@ export const createGeminiClient = (
   }
 
   const ai = new GoogleGenAI({ apiKey });
+  const effectiveRetryModel =
+    retryModel && retryModel.trim().length > 0 ? retryModel : model;
 
   return {
+    primaryModel: model,
+    retryModelName: effectiveRetryModel,
     inferMetadata: async (parsed, options) => {
       // The presence of a stricter instruction is what marks this as the retry
       // after a validation failure, so the model choice follows from it.
@@ -294,7 +319,9 @@ export const createGeminiClient = (
       const text = response.text;
 
       if (!text) {
-        throw new GeminiError("Gemini returned an empty response.");
+        throw new GeminiValidationError(
+          `Model "${activeModel}" returned an empty response.`,
+        );
       }
 
       let parsedJson: unknown;
@@ -302,8 +329,8 @@ export const createGeminiClient = (
       try {
         parsedJson = JSON.parse(text);
       } catch {
-        throw new GeminiError(
-          "Gemini returned a response that is not valid JSON.",
+        throw new GeminiValidationError(
+          `Model "${activeModel}" returned a response that is not valid JSON.`,
         );
       }
 
@@ -311,8 +338,8 @@ export const createGeminiClient = (
       const result = geminiMetadataSchema.safeParse(parsedJson);
 
       if (!result.success) {
-        throw new GeminiError(
-          `Gemini metadata failed schema validation: ${JSON.stringify(result.error.issues)}`,
+        throw new GeminiValidationError(
+          `Metadata from model "${activeModel}" failed schema validation: ${JSON.stringify(result.error.issues)}`,
         );
       }
 

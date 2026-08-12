@@ -9,7 +9,11 @@ import {
 } from "@analytics/shared";
 import type { Payload } from "payload";
 
-import type { GeminiClient } from "../services/gemini";
+import {
+  GeminiBillingError,
+  GeminiValidationError,
+  type GeminiClient,
+} from "../services/gemini";
 import {
   mergeDataset,
   MergeError,
@@ -44,6 +48,18 @@ const MEDIA_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../apps/web/media",
 );
+
+/**
+ * Whether a failure was about the shape of the model's output, which is the only
+ * kind a retry against a stronger model can fix.
+ *
+ * GeminiValidationError covers empty, non-JSON and schema-violating responses.
+ * MergeError covers structural mismatches found while merging: a missing table,
+ * a missing column index, or a headerRowIndex out of bounds. Everything else,
+ * notably GeminiBillingError, network failures and invalid keys, is not.
+ */
+export const isOutputQualityFailure = (error: unknown): boolean =>
+  error instanceof GeminiValidationError || error instanceof MergeError;
 
 export type IngestionDeps = {
   payload: Payload;
@@ -89,11 +105,28 @@ const inferAndMerge = async (
   try {
     return await attempt();
   } catch (firstError: unknown) {
+    // Escalating to a stronger, paid model only makes sense when the problem was
+    // the shape of the output. A billing rejection, a dead network or a bad key
+    // would fail identically on the retry and cost money to confirm it.
+    if (!isOutputQualityFailure(firstError)) {
+      if (firstError instanceof GeminiBillingError) {
+        // Stored verbatim: no retry or validation framing, because neither
+        // happened.
+        throw firstError;
+      }
+
+      throw new IngestionError(
+        `First-call failure, no retry attempted: ${
+          firstError instanceof Error ? firstError.message : String(firstError)
+        }`,
+      );
+    }
+
     const violation =
       firstError instanceof Error ? firstError.message : String(firstError);
 
     logger.warn(
-      `Metadata failed validation, retrying once with stricter instruction. Violation: ${violation}`,
+      `Metadata failed validation, retrying once with stricter instruction on model "${gemini.retryModelName || "unset, fell back to the primary model"}". Violation: ${violation}`,
     );
 
     const stricter = [
@@ -107,7 +140,22 @@ const inferAndMerge = async (
 
     // A second failure is final. The job fails loudly rather than storing
     // partially valid output.
-    return await attempt(stricter);
+    try {
+      return await attempt(stricter);
+    } catch (secondError: unknown) {
+      const detail =
+        secondError instanceof Error
+          ? secondError.message
+          : String(secondError);
+
+      if (secondError instanceof GeminiBillingError) {
+        throw secondError;
+      }
+
+      throw new IngestionError(
+        `Validation failed twice, second attempt used GEMINI_RETRY_MODEL "${gemini.retryModelName || "unset, fell back to the primary model"}". First violation: ${violation} Second failure: ${detail}`,
+      );
+    }
   }
 };
 

@@ -71,6 +71,8 @@ const main = async (): Promise<void> => {
   let calls = 0;
 
   const brokenGemini = {
+    primaryModel: "mock-primary",
+    retryModelName: "mock-retry",
     inferMetadata: async (parsed: {
       tables: { tableName: string; width: number }[];
     }) => {
