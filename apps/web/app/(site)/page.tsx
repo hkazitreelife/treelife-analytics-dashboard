@@ -552,7 +552,7 @@ export default function HomePage() {
 
       {datasetsPhase.kind === "signed-out" ? (
         <p>
-          <a href="/admin">Sign in</a> to view your datasets and upload new
+          <a href="/login">Sign in</a> to view your datasets and upload new
           files.
         </p>
       ) : null}
@@ -581,10 +581,6 @@ export default function HomePage() {
           </>
         )
       ) : null}
-
-      <p style={{ marginTop: 32, fontSize: 13, color: "#666" }}>
-        <a href="/admin">Payload admin</a> for login, uploads, and job status.
-      </p>
     </main>
   );
 }

@@ -220,7 +220,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
           setPhase({
             kind: "error",
             title: "Not signed in",
-            detail: "Sign in at /admin, then reload this page.",
+            detail: "Sign in at /login, then reload this page.",
           });
 
           return;
