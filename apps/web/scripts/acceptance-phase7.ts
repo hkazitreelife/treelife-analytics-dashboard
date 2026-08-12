@@ -7,6 +7,7 @@
  * HTML rather than screenshotting is deliberate: it proves the numbers on screen
  * come from the data, which a screenshot cannot.
  */
+import { DEFAULT_LIMITS } from "@analytics/shared";
 import { renderToStaticMarkup } from "react-dom/server";
 import { getPayload } from "payload";
 
@@ -30,6 +31,21 @@ const say = (label: string, value: unknown): void => {
     `${label}: ${typeof value === "string" ? value : JSON.stringify(value)}`,
   );
 };
+
+// React's renderToStaticMarkup HTML-escapes text content, including an
+// apostrophe (to &#x27;), which a raw .includes(title) check against the
+// rendered HTML would otherwise miss on any title containing one -- a real
+// false-negative risk in this script, not a rendering bug (found when a
+// live-generated insight titled "...Bands' revenue..." tripped exactly
+// this gap in the widget-title check's escaping, which handled &<>" but not
+// the apostrophe).
+const escapeForHtmlCompare = (text: string): string =>
+  text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
 
 type StoredTable = {
   tableName: string;
@@ -256,11 +272,7 @@ const main = async (): Promise<void> => {
     }
 
     // React escapes text, so compare against the escaped form.
-    const escapedTitle = widget.title
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+    const escapedTitle = escapeForHtmlCompare(widget.title);
 
     if (!html.includes(escapedTitle)) {
       failures.push(`${widget.widgetId}: title missing from output`);
@@ -696,7 +708,7 @@ const main = async (): Promise<void> => {
     ...new Set(dashboardConfig.insights.map((i) => i.severity)),
   ];
   const allBodiesPresent = dashboardConfig.insights.every((i) =>
-    insightsHtml.includes(i.title),
+    insightsHtml.includes(escapeForHtmlCompare(i.title)),
   );
   const severityAttrs = severities.every((s) =>
     insightsHtml.includes(`data-severity="${s}"`),
@@ -718,6 +730,121 @@ const main = async (): Promise<void> => {
   say("data-severity attribute per insight", severityAttrs);
   say("distinct colour token per severity", distinctColours);
 
+  // ---------------------------------------------------------- performance
+  console.log("\n=== performance: config+data fetch to render-ready (Section 23.3) ===");
+
+  // Section 23.3.1's 2-second target, read literally as this prompt asked:
+  // the whole window from starting the config+data fetch to a fully
+  // rendered dashboard, not just render time after fetch completes. Uses
+  // real HTTP against the running server, not the in-process `payload`
+  // reads the rest of this script uses elsewhere, because wall-clock
+  // fetch latency is exactly what's being measured here.
+  const PERF_TARGET_MS = 2000;
+  const perfStart = Date.now();
+
+  const [perfDatasetResp, perfConfigResp] = await Promise.all([
+    fetch(`${APP}/api/datasets/${datasetId}`, { headers: { cookie } }),
+    fetch(`${APP}/api/datasets/${datasetId}/config`, { headers: { cookie } }),
+  ]);
+
+  if (!perfDatasetResp.ok || !perfConfigResp.ok) {
+    throw new Error("Performance probe: dataset or config fetch failed.");
+  }
+
+  const perfConfigBody = (await perfConfigResp.json()) as {
+    config: typeof dashboardConfig;
+  };
+  const perfWidgets = perfConfigBody.config.tabs.flatMap((t) => t.widgets);
+
+  const perfRequiredTables = Array.from(
+    new Set(perfWidgets.map((w) => w.sourceTable)),
+  );
+  // Mirrors DashboardRenderer.tsx's needsFullTableAggregation exactly.
+  const perfAggregateTables = Array.from(
+    new Set(
+      perfWidgets
+        .filter(
+          (w) =>
+            ["bar", "line", "pie"].includes(w.type) && w.aggregation !== "none",
+        )
+        .map((w) => w.sourceTable),
+    ),
+  );
+
+  type PerfTableResponse = { columns: DataColumn[]; rows: DataRow[]; totalRows: number };
+
+  const fetchTable = (tableName: string, limit: number): Promise<PerfTableResponse> =>
+    fetch(
+      `${APP}/api/datasets/${datasetId}/data?table=${encodeURIComponent(tableName)}&limit=${limit}`,
+      { headers: { cookie } },
+    ).then((r) => r.json() as Promise<PerfTableResponse>);
+
+  const [previewResults, aggregateResults] = await Promise.all([
+    Promise.all(perfRequiredTables.map((name) => fetchTable(name, 100))),
+    Promise.all(
+      perfAggregateTables.map((name) =>
+        fetchTable(name, DEFAULT_LIMITS.maxRowsPerTable),
+      ),
+    ),
+  ]);
+
+  const previewByTable = new Map(
+    perfRequiredTables.map((name, i) => [name, previewResults[i]!]),
+  );
+  const aggregateByTable = new Map(
+    perfAggregateTables.map((name, i) => [name, aggregateResults[i]!]),
+  );
+
+  // Full render-ready state: every widget actually rendered, same as the
+  // main rendering pass above, using whichever fetch (preview or
+  // full-aggregate) the real renderer would pick for that widget.
+  let perfRenderFailures = 0;
+
+  for (const widget of perfWidgets) {
+    const isAggregateChart =
+      ["bar", "line", "pie"].includes(widget.type) && widget.aggregation !== "none";
+    const source = isAggregateChart
+      ? aggregateByTable.get(widget.sourceTable)
+      : previewByTable.get(widget.sourceTable);
+
+    if (!source) {
+      perfRenderFailures += 1;
+      continue;
+    }
+
+    try {
+      renderToStaticMarkup(
+        WidgetRenderer({
+          widget,
+          state: { status: "ready", ...source },
+        }) as React.ReactElement,
+      );
+    } catch {
+      perfRenderFailures += 1;
+    }
+  }
+
+  const perfElapsedMs = Date.now() - perfStart;
+  const perfOk = perfRenderFailures === 0 && perfElapsedMs <= PERF_TARGET_MS;
+
+  say("widgets fetched+rendered", perfWidgets.length);
+  say("render failures during timing pass", perfRenderFailures);
+  say("elapsed ms (config+data fetch through full render)", perfElapsedMs);
+  say(`within Section 23.3's ${PERF_TARGET_MS}ms target`, perfElapsedMs <= PERF_TARGET_MS);
+  say("performance probe result", perfOk ? "PASS" : "FAIL");
+
+  if (perfRenderFailures > 0) {
+    failures.push(
+      `performance probe: ${perfRenderFailures} widget(s) failed to render during the timing pass`,
+    );
+  }
+
+  if (perfElapsedMs > PERF_TARGET_MS) {
+    failures.push(
+      `performance probe: ${perfElapsedMs}ms exceeds Section 23.3's ${PERF_TARGET_MS}ms target`,
+    );
+  }
+
   console.log("\n=== SUMMARY ===");
   say("widgets rendered without throwing", `${renderedWidgets}/${allWidgets.length}`);
   say("kpi widgets with verified values", kpisRendered);
@@ -728,6 +855,7 @@ const main = async (): Promise<void> => {
   say("full-table chart aggregation probe", bigTable ? (fullAggregationOk ? "pass" : "fail") : "skipped");
   say("failed-status-with-good-data probe", failedWithDataOk ? "pass" : "fail");
   say("config version probe", versionsUnique ? "pass" : "fail");
+  say("performance probe (Section 23.3)", perfOk ? "pass" : "fail");
   say("failures", failures.length === 0 ? "none" : failures);
 
   const passed =
@@ -742,7 +870,8 @@ const main = async (): Promise<void> => {
     loadingOk &&
     allBodiesPresent &&
     severityAttrs &&
-    distinctColours;
+    distinctColours &&
+    perfOk;
 
   console.log(`\nPHASE 7 RENDERER: ${passed ? "PASS" : "FAIL"}`);
 
