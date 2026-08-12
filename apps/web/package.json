@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@analytics/shared": "workspace:*",
+    "@anthropic-ai/sdk": "^0.116.0",
     "@payloadcms/db-postgres": "3.87.1",
     "@payloadcms/next": "3.87.1",
     "@payloadcms/ui": "3.87.1",

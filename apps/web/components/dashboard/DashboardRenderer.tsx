@@ -176,6 +176,18 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   // table-fetch effects below without touching config or reloading the page.
   const [dataRefreshToken, setDataRefreshToken] = useState(0);
 
+  // Section 13: prompt-based editing. A minimal control surface for the
+  // existing POST /api/datasets/:id/config/prompt endpoint -- the SSE
+  // listener below already refetches config on success, so this only needs
+  // to submit the request and show a pending/result state.
+  const [promptValue, setPromptValue] = useState("");
+  const [promptStatus, setPromptStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "pending" }
+    | { kind: "success"; version: number }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
   useEffect(() => {
     let cancelled = false;
 
@@ -386,6 +398,56 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     };
   }, [datasetId, phase.kind]);
 
+  const handlePromptSubmit = async (
+    event: React.FormEvent<HTMLFormElement>,
+  ): Promise<void> => {
+    event.preventDefault();
+
+    const trimmed = promptValue.trim();
+
+    if (!trimmed || promptStatus.kind === "pending") {
+      return;
+    }
+
+    setPromptStatus({ kind: "pending" });
+
+    try {
+      const response = await fetch(
+        `/api/datasets/${datasetId}/config/prompt`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: trimmed }),
+        },
+      );
+
+      const body = (await response.json()) as {
+        configVersion?: number;
+        error?: string;
+      };
+
+      if (!response.ok) {
+        setPromptStatus({
+          kind: "error",
+          message: body.error ?? `Request returned ${response.status}.`,
+        });
+
+        return;
+      }
+
+      // Deliberately no manual config refetch here: config.updated over SSE
+      // already does it (Section 18.3). This just confirms success.
+      setPromptStatus({ kind: "success", version: body.configVersion ?? 0 });
+      setPromptValue("");
+    } catch (error: unknown) {
+      setPromptStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   if (phase.kind === "loading") {
     return (
       <div className="space-y-4" aria-busy="true" aria-live="polite">
@@ -437,6 +499,46 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
           status {dataset.status} · config v{version}
         </p>
       </header>
+
+      <form
+        onSubmit={handlePromptSubmit}
+        className="flex flex-wrap items-center gap-2 rounded-lg border border-[color:var(--color-cloud)] bg-white p-3"
+      >
+        <label htmlFor="dashboard-prompt" className="sr-only">
+          Reshape this dashboard
+        </label>
+        <input
+          id="dashboard-prompt"
+          type="text"
+          value={promptValue}
+          onChange={(event) => setPromptValue(event.target.value)}
+          placeholder='Reshape this dashboard, e.g. "Change the revenue chart to a pie chart."'
+          disabled={promptStatus.kind === "pending"}
+          className="min-w-64 flex-1 rounded-md border border-[color:var(--color-cloud)] px-3 py-1.5 text-sm text-[color:var(--color-ink)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-cobalt)] disabled:opacity-60"
+        />
+        <button
+          type="submit"
+          disabled={
+            promptStatus.kind === "pending" || promptValue.trim().length === 0
+          }
+          className="rounded-md bg-[color:var(--color-forest)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+        >
+          {promptStatus.kind === "pending" ? "Applying…" : "Apply"}
+        </button>
+        {promptStatus.kind === "success" ? (
+          <span
+            role="status"
+            className="text-xs text-[color:var(--color-risk-low)]"
+          >
+            Applied as config v{promptStatus.version}.
+          </span>
+        ) : null}
+        {promptStatus.kind === "error" ? (
+          <span role="alert" className="text-xs text-[color:var(--color-risk-high)]">
+            {promptStatus.message}
+          </span>
+        ) : null}
+      </form>
 
       <Tabs defaultValue={firstTab.tabId}>
         <TabsList>

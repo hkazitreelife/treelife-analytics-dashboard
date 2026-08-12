@@ -1,0 +1,292 @@
+import type { DashboardConfigShape } from "./schemas/dashboardConfig";
+import type { NormalizedTableShape } from "./schemas/normalizedDataset";
+
+/**
+ * Shared between the worker (initial config generation, worker/src/services/
+ * claudeConfig.ts) and the web process (prompt-based editing,
+ * apps/web/lib/claudeConfigEditClient.ts). Both build the same metadata shape
+ * for Claude and validate its output against the same rules, so this lives
+ * here once rather than drifting between two copies.
+ */
+
+/** Billing, quota or tier rejection. Never retried by either caller. */
+export const isClaudeBillingRejection = (
+  message: string,
+  status?: number,
+): boolean => {
+  if (status === 402 || status === 429) {
+    return true;
+  }
+
+  const text = message.toLowerCase();
+
+  return [
+    "credit balance",
+    "billing",
+    "insufficient",
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "payment",
+    "upgrade your plan",
+  ].some((marker) => text.includes(marker));
+};
+
+export type NumericAggregate = {
+  column: string;
+  sum: number;
+  avg: number;
+  min: number;
+  max: number;
+  nonNullCount: number;
+};
+
+export type TableMetadataForClaude = {
+  tableName: string;
+  tableRole: string;
+  rowCount: number;
+  columns: {
+    name: string;
+    inferredType: string;
+    nullable: boolean;
+    sampleValues: string[];
+    emptyCount: number;
+  }[];
+  numericAggregates: NumericAggregate[];
+};
+
+export type DatasetMetadataForClaude = {
+  datasetId: string;
+  datasetName: string;
+  tables: TableMetadataForClaude[];
+  relationships: unknown[];
+};
+
+const asNumber = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    // Tolerates currency symbols, thousands separators and stray spaces.
+    const cleaned = value.replace(/[^0-9.eE+-]/g, "");
+    const parsed = Number.parseFloat(cleaned);
+
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+};
+
+/**
+ * Builds the metadata payload sent to Claude, for either initial generation
+ * or a prompt edit. Rows are read here to compute aggregates, and only the
+ * aggregates leave this function. No row ever reaches the prompt.
+ */
+export const buildDatasetMetadata = (
+  datasetId: string,
+  datasetName: string,
+  tables: NormalizedTableShape[],
+  relationships: unknown[],
+): DatasetMetadataForClaude => ({
+  datasetId,
+  datasetName,
+  relationships,
+  tables: tables.map((table) => {
+    const numericAggregates: NumericAggregate[] = [];
+
+    for (const column of table.columns) {
+      if (column.inferredType !== "numeric") {
+        continue;
+      }
+
+      const values: number[] = [];
+
+      for (const row of table.rows) {
+        const parsed = asNumber(row[column.name]);
+
+        if (parsed !== null) {
+          values.push(parsed);
+        }
+      }
+
+      if (values.length === 0) {
+        continue;
+      }
+
+      const sum = values.reduce((total, value) => total + value, 0);
+
+      numericAggregates.push({
+        column: column.name,
+        sum: Number(sum.toFixed(6)),
+        avg: Number((sum / values.length).toFixed(6)),
+        min: Math.min(...values),
+        max: Math.max(...values),
+        nonNullCount: values.length,
+      });
+    }
+
+    return {
+      tableName: table.tableName,
+      tableRole: table.tableRole,
+      rowCount: table.rows.length,
+      columns: table.columns.map((column) => ({
+        name: column.name,
+        inferredType: column.inferredType,
+        nullable: column.nullable,
+        sampleValues: column.sampleValues,
+        emptyCount: table.rows.filter((row) => {
+          const value = row[column.name];
+
+          return value === null || value === undefined || value === "";
+        }).length,
+      })),
+      numericAggregates,
+    };
+  }),
+});
+
+/**
+ * Rejects a config that references a table or column which does not exist.
+ * Schema validation cannot catch this, because an invented name is a
+ * well-formed string. Returns the list of problems, empty when clean.
+ */
+export const findUnknownReferences = (
+  config: DashboardConfigShape,
+  tables: NormalizedTableShape[],
+): string[] => {
+  const columnsByTable = new Map(
+    tables.map((table) => [
+      table.tableName,
+      new Set(table.columns.map((column) => column.name)),
+    ]),
+  );
+
+  const problems: string[] = [];
+
+  for (const tab of config.tabs) {
+    for (const widget of tab.widgets) {
+      const columns = columnsByTable.get(widget.sourceTable);
+
+      if (!columns) {
+        problems.push(
+          `widget "${widget.widgetId}" references unknown table "${widget.sourceTable}"`,
+        );
+        continue;
+      }
+
+      for (const field of widget.fields) {
+        if (!columns.has(field)) {
+          problems.push(
+            `widget "${widget.widgetId}" references unknown column "${field}" in table "${widget.sourceTable}"`,
+          );
+        }
+      }
+    }
+  }
+
+  for (const insight of config.insights) {
+    for (const tableName of insight.relatedTables) {
+      if (!columnsByTable.has(tableName)) {
+        problems.push(
+          `insight "${insight.insightId}" references unknown table "${tableName}"`,
+        );
+      }
+    }
+  }
+
+  return problems;
+};
+
+/**
+ * The emit_dashboard_config tool's input schema. Shared so the initial
+ * generation call and the prompt-edit call force the exact same structural
+ * shape at the API level — both produce a DashboardConfigShape, so there is
+ * no reason for the two tool schemas to ever disagree.
+ */
+export const dashboardConfigToolSchema = {
+  type: "object" as const,
+  properties: {
+    datasetId: { type: "string" },
+    title: { type: "string" },
+    tabs: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          tabId: { type: "string" },
+          tabName: { type: "string" },
+          widgets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                widgetId: { type: "string" },
+                type: {
+                  type: "string",
+                  enum: ["kpi_card", "bar", "line", "pie", "table"],
+                },
+                title: { type: "string" },
+                sourceTable: { type: "string" },
+                fields: { type: "array", items: { type: "string" } },
+                aggregation: {
+                  type: "string",
+                  enum: ["none", "sum", "count", "avg"],
+                },
+                position: {
+                  type: "object",
+                  properties: {
+                    row: { type: "integer" },
+                    col: { type: "integer" },
+                    w: { type: "integer" },
+                    h: { type: "integer" },
+                  },
+                  required: ["row", "col", "w", "h"],
+                  additionalProperties: false,
+                },
+              },
+              required: [
+                "widgetId",
+                "type",
+                "title",
+                "sourceTable",
+                "fields",
+                "aggregation",
+                "position",
+              ],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["tabId", "tabName", "widgets"],
+        additionalProperties: false,
+      },
+    },
+    insights: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          insightId: { type: "string" },
+          title: { type: "string" },
+          body: { type: "string" },
+          severity: {
+            type: "string",
+            enum: ["info", "warning", "positive", "negative"],
+          },
+          relatedTables: { type: "array", items: { type: "string" } },
+        },
+        required: [
+          "insightId",
+          "title",
+          "body",
+          "severity",
+          "relatedTables",
+        ],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["datasetId", "title", "tabs", "insights"],
+  additionalProperties: false,
+};
