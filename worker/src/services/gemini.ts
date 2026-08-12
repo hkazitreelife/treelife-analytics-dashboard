@@ -26,10 +26,54 @@ export class GeminiError extends Error {
 }
 
 /**
- * A concrete model id, not a "-latest" alias, so structural inference stays
- * reproducible across runs. Override with GEMINI_MODEL.
+ * A billing or tier rejection, kept separate from GeminiError on purpose. A
+ * payment problem looks nothing like a bad-output problem, and whoever reads the
+ * Job record later must be able to tell them apart at a glance.
  */
-const DEFAULT_MODEL = "gemini-3.5-flash";
+export class GeminiBillingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GeminiBillingError";
+  }
+}
+
+/**
+ * Concrete model ids, not "-latest" aliases, so structural inference stays
+ * reproducible across runs.
+ *
+ * First call: a fast model, good enough for structural classification.
+ * Retry after a validation failure: a stronger model, because the cheap one has
+ * already demonstrated it cannot satisfy the schema for this input.
+ */
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const DEFAULT_RETRY_MODEL = "gemini-3.1-pro-preview";
+
+/**
+ * Recognises a tier or billing rejection from the API error text. Google
+ * signals these as 429 RESOURCE_EXHAUSTED or 403 PERMISSION_DENIED with
+ * billing- or quota-flavoured wording, rather than with a dedicated code.
+ */
+export const isBillingOrTierRejection = (message: string): boolean => {
+  const text = message.toLowerCase();
+
+  const markers = [
+    "billing",
+    "billed users",
+    "paid tier",
+    "free tier",
+    "free quota",
+    "resource_exhausted",
+    "quota exceeded",
+    "exceeded your current quota",
+    "permission_denied",
+    "does not have access",
+    "not available to free",
+    "requires a paid",
+    "enable billing",
+  ];
+
+  return markers.some((marker) => text.includes(marker));
+};
 
 const SYSTEM_INSTRUCTION = [
   "You infer structural metadata about tabular data extracted from a file.",
@@ -174,9 +218,17 @@ export type GeminiClient = {
   ) => Promise<GeminiMetadata>;
 };
 
+export type GeminiLogger = {
+  warn: (message: string) => void;
+  info: (message: string) => void;
+};
+
 export const createGeminiClient = (
   apiKey: string,
   model: string = process.env.GEMINI_MODEL ?? DEFAULT_MODEL,
+  retryModel: string | undefined = process.env.GEMINI_RETRY_MODEL ??
+    DEFAULT_RETRY_MODEL,
+  logger: GeminiLogger = console,
 ): GeminiClient => {
   if (!apiKey) {
     throw new GeminiError(
@@ -188,6 +240,24 @@ export const createGeminiClient = (
 
   return {
     inferMetadata: async (parsed, options) => {
+      // The presence of a stricter instruction is what marks this as the retry
+      // after a validation failure, so the model choice follows from it.
+      const isRetry = Boolean(options?.stricterInstruction);
+
+      let activeModel = model;
+
+      if (isRetry) {
+        if (retryModel && retryModel.trim().length > 0) {
+          activeModel = retryModel;
+        } else {
+          logger.warn(
+            `GEMINI_RETRY_MODEL is unset. Falling back to GEMINI_MODEL "${model}" for the validation retry.`,
+          );
+        }
+
+        logger.info(`Retrying structural inference with model "${activeModel}".`);
+      }
+
       const systemInstruction = options?.stricterInstruction
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
@@ -196,7 +266,7 @@ export const createGeminiClient = (
 
       try {
         response = await ai.models.generateContent({
-          model,
+          model: activeModel,
           contents: buildMetadataPrompt(parsed),
           config: {
             systemInstruction,
@@ -208,8 +278,16 @@ export const createGeminiClient = (
         });
       } catch (error: unknown) {
         // The key must never reach a log or an error message.
+        const detail = error instanceof Error ? error.message : String(error);
+
+        if (isBillingOrTierRejection(detail)) {
+          throw new GeminiBillingError(
+            `BILLING OR TIER REJECTION from model "${activeModel}"${isRetry ? " on the validation retry" : ""}. This is a payment or quota problem, not bad model output. The API key's tier does not permit this model, or its quota is exhausted. Either enable billing for the key, or set ${isRetry ? "GEMINI_RETRY_MODEL" : "GEMINI_MODEL"} to a model the key can use. Provider detail: ${detail}`,
+          );
+        }
+
         throw new GeminiError(
-          `Gemini request failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Gemini request failed on model "${activeModel}": ${detail}`,
         );
       }
 
