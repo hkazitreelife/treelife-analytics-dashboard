@@ -23,6 +23,7 @@ import {
 } from "../services/claudeConfig";
 
 import { type DatasetLock } from "../services/datasetLock";
+import { type DatasetEventPublisher } from "../services/events";
 import {
   GeminiBillingError,
   GeminiValidationError,
@@ -83,6 +84,7 @@ export type IngestionDeps = {
   claude: ClaudeConfigClient;
   datasetLock: DatasetLock;
   queue: Queue<IngestionJobData>;
+  events: DatasetEventPublisher;
   mediaDir?: string;
 };
 
@@ -294,7 +296,7 @@ export const processIngestionJob = async (
   data: IngestionJobData,
   deps: IngestionDeps,
 ): Promise<void> => {
-  const { payload, gemini, claude, datasetLock, queue } = deps;
+  const { payload, gemini, claude, datasetLock, queue, events } = deps;
   const mediaDir = deps.mediaDir ?? MEDIA_DIR;
   const limits = readIngestionLimits();
 
@@ -303,6 +305,7 @@ export const processIngestionJob = async (
     id: data.jobId,
     data: { status: "processing" },
   });
+  await events.publish("job.updated", data.datasetId, data.jobId);
 
   const jobRecord = await payload.findByID({
     collection: "jobs",
@@ -331,6 +334,7 @@ export const processIngestionJob = async (
     id: data.jobId,
     data: { status: "validating" },
   });
+  await events.publish("job.updated", data.datasetId, data.jobId);
 
   const parsed = parseSpreadsheet(
     bytes,
@@ -344,6 +348,7 @@ export const processIngestionJob = async (
     id: data.jobId,
     data: { status: "generating_config" },
   });
+  await events.publish("job.updated", data.datasetId, data.jobId);
 
   const datasetId =
     jobRecord.dataset === null || jobRecord.dataset === undefined
@@ -388,6 +393,7 @@ export const processIngestionJob = async (
       id: data.jobId,
       data: { status: "queued" },
     });
+    await events.publish("job.updated", datasetId, data.jobId);
 
     return;
   }
@@ -427,6 +433,7 @@ export const processIngestionJob = async (
         lastError: null,
       },
     });
+    await events.publish("dataset.updated", datasetId, data.jobId);
 
     // Config generation is part of this pipeline, not a separate trigger, so
     // the job stays open until a Config exists. A dataset that is ready with
@@ -470,6 +477,7 @@ export const processIngestionJob = async (
         generatedBy: CONFIG_SOURCE.initialAutoGeneration,
       },
     });
+    await events.publish("config.updated", datasetId, data.jobId);
 
     await payload.update({
       collection: "jobs",
@@ -480,6 +488,7 @@ export const processIngestionJob = async (
         error: null,
       },
     });
+    await events.publish("job.updated", datasetId, data.jobId);
   } finally {
     await datasetLock.releaseLock(datasetId, lockToken);
   }

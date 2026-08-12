@@ -172,6 +172,9 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   // instead of ROW_LIMIT, so that aggregation math is correct rather than
   // computed over the first 100 rows.
   const [aggregateData, setAggregateData] = useState<Record<string, TableState>>({});
+  // Bumped by the SSE listener's dataset.updated handler to re-trigger the two
+  // table-fetch effects below without touching config or reloading the page.
+  const [dataRefreshToken, setDataRefreshToken] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -309,18 +312,79 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   }, [phase]);
 
   // Preview fetch: 100 rows, used by table/kpi widgets and by charts with no
-  // aggregation. Unchanged behaviour.
+  // aggregation. Re-runs on dataRefreshToken so a dataset.updated SSE event
+  // refetches the same tables without a full page reload.
   useEffect(
     () => loadTablesInto(datasetId, requiredTables, ROW_LIMIT, setTables),
-    [datasetId, requiredTables],
+    [datasetId, requiredTables, dataRefreshToken],
   );
 
   // Full-table fetch: only for tables backing an aggregating chart, so the
   // sum/avg/count shown reflects the whole table rather than the preview.
   useEffect(
     () => loadTablesInto(datasetId, aggregateTables, AGGREGATE_ROW_LIMIT, setAggregateData),
-    [datasetId, aggregateTables],
+    [datasetId, aggregateTables, dataRefreshToken],
   );
+
+  // Section 18.3: on dataset.updated, refetch the affected data; on
+  // config.updated, refetch config and re-render; on job.updated, no-op for
+  // now (no job-status UI exists yet) but still handled explicitly so an
+  // event type this component doesn't otherwise act on never surfaces as
+  // unhandled. One EventSource per successfully-loaded dashboard.
+  useEffect(() => {
+    if (phase.kind !== "ready") {
+      return;
+    }
+
+    const source = new EventSource(`/api/events/datasets/${datasetId}`);
+
+    const onDatasetUpdated = (): void => {
+      setDataRefreshToken((token) => token + 1);
+    };
+
+    const onConfigUpdated = (): void => {
+      void (async () => {
+        try {
+          const response = await fetch(
+            `/api/datasets/${datasetId}/config`,
+            { credentials: "include" },
+          );
+
+          if (!response.ok) {
+            return;
+          }
+
+          const body = (await response.json()) as ConfigResponse;
+
+          setPhase((current) =>
+            current.kind === "ready"
+              ? { ...current, config: body.config, version: body.version }
+              : current,
+          );
+        } catch {
+          // A missed live update is not fatal: the next SSE event, or a
+          // manual reload, catches the dashboard up. Never let this throw.
+        }
+      })();
+    };
+
+    const onJobUpdated = (): void => {
+      // Deliberately empty: no job-status UI exists yet to update.
+    };
+
+    source.addEventListener("dataset.updated", onDatasetUpdated);
+    source.addEventListener("config.updated", onConfigUpdated);
+    source.addEventListener("job.updated", onJobUpdated);
+
+    source.onerror = () => {
+      // EventSource retries on its own; a transient network error here must
+      // never surface as an app-level error state.
+    };
+
+    return () => {
+      source.close();
+    };
+  }, [datasetId, phase.kind]);
 
   if (phase.kind === "loading") {
     return (

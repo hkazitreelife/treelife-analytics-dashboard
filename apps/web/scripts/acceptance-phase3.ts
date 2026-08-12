@@ -227,6 +227,7 @@ const main = async (): Promise<void> => {
     datasetLock: { acquireLock: async () => true, releaseLock: async () => true },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     queue: { add: async () => undefined } as any,
+    events: { publish: async () => undefined },
     mediaDir,
   });
 
@@ -339,6 +340,7 @@ const main = async (): Promise<void> => {
       datasetLock: { acquireLock: async () => true, releaseLock: async () => true },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       queue: { add: async () => undefined } as any,
+      events: { publish: async () => undefined },
       mediaDir,
     });
 

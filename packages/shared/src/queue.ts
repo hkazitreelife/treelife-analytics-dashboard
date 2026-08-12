@@ -8,6 +8,36 @@ export type IngestionJobData = {
 };
 
 /**
+ * Section 18.1. The three events the worker publishes and the SSE route
+ * forwards. Frontend refetches the affected resource on receipt rather than
+ * mutating state from the payload (Section 18.3/30.7) — so the payload
+ * stays intentionally minimal, never dataset rows or config content.
+ */
+export const DATASET_EVENT_TYPES = [
+  "job.updated",
+  "dataset.updated",
+  "config.updated",
+] as const;
+
+export type DatasetEventType = (typeof DATASET_EVENT_TYPES)[number];
+
+/** Section 18.2 minimum payload. */
+export type DatasetEventPayload = {
+  event: DatasetEventType;
+  datasetId: string;
+  jobId: string | null;
+  timestamp: string;
+};
+
+/**
+ * One Redis pub/sub channel per dataset, so the dataset-scoped SSE route
+ * (Section 20.10) subscribes to exactly the events its own dashboard cares
+ * about rather than filtering a global stream.
+ */
+export const datasetEventChannel = (datasetId: string): string =>
+  `events:dataset:${datasetId}`;
+
+/**
  * BullMQ requires `maxRetriesPerRequest: null` on connections used by blocking
  * commands, which its workers rely on. Both processes build clients from this
  * one place so the settings cannot drift apart.

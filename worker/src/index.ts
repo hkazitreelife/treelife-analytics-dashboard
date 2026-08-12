@@ -42,12 +42,16 @@ const { default: config } = await import("@payload-config");
 const { createGeminiClient } = await import("./services/gemini");
 const { createClaudeConfigClient } = await import("./services/claudeConfig");
 const { createDatasetLock } = await import("./services/datasetLock");
+const { createDatasetEventPublisher } = await import("./services/events");
 const { processIngestionJob } = await import("./processors/ingestion");
 
 const payload = await getPayload({ config });
 const gemini = createGeminiClient(geminiApiKey);
 const claude = createClaudeConfigClient(anthropicApiKey);
 const datasetLock = createDatasetLock(connection);
+// Shares `connection`: publish is a normal command, not a dedicated
+// subscriber-mode client the way SUBSCRIBE is, so no second connection.
+const events = createDatasetEventPublisher(connection);
 
 // Shares `connection` rather than opening a second Redis connection: BullMQ
 // supports a Queue (producer) and a Worker (consumer) on the same client.
@@ -84,7 +88,11 @@ const recordFailure = async (
         id: jobRecord.dataset,
         data: { status: "failed", lastError: message },
       });
+
+      await events.publish("dataset.updated", String(jobRecord.dataset), data.jobId);
     }
+
+    await events.publish("job.updated", data.datasetId, data.jobId);
   } catch (updateError: unknown) {
     payload.logger.error({ err: updateError }, "Could not record job failure.");
   }
@@ -100,6 +108,7 @@ const worker = new Worker<IngestionJobData>(
         claude,
         datasetLock,
         queue: ingestionQueue,
+        events,
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
