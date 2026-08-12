@@ -84,6 +84,16 @@ export default buildConfig({
     importMap: {
       baseDir: path.resolve(dirname),
     },
+    // Payload's own RootLayout reads this to decide whether to suppress
+    // React's hydration-mismatch warning on the <html> tag it renders. The
+    // mismatch in question is browser extensions (Grammarly, etc.) injecting
+    // their own attributes into the DOM before React hydrates -- not
+    // anything this app's code controls, and not a real bug. React's own
+    // hydration-mismatch error names this exact cause. Payload has no
+    // equivalent knob for the <body> tag it renders, so an extension that
+    // injects body-level attributes (Grammarly does) will still warn; the
+    // only real fix for that half is disabling the extension for localhost.
+    suppressHydrationWarning: true,
   },
   collections: [Users, Files, Datasets, Configs, Jobs],
   secret: requireEnv("PAYLOAD_SECRET"),
