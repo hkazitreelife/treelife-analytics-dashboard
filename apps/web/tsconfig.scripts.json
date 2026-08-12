@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Next uses "preserve", which leaves tsx falling back to the classic JSX
+    // transform and expecting React in scope. Scripts that render components
+    // directly need the automatic runtime instead.
+    "jsx": "react-jsx"
+  }
+}
