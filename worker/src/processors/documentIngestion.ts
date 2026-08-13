@@ -78,6 +78,29 @@ export const processDocumentIngestionJob = async (
   const { payload, geminiDocument, claudeSummary } = deps;
   const mediaDir = deps.mediaDir ?? MEDIA_DIR;
 
+  // Timing instrumentation, not a permanent metric: the AI-call timings
+  // added earlier only covered the two model calls themselves: this covers
+  // everything else in this function (job/document status writes, the file
+  // read, Payload reads/creates) plus queue latency -- the gap between the
+  // job actually being enqueued and this function starting to run it,
+  // which lives entirely outside this function and is invisible to any
+  // timer placed inside it, so it's measured separately, from the Job
+  // row's own createdAt.
+  const processorStartedAt = Date.now();
+
+  const jobRecordForTiming = await payload.findByID({
+    collection: "jobs",
+    id: data.jobId,
+    depth: 0,
+  });
+
+  const queueLatencyMs =
+    processorStartedAt - new Date(jobRecordForTiming.createdAt).getTime();
+
+  payload.logger.info(
+    `Queue latency (job row created -> worker picked it up) ${queueLatencyMs}ms for job ${data.jobId}.`,
+  );
+
   await payload.update({
     collection: "jobs",
     id: data.jobId,
@@ -110,6 +133,12 @@ export const processDocumentIngestionJob = async (
     id: data.jobId,
     data: { status: "validating" },
   });
+
+  const setupDurationMs = Date.now() - processorStartedAt;
+
+  payload.logger.info(
+    `Pre-extraction setup (job/status writes, file record lookup, file read) took ${setupDurationMs}ms for job ${data.jobId}.`,
+  );
 
   const extractionAttempt = async (stricterInstruction?: string) =>
     geminiDocument.extractDocument(
@@ -193,6 +222,8 @@ export const processDocumentIngestionJob = async (
     );
   }
 
+  const postExtractionStartedAt = Date.now();
+
   const normalizedCandidate = {
     documentId: data.documentId,
     sourceFile: {
@@ -228,6 +259,12 @@ export const processDocumentIngestionJob = async (
     id: data.jobId,
     data: { status: "generating_config" },
   });
+
+  const postExtractionDurationMs = Date.now() - postExtractionStartedAt;
+
+  payload.logger.info(
+    `Post-extraction writes (schema validation, document + job status update) took ${postExtractionDurationMs}ms for job ${data.jobId}.`,
+  );
 
   const summaryAttempt = async (stricterInstruction?: string) =>
     claudeSummary.generateSummary(
@@ -293,6 +330,8 @@ export const processDocumentIngestionJob = async (
     `Document summary (Claude, model "${claudeSummary.primaryModel}") took ${summaryDurationMs}ms for job ${data.jobId}.`,
   );
 
+  const postSummaryStartedAt = Date.now();
+
   // Re-validated here too, immediately before storage, same
   // never-trust-a-single-check discipline as the table path's
   // findUnknownReferences/insight-metric checks.
@@ -347,4 +386,15 @@ export const processDocumentIngestionJob = async (
       error: null,
     },
   });
+
+  const postSummaryDurationMs = Date.now() - postSummaryStartedAt;
+  const totalProcessorDurationMs = Date.now() - processorStartedAt;
+
+  payload.logger.info(
+    `Post-summary writes (re-validation, quote check, prior-version lookup, summary create, job completion) took ${postSummaryDurationMs}ms for job ${data.jobId}.`,
+  );
+  payload.logger.info(
+    `Total time inside processDocumentIngestionJob: ${totalProcessorDurationMs}ms for job ${data.jobId} ` +
+      `(queue latency ${queueLatencyMs}ms was before this and is not included).`,
+  );
 };
