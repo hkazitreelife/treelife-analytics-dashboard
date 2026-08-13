@@ -313,10 +313,14 @@ const generateConfig = async (
       metadata.rawSheetTableName
         ? `Every widget's sourceTable must be exactly "${metadata.rawSheetTableName}" -- do not create a widget for any other table, even one that seems relevant. Insights may still name other tables in relatedTables.`
         : "",
-      "Every insight metric's sourceTable/sourceField must be a real table/",
-      "column name, verbatim, and its aggregation must suit that column's",
-      "type (never sum/avg/min/max a non-numeric column). Do not include a",
-      "`value` field on a metric -- you never supply one.",
+      "Every insight metric needs a kind. kind:\"aggregate\" needs",
+      "sourceTable/sourceField (a real table/column name, verbatim) and an",
+      "aggregation suiting that column's type (never sum/avg/min/max a",
+      "non-numeric column). kind:\"row\" needs sourceTable/labelColumn/",
+      "labelValue/valueColumn instead, no aggregation field -- use it for a",
+      "table with preferRowAddressing:true or a row listed in",
+      "namedFigureRows. Do not include a `value` field on any metric -- you",
+      "never supply one.",
     ]
       .filter(Boolean)
       .join(" ");

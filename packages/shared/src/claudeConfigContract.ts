@@ -1,3 +1,4 @@
+import { insightMetricJsonSchema } from "./schemas/dashboardConfig";
 import type {
   DashboardConfigShape,
   DashboardInsightShape,
@@ -46,6 +47,18 @@ export type NumericAggregate = {
   nonNullCount: number;
 };
 
+/**
+ * Section 9.2. A row that names one specific figure rather than being a peer
+ * record -- see findNamedFigureRows for exactly what's detected and why.
+ * Given to Claude pre-computed (labelValue included) so a "row" metric can
+ * cite it verbatim rather than Claude guessing the exact label text itself.
+ */
+export type NamedFigureRow = {
+  labelColumn: string;
+  labelValue: string;
+  valueColumn: string;
+};
+
 export type TableMetadataForClaude = {
   tableName: string;
   tableRole: string;
@@ -58,6 +71,20 @@ export type TableMetadataForClaude = {
     emptyCount: number;
   }[];
   numericAggregates: NumericAggregate[];
+  /**
+   * Section 9.2: true for a config-role table (Gemini already infers
+   * tableRole; this adds no new AI-verified field). A config table is
+   * independent named constants, not peer records -- aggregating across its
+   * value column mixes unrelated figures together, so every figure in it
+   * should be cited by kind:"row", never kind:"aggregate".
+   */
+  preferRowAddressing: boolean;
+  /**
+   * Section 9.2: specific rows detected inside this table (of any role)
+   * that are themselves a single named figure, not a peer to the table's
+   * normal rows -- see findNamedFigureRows.
+   */
+  namedFigureRows: NamedFigureRow[];
 };
 
 export type DatasetMetadataForClaude = {
@@ -143,26 +170,120 @@ export const excludeTotalRows = <T extends Record<string, unknown>>(
   return rows.filter((row) => !isTotalRowLabel(row[labelColumn]));
 };
 
+const isBlankCell = (value: unknown): boolean =>
+  value === null || value === undefined || value === "";
+
 /**
- * Section 9.1. Claude's insight and chat-answer contracts both name which
- * real column and aggregation they're citing (a metric reference) rather
+ * Section 9.2. Detects rows that are themselves a single named figure
+ * (e.g. "Committed target", "Gap to commit") sitting inside an otherwise
+ * normal multi-column data table, rather than a peer record like the
+ * table's other rows.
+ *
+ * Found live in a real dataset's Bands table: five real per-band rows
+ * (Anchor, Core, Entry, ...) populate most or all of five numeric columns,
+ * but four summary rows -- "Model annual (Cr)", "Committed target (Cr)",
+ * "Gap to commit (Cr)", "Exit run rate (Cr)" -- populate exactly one of
+ * them (annual_revenue_Cr) and leave the rest blank. Citing that column by
+ * aggregation (e.g. max) silently mixes an unrelated figure into what looks
+ * like a real per-band statistic -- the exact bug Section 9.2 fixes.
+ *
+ * The rule: a table with two or more numeric columns has a "typical" row
+ * shape that uses more than one of them; any row using exactly one, while
+ * some other row in the same table uses more than one, stands out as a
+ * named figure rather than a peer -- regardless of tableRole. A table with
+ * only one numeric column overall (e.g. a plain category+count breakdown
+ * like a reasons-for-exit table) never reaches this rule at all, since
+ * "exactly one populated column" would be true of every one of its rows
+ * and would say nothing -- those tables are left to preferRowAddressing
+ * (tableRole "config") or ordinary aggregation instead.
+ *
+ * The label column prefers "categorical" over "id"/"date" (unlike
+ * findLabelColumnName): a named figure is more likely to have a
+ * human-readable label than a machine id, and in the Bands table the id
+ * column is specifically what's blank for the rows this needs to catch.
+ */
+export const findNamedFigureRows = (table: {
+  rows: Record<string, unknown>[];
+  columns: { name: string; inferredType: string }[];
+}): NamedFigureRow[] => {
+  const categoricalColumn = table.columns.find(
+    (column) => column.inferredType === "categorical",
+  )?.name;
+  const labelColumn = categoricalColumn ?? findLabelColumnName(table.columns);
+
+  if (!labelColumn) {
+    return [];
+  }
+
+  const numericColumnNames = table.columns
+    .filter((column) => column.inferredType === "numeric")
+    .map((column) => column.name);
+
+  if (numericColumnNames.length < 2) {
+    return [];
+  }
+
+  const populatedNumericCount = (row: Record<string, unknown>): number =>
+    numericColumnNames.filter((name) => asNumber(row[name]) !== null).length;
+
+  // "Typical" row shape: without at least one row using more than one
+  // numeric column, "exactly one populated" would be true everywhere and
+  // would flag the whole table rather than genuine outlier rows.
+  const anyRowUsesMultipleColumns = table.rows.some(
+    (row) => populatedNumericCount(row) > 1,
+  );
+
+  if (!anyRowUsesMultipleColumns) {
+    return [];
+  }
+
+  const results: NamedFigureRow[] = [];
+
+  for (const row of table.rows) {
+    const label = row[labelColumn];
+
+    if (isBlankCell(label) || populatedNumericCount(row) !== 1) {
+      continue;
+    }
+
+    const valueColumn = numericColumnNames.find(
+      (name) => asNumber(row[name]) !== null,
+    )!;
+
+    results.push({
+      labelColumn,
+      labelValue: String(label),
+      valueColumn,
+    });
+  }
+
+  return results;
+};
+
+/**
+ * Section 9.1. Claude's insight and chat-answer contracts name which real
+ * column (or row, Section 9.2) they're citing (a metric reference) rather
  * than writing the number themselves -- Claude has never seen a row and
  * cannot be trusted to arithmetic its way to a real total. This is the one
  * function that turns a metric reference into an actual number, computed
  * from the dataset's real rows, respecting the same TOTAL-row exclusion as
- * every other aggregate in this file (excludeTotalRows).
+ * every other aggregate in this file (excludeTotalRows) for the "aggregate"
+ * kind. The "row" kind (9.2) does no aggregation at all: it looks up one
+ * row by its label and returns that row's value column, unaggregated,
+ * unaffected by TOTAL-row exclusion (a named figure is never itself a
+ * TOTAL/Grand Total row -- see isTotalRowLabel -- but even if its label
+ * happened to match, row lookup addresses it directly, not through the
+ * aggregation path that exclusion guards).
  *
- * A reference that doesn't resolve (unknown table, unknown column, or a
- * non-numeric column asked to sum/avg/min/max) is reported in `errors`, not
- * silently dropped or defaulted to zero: per Section 9.1 item 3, an
- * unresolvable metric is a validation failure with the same retry-once
- * discipline as findUnknownReferences/findExtraTabWidgets, not something
- * this function papers over.
+ * A reference that doesn't resolve (unknown table, unknown column, a
+ * non-numeric column asked to sum/avg/min/max, or a labelValue absent from
+ * its labelColumn) is reported in `errors`, not silently dropped or
+ * defaulted to zero: per Section 9.1 item 3, an unresolvable metric is a
+ * validation failure with the same retry-once discipline as
+ * findUnknownReferences/findExtraTabWidgets, not something this function
+ * papers over.
  */
 export type ResolvedMetric = InsightMetricRefShape & { value: number };
-
-const isBlankCell = (value: unknown): boolean =>
-  value === null || value === undefined || value === "";
 
 export const resolveMetricReferences = (
   metrics: InsightMetricRefShape[],
@@ -179,6 +300,50 @@ export const resolveMetricReferences = (
       errors.push(
         `metric "${ref.label}" references unknown table "${ref.sourceTable}"`,
       );
+      continue;
+    }
+
+    if (ref.kind === "row") {
+      const labelColumn = table.columns.find((c) => c.name === ref.labelColumn);
+
+      if (!labelColumn) {
+        errors.push(
+          `metric "${ref.label}" references unknown label column "${ref.labelColumn}" in table "${ref.sourceTable}"`,
+        );
+        continue;
+      }
+
+      const valueColumn = table.columns.find((c) => c.name === ref.valueColumn);
+
+      if (!valueColumn) {
+        errors.push(
+          `metric "${ref.label}" references unknown value column "${ref.valueColumn}" in table "${ref.sourceTable}"`,
+        );
+        continue;
+      }
+
+      const target = ref.labelValue.trim().toLowerCase();
+      const matchingRow = table.rows.find(
+        (row) => String(row[ref.labelColumn] ?? "").trim().toLowerCase() === target,
+      );
+
+      if (!matchingRow) {
+        errors.push(
+          `metric "${ref.label}" references labelValue "${ref.labelValue}" not found in column "${ref.labelColumn}" of table "${ref.sourceTable}"`,
+        );
+        continue;
+      }
+
+      const numericValue = asNumber(matchingRow[ref.valueColumn]);
+
+      if (numericValue === null) {
+        errors.push(
+          `metric "${ref.label}" found row "${ref.labelValue}" in "${ref.sourceTable}" but its "${ref.valueColumn}" value is not numeric`,
+        );
+        continue;
+      }
+
+      resolved.push({ ...ref, value: Number(numericValue.toFixed(6)) });
       continue;
     }
 
@@ -427,6 +592,8 @@ export const buildDatasetMetadata = (
         }).length,
       })),
       numericAggregates,
+      preferRowAddressing: table.tableRole === "config",
+      namedFigureRows: findNamedFigureRows(table),
     };
   }),
 });
@@ -610,20 +777,7 @@ export const dashboardConfigToolSchema = {
           finding: { type: "string" },
           metrics: {
             type: "array",
-            items: {
-              type: "object",
-              properties: {
-                label: { type: "string" },
-                sourceTable: { type: "string" },
-                sourceField: { type: "string" },
-                aggregation: {
-                  type: "string",
-                  enum: ["sum", "avg", "count", "min", "max"],
-                },
-              },
-              required: ["label", "sourceTable", "sourceField", "aggregation"],
-              additionalProperties: false,
-            },
+            items: insightMetricJsonSchema,
           },
           whyItMatters: { type: "string" },
           recommendedAction: { type: "string" },

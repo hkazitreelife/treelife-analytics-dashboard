@@ -121,13 +121,25 @@ const main = async (): Promise<void> => {
     insights: {
       insightId: string;
       finding: string;
-      metrics: {
-        label: string;
-        sourceTable: string;
-        sourceField: string;
-        aggregation: "sum" | "avg" | "count" | "min" | "max";
-        value: number;
-      }[];
+      metrics: (
+        | {
+            kind: "aggregate";
+            label: string;
+            sourceTable: string;
+            sourceField: string;
+            aggregation: "sum" | "avg" | "count" | "min" | "max";
+            value: number;
+          }
+        | {
+            kind: "row";
+            label: string;
+            sourceTable: string;
+            labelColumn: string;
+            labelValue: string;
+            valueColumn: string;
+            value: number;
+          }
+      )[];
       whyItMatters: string;
       recommendedAction: string;
       severity: "info" | "warning" | "positive" | "negative";

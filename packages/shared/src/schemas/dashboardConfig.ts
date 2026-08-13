@@ -70,13 +70,33 @@ export const dashboardTabSchema = z
   .strict();
 
 /**
- * Section 9.1. Claude names which real column and aggregation it is citing;
- * it never writes the number itself. `value` is deliberately absent here --
- * see resolveMetricReferences in claudeConfigContract.ts, which is the only
- * code allowed to produce one, computed from the dataset's real rows.
+ * Section 9.1/9.2. Claude names which real column (and aggregation, or row)
+ * it is citing; it never writes the number itself. `value` is deliberately
+ * absent from either variant below -- see resolveMetricReferences in
+ * claudeConfigContract.ts, the only code allowed to produce one, computed
+ * from the dataset's real rows.
+ *
+ * Two kinds, because one column-aggregation vocabulary cannot address both
+ * shapes of table a real dataset contains:
+ *
+ * - "aggregate": sum/avg/count/min/max over a column across many peer rows
+ *   (e.g. total exits across a department breakdown). Sections 9.0/9.1's
+ *   original kind, unchanged.
+ * - "row": one specific row's value, named by its label, not aggregated at
+ *   all. Section 9.2, added after a live bug: a table can hold several
+ *   distinct named figures sharing one value column (a Constants-style
+ *   key/value table, or specific rows embedded inside an otherwise normal
+ *   per-entity table -- a dataset's Bands table mixed five real per-band
+ *   rows with four summary rows literally labeled "Model annual",
+ *   "Committed target", "Gap to commit", "Exit run rate"). Aggregating
+ *   (e.g. max) across such a column picks whichever figure happens to be
+ *   largest, not the one actually meant -- exactly the bug this kind fixes.
+ *   See buildDatasetMetadata's preferRowAddressing/namedFigureRows, which
+ *   tell Claude which tables/rows this applies to.
  */
-export const insightMetricRefSchema = z
+export const aggregateMetricRefSchema = z
   .object({
+    kind: z.literal("aggregate"),
     label: z.string().min(1),
     sourceTable: z.string().min(1),
     sourceField: z.string().min(1),
@@ -84,10 +104,78 @@ export const insightMetricRefSchema = z
   })
   .strict();
 
-/** insightMetricRefSchema plus the server-computed value. Never model output. */
-export const resolvedInsightMetricSchema = insightMetricRefSchema.extend({
+export const rowMetricRefSchema = z
+  .object({
+    kind: z.literal("row"),
+    label: z.string().min(1),
+    sourceTable: z.string().min(1),
+    // The column that names each row (e.g. "key" in a Constants table, or
+    // "label" in Bands). labelValue must match one row's value in it,
+    // verbatim -- validated the same way an unknown table/column is.
+    labelColumn: z.string().min(1),
+    labelValue: z.string().min(1),
+    // The column holding that row's actual figure (e.g. "value", or
+    // "annual_revenue_Cr").
+    valueColumn: z.string().min(1),
+  })
+  .strict();
+
+export const insightMetricRefSchema = z.discriminatedUnion("kind", [
+  aggregateMetricRefSchema,
+  rowMetricRefSchema,
+]);
+
+/** Either metric ref variant plus the server-computed value. Never model output. */
+export const resolvedAggregateMetricSchema = aggregateMetricRefSchema.extend({
   value: z.number(),
 });
+export const resolvedRowMetricSchema = rowMetricRefSchema.extend({
+  value: z.number(),
+});
+export const resolvedInsightMetricSchema = z.discriminatedUnion("kind", [
+  resolvedAggregateMetricSchema,
+  resolvedRowMetricSchema,
+]);
+
+/**
+ * Section 9.2. Raw JSON schema for a metric reference, shared by
+ * dashboardConfigToolSchema's insights.metrics and chatAnswerToolSchema's
+ * metrics -- both tool calls accept either variant, so this is defined once
+ * rather than duplicated.
+ */
+export const aggregateMetricJsonSchema = {
+  type: "object" as const,
+  properties: {
+    kind: { type: "string" as const, enum: ["aggregate"] },
+    label: { type: "string" as const },
+    sourceTable: { type: "string" as const },
+    sourceField: { type: "string" as const },
+    aggregation: {
+      type: "string" as const,
+      enum: ["sum", "avg", "count", "min", "max"],
+    },
+  },
+  required: ["kind", "label", "sourceTable", "sourceField", "aggregation"],
+  additionalProperties: false,
+};
+
+export const rowMetricJsonSchema = {
+  type: "object" as const,
+  properties: {
+    kind: { type: "string" as const, enum: ["row"] },
+    label: { type: "string" as const },
+    sourceTable: { type: "string" as const },
+    labelColumn: { type: "string" as const },
+    labelValue: { type: "string" as const },
+    valueColumn: { type: "string" as const },
+  },
+  required: ["kind", "label", "sourceTable", "labelColumn", "labelValue", "valueColumn"],
+  additionalProperties: false,
+};
+
+export const insightMetricJsonSchema = {
+  anyOf: [aggregateMetricJsonSchema, rowMetricJsonSchema],
+};
 
 export const dashboardInsightSchema = z
   .object({
@@ -141,7 +229,11 @@ export type MetricAggregationValue = z.infer<typeof metricAggregationSchema>;
 export type InsightSeverityValue = z.infer<typeof insightSeveritySchema>;
 export type DashboardWidgetShape = z.infer<typeof dashboardWidgetSchema>;
 export type DashboardTabShape = z.infer<typeof dashboardTabSchema>;
+export type AggregateMetricRefShape = z.infer<typeof aggregateMetricRefSchema>;
+export type RowMetricRefShape = z.infer<typeof rowMetricRefSchema>;
 export type InsightMetricRefShape = z.infer<typeof insightMetricRefSchema>;
+export type ResolvedAggregateMetricShape = z.infer<typeof resolvedAggregateMetricSchema>;
+export type ResolvedRowMetricShape = z.infer<typeof resolvedRowMetricSchema>;
 export type ResolvedInsightMetricShape = z.infer<typeof resolvedInsightMetricSchema>;
 export type DashboardInsightShape = z.infer<typeof dashboardInsightSchema>;
 export type ResolvedDashboardInsightShape = z.infer<typeof resolvedDashboardInsightSchema>;

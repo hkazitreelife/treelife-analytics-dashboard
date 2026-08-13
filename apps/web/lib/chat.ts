@@ -169,9 +169,12 @@ export const runChatQuestion = async (
       `The exact violation was: ${violation}`,
       "Call emit_chat_answer exactly once, with a non-empty directAnswer",
       "string and a metrics array (it may be empty, but must be an array).",
-      "Every metric's sourceTable/sourceField must be a real table/column",
-      "name, verbatim, with an aggregation that suits that column's type.",
-      "Do not include a `value` field on a metric.",
+      "Every metric needs a kind. kind:\"aggregate\" needs sourceTable/",
+      "sourceField (real table/column names, verbatim) and an aggregation",
+      "suiting that column's type. kind:\"row\" needs sourceTable/labelColumn/",
+      "labelValue/valueColumn instead, no aggregation field -- use it for a",
+      "table with preferRowAddressing:true or a row listed in",
+      "namedFigureRows. Do not include a `value` field on any metric.",
     ].join(" ");
 
     try {

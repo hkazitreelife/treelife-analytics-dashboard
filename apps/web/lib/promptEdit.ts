@@ -172,7 +172,12 @@ export const runPromptEdit = async (
       "datasetId must be returned exactly as given in the metadata.",
       "Every sourceTable must be a table name from the metadata, verbatim, and",
       "every entry in fields must be a column that exists in that table,",
-      "verbatim. Call emit_dashboard_config exactly once.",
+      "verbatim. Every insight metric needs a kind: kind:\"aggregate\" needs",
+      "sourceTable/sourceField and an aggregation suiting that column's type;",
+      "kind:\"row\" needs sourceTable/labelColumn/labelValue/valueColumn",
+      "instead (use it for a preferRowAddressing table or a row listed in",
+      "namedFigureRows). Do not include a `value` field on any metric. Call",
+      "emit_dashboard_config exactly once.",
     ].join(" ");
 
     try {

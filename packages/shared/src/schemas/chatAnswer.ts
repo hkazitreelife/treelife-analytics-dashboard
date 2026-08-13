@@ -1,6 +1,10 @@
 import { z } from "zod";
 
-import { insightMetricRefSchema, resolvedInsightMetricSchema } from "./dashboardConfig";
+import {
+  insightMetricJsonSchema,
+  insightMetricRefSchema,
+  resolvedInsightMetricSchema,
+} from "./dashboardConfig";
 
 /**
  * The chat agent's response contract, Section 17.4 / 20.9, updated by
@@ -15,6 +19,10 @@ import { insightMetricRefSchema, resolvedInsightMetricSchema } from "./dashboard
  * `caveats` is optional free text for a caller-relevant note the resolved
  * number doesn't otherwise carry (e.g. "this table's TOTAL row was excluded
  * from this figure").
+ *
+ * Section 9.2: metrics is the same {aggregate, row} union insights use, for
+ * the identical reason (a key-value-shaped table's row can't be correctly
+ * cited via column aggregation).
  */
 export const chatAnswerSchema = z
   .object({
@@ -43,20 +51,7 @@ export const chatAnswerToolSchema = {
     directAnswer: { type: "string" },
     metrics: {
       type: "array",
-      items: {
-        type: "object",
-        properties: {
-          label: { type: "string" },
-          sourceTable: { type: "string" },
-          sourceField: { type: "string" },
-          aggregation: {
-            type: "string",
-            enum: ["sum", "avg", "count", "min", "max"],
-          },
-        },
-        required: ["label", "sourceTable", "sourceField", "aggregation"],
-        additionalProperties: false,
-      },
+      items: insightMetricJsonSchema,
     },
     caveats: { type: "string" },
   },
