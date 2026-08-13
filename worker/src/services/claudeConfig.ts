@@ -2,6 +2,7 @@ import {
   buildDatasetMetadata,
   dashboardConfigSchema,
   dashboardConfigToolSchema,
+  findExtraTabWidgets,
   findUnknownReferences,
   isClaudeBillingRejection,
   type DashboardConfigShape,
@@ -77,6 +78,20 @@ const SYSTEM_INSTRUCTION = [
   "  producing a chart that would mislead.",
   "- Group related widgets into tabs. Position widgets on a 12-column grid: col",
   "  plus w must not exceed 12.",
+  "",
+  "The dataset metadata's rawSheetTableName field names the ONE table every",
+  "widget you create must source from at this stage. Build a thorough Overview",
+  "using every meaningful field of that table -- as many charts and KPIs as you",
+  "judge relevant, grouped into tabs however makes sense -- but do not create a",
+  "widget whose sourceTable is any other table. The other tables are real, are",
+  "fully parsed and stored, and remain available for a later prompt-edit or",
+  "chat question; they simply get no automatic tab at initial generation. If",
+  "rawSheetTableName is null, this restriction does not apply and you may use",
+  "any table role=\"data\" table as you judge appropriate.",
+  "This restriction is about widgets and tabs only, not insights: an insight's",
+  "relatedTables may still name any table in the metadata, including one with",
+  "no tab of its own -- the business-figure and data-quality insight rules",
+  "below apply across the whole dataset, not just the raw sheet.",
   "",
   "Insights must explain what matters in the data, not describe the charts.",
   "Ground every number you state in the aggregates and counts provided to you.",
@@ -233,6 +248,21 @@ export const createClaudeConfigClient = (
       if (unknownReferences.length > 0) {
         throw new ClaudeValidationError(
           `Config from model "${activeModel}" references names absent from the dataset: ${unknownReferences.join("; ")}`,
+        );
+      }
+
+      // Section 9.0: a widget sourcing from a real table other than the
+      // identified raw sheet is well-formed (findUnknownReferences would
+      // not catch it) but violates the "one automatic tab" rule, so it is
+      // treated exactly like a schema violation too.
+      const extraTabWidgets = findExtraTabWidgets(
+        result.data,
+        metadata.rawSheetTableName,
+      );
+
+      if (extraTabWidgets.length > 0) {
+        throw new ClaudeValidationError(
+          `Config from model "${activeModel}" created a widget for a table other than the identified raw sheet "${metadata.rawSheetTableName}": ${extraTabWidgets.join("; ")}`,
         );
       }
 

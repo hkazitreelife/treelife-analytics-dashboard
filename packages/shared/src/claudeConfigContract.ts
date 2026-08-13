@@ -60,6 +60,13 @@ export type DatasetMetadataForClaude = {
   datasetName: string;
   tables: TableMetadataForClaude[];
   relationships: unknown[];
+  /**
+   * Section 9.0's Overview rule: the one table initial config generation
+   * must build every tab/widget from. Null when no data-role table exists
+   * to identify one from (e.g. every table is documentation/config/
+   * unknown). See identifyRawSheet for how this is chosen.
+   */
+  rawSheetTableName: string | null;
 };
 
 const asNumber = (value: unknown): number | null => {
@@ -131,6 +138,88 @@ export const excludeTotalRows = <T extends Record<string, unknown>>(
   return rows.filter((row) => !isTotalRowLabel(row[labelColumn]));
 };
 
+type RawSheetCandidate = {
+  tableName: string;
+  tableRole: string;
+  rows: Record<string, unknown>[];
+  columns: { name: string; inferredType: string }[];
+};
+
+/**
+ * Section 9.0. Identifies the one "raw" sheet initial config generation
+ * must build Overview from: the tableRole "data" table with the most rows,
+ * excluding any data-role table that is itself a rollup/summary sheet (has
+ * a TOTAL/Grand Total row) -- a sheet with its own rollup row is a derived
+ * view of the real data, not the raw data itself, even where Gemini also
+ * tagged it "data". Ties broken by original file order (first-listed
+ * wins), never by name.
+ *
+ * Falls back to the highest-row-count data-role table even if it has a
+ * TOTAL row, if every data-role table has one, so this only returns null
+ * when there is truly no data-role table to pick from at all.
+ */
+export const identifyRawSheet = (
+  tables: RawSheetCandidate[],
+): string | null => {
+  const dataRoleTables = tables.filter((table) => table.tableRole === "data");
+
+  if (dataRoleTables.length === 0) {
+    return null;
+  }
+
+  const withoutTotalRow = dataRoleTables.filter(
+    (table) => excludeTotalRows(table.rows, table.columns).length === table.rows.length,
+  );
+
+  const pool = withoutTotalRow.length > 0 ? withoutTotalRow : dataRoleTables;
+
+  let winner = pool[0]!;
+
+  for (const table of pool.slice(1)) {
+    if (table.rows.length > winner.rows.length) {
+      winner = table;
+    }
+  }
+
+  return winner.tableName;
+};
+
+/**
+ * Section 9.0. At initial generation, every widget must source from the
+ * identified raw sheet -- no other table gets an automatic tab. Insights
+ * are exempt: an insight's relatedTables may still name any table, since
+ * insights are not tabs and the business-figure/data-quality rules apply
+ * dataset-wide. Schema validation cannot catch a widget quietly sourcing
+ * from a different real table (it's a well-formed reference, just to the
+ * wrong one), so this is checked the same way an invented name is.
+ *
+ * Not applied to prompt-edit or chat: pulling a previously-hidden table
+ * into a new tab by prompt is the intended, only way to surface one, per
+ * Section 9.0 item 4. This must never be called from that path.
+ */
+export const findExtraTabWidgets = (
+  config: DashboardConfigShape,
+  rawSheetTableName: string | null,
+): string[] => {
+  if (!rawSheetTableName) {
+    return [];
+  }
+
+  const problems: string[] = [];
+
+  for (const tab of config.tabs) {
+    for (const widget of tab.widgets) {
+      if (widget.sourceTable !== rawSheetTableName) {
+        problems.push(
+          `widget "${widget.widgetId}" in tab "${tab.tabName}" sources from "${widget.sourceTable}", not the identified raw sheet "${rawSheetTableName}"`,
+        );
+      }
+    }
+  }
+
+  return problems;
+};
+
 /**
  * Builds the metadata payload sent to Claude, for either initial generation
  * or a prompt edit. Rows are read here to compute aggregates, and only the
@@ -145,6 +234,7 @@ export const buildDatasetMetadata = (
   datasetId,
   datasetName,
   relationships,
+  rawSheetTableName: identifyRawSheet(tables),
   tables: tables.map((table) => {
     const numericAggregates: NumericAggregate[] = [];
     // Excluded from the aggregates below only. rowCount and emptyCount

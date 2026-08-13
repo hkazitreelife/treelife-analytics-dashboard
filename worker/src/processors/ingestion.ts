@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_SOURCE,
   dashboardConfigSchema,
+  findExtraTabWidgets,
   readIngestionLimits,
   type DashboardConfigShape,
   type IngestionJobData,
@@ -240,6 +241,20 @@ const generateConfig = async (
       );
     }
 
+    // Section 9.0, re-checked here immediately before storage same as
+    // findUnknownReferences above: nothing invalid reaches the Configs
+    // write regardless of which client implementation produced it.
+    const extraTabWidgets = findExtraTabWidgets(
+      parsed.data,
+      metadata.rawSheetTableName,
+    );
+
+    if (extraTabWidgets.length > 0) {
+      throw new ClaudeValidationError(
+        `Config created a widget for a table other than the identified raw sheet "${metadata.rawSheetTableName}": ${extraTabWidgets.join("; ")}`,
+      );
+    }
+
     return parsed.data;
   };
 
@@ -271,7 +286,12 @@ const generateConfig = async (
       "Every entry in fields must be a column name that exists in that table,",
       "verbatim. Emit no keys beyond those in the tool schema. Provide at least",
       "one tab. Call emit_dashboard_config exactly once.",
-    ].join(" ");
+      metadata.rawSheetTableName
+        ? `Every widget's sourceTable must be exactly "${metadata.rawSheetTableName}" -- do not create a widget for any other table, even one that seems relevant. Insights may still name other tables in relatedTables.`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
 
     try {
       return await attempt(stricter);
