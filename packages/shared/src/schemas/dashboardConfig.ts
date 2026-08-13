@@ -17,7 +17,23 @@ export const widgetTypeSchema = z.enum([
   "table",
 ]);
 
-export const aggregationTypeSchema = z.enum(["none", "sum", "count", "avg"]);
+/**
+ * Section 10.5: "distinct" added alongside the original four. Plain
+ * "count" (apps/web/lib/aggregate.ts's computeKpi) counts ROWS -- it
+ * always has, regardless of which field is named -- which is correct for
+ * a KPI like "Total Exits" but silently wrong for one like "Departments
+ * Affected", whose title asks how many DIFFERENT values a field takes,
+ * not how many rows exist. Before this, the aggregation vocabulary had no
+ * way to express that distinction at all; "distinct" is a real,
+ * field-specific aggregation, not a synonym for "count".
+ */
+export const aggregationTypeSchema = z.enum([
+  "none",
+  "sum",
+  "count",
+  "avg",
+  "distinct",
+]);
 
 export const insightSeveritySchema = z.enum([
   "info",

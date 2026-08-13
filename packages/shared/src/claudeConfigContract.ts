@@ -737,7 +737,7 @@ export const dashboardConfigToolSchema = {
                 fields: { type: "array", items: { type: "string" } },
                 aggregation: {
                   type: "string",
-                  enum: ["none", "sum", "count", "avg"],
+                  enum: ["none", "sum", "count", "avg", "distinct"],
                 },
                 position: {
                   type: "object",

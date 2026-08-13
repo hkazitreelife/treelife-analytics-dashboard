@@ -162,7 +162,9 @@ const WidgetBody = ({
         <p className="mt-1 text-xs text-[color:var(--color-steel)]">
           {widget.aggregation === "count"
             ? `count of rows in ${widget.sourceTable}`
-            : `${widget.aggregation} of ${field ?? "n/a"} over ${usedRows} of ${totalRows} rows`}
+            : widget.aggregation === "distinct"
+              ? `distinct values of ${field ?? "n/a"} in ${widget.sourceTable}`
+              : `${widget.aggregation} of ${field ?? "n/a"} over ${usedRows} of ${totalRows} rows`}
         </p>
       </div>
     );

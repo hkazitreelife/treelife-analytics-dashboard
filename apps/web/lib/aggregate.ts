@@ -42,6 +42,22 @@ const applyAggregation = (
     return rowCount;
   }
 
+  // Section 10.5: distinct is implemented for kpi_card (computeKpi, which
+  // never reaches this function for that aggregation -- it counts unique
+  // raw values of a named field, not a numeric measure). This function
+  // only ever sees already-numeric-coerced values grouped per category
+  // bucket, which is the wrong shape for "how many distinct values" of a
+  // possibly non-numeric field, so a chart widget cannot correctly express
+  // distinct-count today. Falling back to count (bucket size) rather than
+  // sum: a wrong-but-plausible row count is a smaller error than silently
+  // summing values that were never meant to be added. The system
+  // instruction steers Claude away from putting "distinct" on a chart
+  // widget in the first place, since a chart already shows distinct
+  // categories as its own bars/slices.
+  if (aggregation === "distinct") {
+    return rowCount;
+  }
+
   if (values.length === 0) {
     return 0;
   }
@@ -168,6 +184,36 @@ export const computeKpi = (
   // to count too: "how many records" shouldn't count the rollup row as one
   // more record.
   const aggregatableRows = excludeTotalRows(rows, columns);
+
+  // Section 10.5: distinct is field-specific, unlike count -- "how many
+  // DIFFERENT values" needs an actual field to count unique values of, so
+  // it must be handled before the fields.length===0 shortcut below (which
+  // exists for count/sum/avg on a fieldless widget, not for this) and
+  // before measureFields resolution, which only looks at numeric columns.
+  // Any column type can be distinct-counted (a Department name is
+  // categorical, not numeric), so this reads fields[0] directly rather
+  // than going through resolveChartFields.
+  if (aggregation === "distinct") {
+    const field = fields[0];
+
+    if (!field) {
+      return { kind: "not-numeric", field: "" };
+    }
+
+    const distinctValues = new Set(
+      aggregatableRows
+        .map((row) => row[field])
+        .filter((value) => !isBlank(value))
+        .map((value) => String(value)),
+    );
+
+    return {
+      kind: "value",
+      value: distinctValues.size,
+      field,
+      usedRows: aggregatableRows.length,
+    };
+  }
 
   if (aggregation === "count") {
     return {
