@@ -43,9 +43,10 @@ export async function GET(request: Request): Promise<Response> {
 
   let heartbeat: {
     present: boolean;
+    instanceId: string | null;
     ageSeconds: number | null;
     queues: string[] | null;
-  } = { present: false, ageSeconds: null, queues: null };
+  } = { present: false, instanceId: null, ageSeconds: null, queues: null };
 
   try {
     const redisUrl = process.env.REDIS_URL;
@@ -66,6 +67,10 @@ export async function GET(request: Request): Promise<Response> {
 
           heartbeat = {
             present: true,
+            // Section 10.6: which single instance currently holds the
+            // heartbeat/lock -- useful for confirming a takeover actually
+            // happened, without checking process start times by hand.
+            instanceId: parsed.instanceId,
             ageSeconds: Math.max(0, Math.round(ageMs / 1000)),
             queues: parsed.queues,
           };
