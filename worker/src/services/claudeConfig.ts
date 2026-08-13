@@ -4,6 +4,7 @@ import {
   dashboardConfigToolSchema,
   findExtraTabWidgets,
   findUnknownReferences,
+  findUnresolvableMetrics,
   isClaudeBillingRejection,
   type DashboardConfigShape,
   type DatasetMetadataForClaude,
@@ -54,7 +55,19 @@ export class ClaudeValidationError extends Error {
   }
 }
 
-const DEFAULT_MODEL = "claude-sonnet-5";
+/**
+ * Section 9.1: config generation moves to Opus, on its own env vars
+ * (ANTHROPIC_CONFIG_MODEL / ANTHROPIC_CONFIG_RETRY_MODEL) rather than the
+ * ANTHROPIC_MODEL / ANTHROPIC_RETRY_MODEL pair -- those are shared by
+ * apps/web/lib/claudeChatClient.ts (chat, staying on Sonnet) and
+ * apps/web/lib/claudeConfigEditClient.ts (prompt-edit, unchanged), so
+ * reusing the same names here would have silently moved both of those to
+ * Opus too. Retry model stays the same tier (claude-opus-5): confirmed via
+ * a live client.models.list() call against this key that claude-opus-5 is
+ * already the strongest reachable model, so there is nothing stronger to
+ * escalate a retry to.
+ */
+const DEFAULT_MODEL = "claude-opus-5";
 const DEFAULT_RETRY_MODEL = "claude-opus-5";
 
 const SYSTEM_INSTRUCTION = [
@@ -78,6 +91,10 @@ const SYSTEM_INSTRUCTION = [
   "  producing a chart that would mislead.",
   "- Group related widgets into tabs. Position widgets on a 12-column grid: col",
   "  plus w must not exceed 12.",
+  "- A widget's aggregation is one of exactly: none, sum, count, avg. This is a",
+  "  DIFFERENT, smaller enum than an insight metric's aggregation further",
+  "  below, which also allows min and max. Never put min or max on a widget's",
+  "  aggregation field -- the tool schema will reject it.",
   "",
   "The dataset metadata's rawSheetTableName field names the ONE table every",
   "widget you create must source from at this stage. Build a thorough Overview",
@@ -93,10 +110,28 @@ const SYSTEM_INSTRUCTION = [
   "no tab of its own -- the business-figure and data-quality insight rules",
   "below apply across the whole dataset, not just the raw sheet.",
   "",
-  "Insights must explain what matters in the data, not describe the charts.",
-  "Ground every number you state in the aggregates and counts provided to you.",
-  "Never invent a value. If something is missing or empty, say so plainly rather",
-  "than estimating it.",
+  "Each insight is structured, not a paragraph: finding (a short headline),",
+  "metrics (the real numbers backing it), whyItMatters (one to two",
+  "sentences), and recommendedAction (one concrete sentence).",
+  "",
+  "You do NOT write numbers into finding, whyItMatters or recommendedAction.",
+  "You have never seen a dataset row, and are not trusted to add, average or",
+  "compare figures yourself. Instead, for every number your insight depends",
+  "on, add an entry to metrics naming which real table, column and",
+  "aggregation (sum, avg, count, min or max) it comes from -- for example",
+  "{label: \"Actual exits\", sourceTable: \"Raw Data\", sourceField: \"Exit",
+  "Date\", aggregation: \"count\"}. The server resolves each metric against the",
+  "dataset's real rows and computes the actual value; you never see or",
+  "supply a `value` field yourself, and the tool schema will reject one if",
+  "you include it. Write finding/whyItMatters/recommendedAction to read",
+  "naturally alongside those resolved numbers (e.g. \"Exits are running",
+  "above the committed model\" rather than restating a number you don't have)",
+  "-- the rendered insight shows your text and the resolved metrics side by",
+  "side, so do not paraphrase a number in prose that metrics already states.",
+  "Every metric's sourceTable/sourceField must be a table/column name given",
+  "to you, verbatim, and aggregation must suit the column (never sum/avg/min/",
+  "max a non-numeric column; use count for that, which counts non-empty",
+  "values of the named column).",
   "",
   "Cover both of these categories, not only one:",
   "(1) Key business figures. If any table contains or implies a target, a",
@@ -104,12 +139,14 @@ const SYSTEM_INSTRUCTION = [
   "  column, or key/value entry whose own label identifies it as such (for",
   "  example a row literally labeled \"target\", \"committed\", \"model\",",
   "  \"actual\", or \"gap\", or a Constants-style key/value table with a",
-  "  comparably named key) -- state that figure directly as its own insight.",
+  "  comparably named key) -- state that figure directly as its own insight,",
+  "  with a metric entry pointing at the real column/row that carries it.",
   "  When both a target/committed figure and an actual/model figure are",
-  "  present, state the gap between them explicitly, even if the gap is also",
-  "  already sitting in the data as its own labeled value. A dataset that",
-  "  hands you a clear target and a clear actual must produce an insight",
-  "  stating both numbers and the gap, regardless of whether anything else",
+  "  present, name metrics for both (and for the gap itself if it exists as",
+  "  its own labeled value), even if the gap is also derivable by subtracting",
+  "  the other two. A dataset that hands you a clear target and a clear",
+  "  actual must produce an insight naming both figures as metrics and",
+  "  stating the gap in whyItMatters, regardless of whether anything else",
   "  about the data looks unusual.",
   "(2) Data-quality and pattern findings. Gaps, trends, outliers, missing",
   "  data, ownership gaps, category concentration, date-based patterns,",
@@ -147,8 +184,8 @@ export type ClaudeLogger = {
 
 export const createClaudeConfigClient = (
   apiKey: string,
-  model: string = process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL,
-  retryModel: string | undefined = process.env.ANTHROPIC_RETRY_MODEL ??
+  model: string = process.env.ANTHROPIC_CONFIG_MODEL ?? DEFAULT_MODEL,
+  retryModel: string | undefined = process.env.ANTHROPIC_CONFIG_RETRY_MODEL ??
     DEFAULT_RETRY_MODEL,
   logger: ClaudeLogger = console,
 ): ClaudeConfigClient => {
@@ -263,6 +300,21 @@ export const createClaudeConfigClient = (
       if (extraTabWidgets.length > 0) {
         throw new ClaudeValidationError(
           `Config from model "${activeModel}" created a widget for a table other than the identified raw sheet "${metadata.rawSheetTableName}": ${extraTabWidgets.join("; ")}`,
+        );
+      }
+
+      // Section 9.1: an insight metric naming a real-looking but wrong
+      // table/column, or asking sum/avg/min/max of a non-numeric column, is
+      // well-formed JSON but unresolvable against real data -- treated like
+      // any other schema violation, not silently dropped or zeroed.
+      const unresolvableMetrics = findUnresolvableMetrics(
+        result.data.insights,
+        tables,
+      );
+
+      if (unresolvableMetrics.length > 0) {
+        throw new ClaudeValidationError(
+          `Config from model "${activeModel}" has insight metrics that don't resolve against real data: ${unresolvableMetrics.join("; ")}`,
         );
       }
 

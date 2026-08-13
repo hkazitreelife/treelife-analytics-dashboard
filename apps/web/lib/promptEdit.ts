@@ -3,9 +3,13 @@ import {
   CONFIG_SOURCE,
   dashboardConfigSchema,
   findUnknownReferences,
+  findUnresolvableMetrics,
+  resolveInsightMetrics,
+  resolvedDashboardConfigSchema,
   type DashboardConfigShape,
   type DatasetEventType,
   type NormalizedTableShape,
+  type ResolvedDashboardConfigShape,
 } from "@analytics/shared";
 import type { Payload } from "payload";
 
@@ -112,7 +116,12 @@ export const runPromptEdit = async (
     };
   }
 
-  const currentConfig = currentConfigRecord.config as DashboardConfigShape;
+  // Section 9.1: a freshly-written config's insights carry resolved metric
+  // values; anything stored before that change still has the old title/body
+  // shape and will not satisfy this cast at runtime -- out of scope here
+  // (config versioning already keeps old rows as-is), but worth knowing if
+  // editing a dataset whose config predates Section 9.1.
+  const currentConfig = currentConfigRecord.config as ResolvedDashboardConfigShape;
   const metadata = buildDatasetMetadata(
     String(datasetId),
     dataset.name,
@@ -223,6 +232,40 @@ export const runPromptEdit = async (
     };
   }
 
+  // Section 9.1: same check as ingestion.ts's write site, for the same
+  // reason -- an insight metric that doesn't resolve against real data is a
+  // storage-blocking failure, not something to silently drop or zero.
+  const unresolvableMetrics = findUnresolvableMetrics(
+    revalidated.data.insights,
+    tables,
+  );
+
+  if (unresolvableMetrics.length > 0) {
+    return {
+      ok: false,
+      status: 502,
+      error: `Edited config has insight metrics that don't resolve against real data: ${unresolvableMetrics.join("; ")}`,
+    };
+  }
+
+  // Resolution happens exactly once, after every check above has already
+  // passed, mirroring ingestion.ts's generateConfig exactly: the stored
+  // config always carries resolved metric values, never bare references.
+  const resolvedConfig: ResolvedDashboardConfigShape = {
+    ...revalidated.data,
+    insights: resolveInsightMetrics(revalidated.data.insights, tables),
+  };
+
+  const resolvedParsed = resolvedDashboardConfigSchema.safeParse(resolvedConfig);
+
+  if (!resolvedParsed.success) {
+    return {
+      ok: false,
+      status: 502,
+      error: `Resolved edited config failed schema validation before storage: ${JSON.stringify(resolvedParsed.error.issues)}`,
+    };
+  }
+
   // Version is never hardcoded, same query worker/src/processors/
   // ingestion.ts uses: max existing version for this dataset, + 1.
   const priorConfigs = await payload.find({
@@ -239,8 +282,8 @@ export const runPromptEdit = async (
     data: {
       dataset: Number(datasetId),
       version: nextVersion,
-      config: revalidated.data,
-      insights: revalidated.data.insights,
+      config: resolvedParsed.data,
+      insights: resolvedParsed.data.insights,
       generatedBy: CONFIG_SOURCE.promptEdit,
       editedBy: editedByUserId,
     },

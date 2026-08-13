@@ -1,7 +1,11 @@
 "use client";
 
-import type { DashboardInsightShape, InsightSeverityValue } from "@analytics/shared";
+import type {
+  InsightSeverityValue,
+  ResolvedDashboardInsightShape,
+} from "@analytics/shared";
 
+import { formatNumber } from "@/lib/aggregate";
 import { EmptyState } from "@/components/ui/primitives";
 
 /**
@@ -45,7 +49,7 @@ const SEVERITY_STYLE: Record<
 export const InsightsPanel = ({
   insights,
 }: {
-  insights: DashboardInsightShape[];
+  insights: ResolvedDashboardInsightShape[];
 }) => {
   if (insights.length === 0) {
     return <EmptyState message="No insights were generated for this dataset." />;
@@ -72,13 +76,44 @@ export const InsightsPanel = ({
               >
                 {style.glyph}
               </span>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <p className="text-sm font-semibold text-[color:var(--color-forest)]">
-                  {insight.title}
+                  {insight.finding}
                 </p>
-                <p className="mt-1 text-sm leading-relaxed text-[color:var(--color-ink)]">
-                  {insight.body}
+
+                {insight.metrics.length > 0 ? (
+                  <div className="mt-2 flex flex-wrap gap-3">
+                    {insight.metrics.map((metric, index) => (
+                      <div
+                        key={`${metric.label}-${index}`}
+                        className="rounded-md bg-[color:var(--color-cloud)] px-2.5 py-1.5"
+                      >
+                        <p className="text-base font-semibold leading-none text-[color:var(--color-forest)]">
+                          {formatNumber(metric.value)}
+                        </p>
+                        <p className="mt-1 text-[11px] leading-none text-[color:var(--color-steel)]">
+                          {metric.label}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                <p className="mt-2 text-sm leading-relaxed text-[color:var(--color-ink)]">
+                  {insight.whyItMatters}
                 </p>
+
+                <p className="mt-2 flex items-start gap-1.5 text-sm leading-relaxed text-[color:var(--color-ink)]">
+                  <span
+                    aria-hidden="true"
+                    className="mt-0.5 shrink-0 text-xs font-bold"
+                    style={{ color: style.badgeText }}
+                  >
+                    →
+                  </span>
+                  <span>{insight.recommendedAction}</span>
+                </p>
+
                 <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--color-steel)]">
                   <span
                     className="rounded px-1.5 py-0.5 font-medium"

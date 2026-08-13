@@ -1,4 +1,9 @@
-import type { DashboardConfigShape } from "./schemas/dashboardConfig";
+import type {
+  DashboardConfigShape,
+  DashboardInsightShape,
+  InsightMetricRefShape,
+  ResolvedDashboardInsightShape,
+} from "./schemas/dashboardConfig";
 import type { NormalizedTableShape } from "./schemas/normalizedDataset";
 
 /**
@@ -137,6 +142,138 @@ export const excludeTotalRows = <T extends Record<string, unknown>>(
 
   return rows.filter((row) => !isTotalRowLabel(row[labelColumn]));
 };
+
+/**
+ * Section 9.1. Claude's insight and chat-answer contracts both name which
+ * real column and aggregation they're citing (a metric reference) rather
+ * than writing the number themselves -- Claude has never seen a row and
+ * cannot be trusted to arithmetic its way to a real total. This is the one
+ * function that turns a metric reference into an actual number, computed
+ * from the dataset's real rows, respecting the same TOTAL-row exclusion as
+ * every other aggregate in this file (excludeTotalRows).
+ *
+ * A reference that doesn't resolve (unknown table, unknown column, or a
+ * non-numeric column asked to sum/avg/min/max) is reported in `errors`, not
+ * silently dropped or defaulted to zero: per Section 9.1 item 3, an
+ * unresolvable metric is a validation failure with the same retry-once
+ * discipline as findUnknownReferences/findExtraTabWidgets, not something
+ * this function papers over.
+ */
+export type ResolvedMetric = InsightMetricRefShape & { value: number };
+
+const isBlankCell = (value: unknown): boolean =>
+  value === null || value === undefined || value === "";
+
+export const resolveMetricReferences = (
+  metrics: InsightMetricRefShape[],
+  tables: NormalizedTableShape[],
+): { resolved: ResolvedMetric[]; errors: string[] } => {
+  const tableByName = new Map(tables.map((table) => [table.tableName, table]));
+  const resolved: ResolvedMetric[] = [];
+  const errors: string[] = [];
+
+  for (const ref of metrics) {
+    const table = tableByName.get(ref.sourceTable);
+
+    if (!table) {
+      errors.push(
+        `metric "${ref.label}" references unknown table "${ref.sourceTable}"`,
+      );
+      continue;
+    }
+
+    const column = table.columns.find((c) => c.name === ref.sourceField);
+
+    if (!column) {
+      errors.push(
+        `metric "${ref.label}" references unknown column "${ref.sourceField}" in table "${ref.sourceTable}"`,
+      );
+      continue;
+    }
+
+    const aggregatableRows = excludeTotalRows(table.rows, table.columns);
+
+    if (ref.aggregation === "count") {
+      const count = aggregatableRows.filter(
+        (row) => !isBlankCell(row[ref.sourceField]),
+      ).length;
+
+      resolved.push({ ...ref, value: count });
+      continue;
+    }
+
+    if (column.inferredType !== "numeric") {
+      errors.push(
+        `metric "${ref.label}" asks for ${ref.aggregation} of "${ref.sourceField}" in "${ref.sourceTable}", which is not numeric`,
+      );
+      continue;
+    }
+
+    const values = aggregatableRows
+      .map((row) => asNumber(row[ref.sourceField]))
+      .filter((value): value is number => value !== null);
+
+    if (values.length === 0) {
+      errors.push(
+        `metric "${ref.label}" found no numeric values for "${ref.sourceField}" in "${ref.sourceTable}" after excluding any TOTAL row`,
+      );
+      continue;
+    }
+
+    const sum = values.reduce((total, value) => total + value, 0);
+    let value: number;
+
+    if (ref.aggregation === "sum") {
+      value = sum;
+    } else if (ref.aggregation === "avg") {
+      value = sum / values.length;
+    } else if (ref.aggregation === "min") {
+      value = Math.min(...values);
+    } else {
+      value = Math.max(...values);
+    }
+
+    resolved.push({ ...ref, value: Number(value.toFixed(6)) });
+  }
+
+  return { resolved, errors };
+};
+
+/**
+ * Validation-only: every problem across every insight's metrics, prefixed
+ * with the insightId so a retry instruction can point at the right one.
+ * Empty means every metric on every insight resolves cleanly. Must be
+ * called, and pass, before resolveInsightMetrics is trusted to run without
+ * checking its own errors.
+ */
+export const findUnresolvableMetrics = (
+  insights: DashboardInsightShape[],
+  tables: NormalizedTableShape[],
+): string[] => {
+  const problems: string[] = [];
+
+  for (const insight of insights) {
+    const { errors } = resolveMetricReferences(insight.metrics, tables);
+
+    problems.push(...errors.map((error) => `insight "${insight.insightId}": ${error}`));
+  }
+
+  return problems;
+};
+
+/**
+ * Resolves every insight's metrics to real numbers. Only call this after
+ * findUnresolvableMetrics has returned empty for the same insights/tables --
+ * it does not re-check for errors itself.
+ */
+export const resolveInsightMetrics = (
+  insights: DashboardInsightShape[],
+  tables: NormalizedTableShape[],
+): ResolvedDashboardInsightShape[] =>
+  insights.map((insight) => ({
+    ...insight,
+    metrics: resolveMetricReferences(insight.metrics, tables).resolved,
+  }));
 
 type RawSheetCandidate = {
   tableName: string;
@@ -470,8 +607,26 @@ export const dashboardConfigToolSchema = {
         type: "object",
         properties: {
           insightId: { type: "string" },
-          title: { type: "string" },
-          body: { type: "string" },
+          finding: { type: "string" },
+          metrics: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string" },
+                sourceTable: { type: "string" },
+                sourceField: { type: "string" },
+                aggregation: {
+                  type: "string",
+                  enum: ["sum", "avg", "count", "min", "max"],
+                },
+              },
+              required: ["label", "sourceTable", "sourceField", "aggregation"],
+              additionalProperties: false,
+            },
+          },
+          whyItMatters: { type: "string" },
+          recommendedAction: { type: "string" },
           severity: {
             type: "string",
             enum: ["info", "warning", "positive", "negative"],
@@ -480,8 +635,10 @@ export const dashboardConfigToolSchema = {
         },
         required: [
           "insightId",
-          "title",
-          "body",
+          "finding",
+          "metrics",
+          "whyItMatters",
+          "recommendedAction",
           "severity",
           "relatedTables",
         ],

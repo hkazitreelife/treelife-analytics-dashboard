@@ -78,8 +78,9 @@ export async function POST(
   }
 
   return Response.json({
-    answer: result.answer,
-    sources: result.sources,
+    directAnswer: result.directAnswer,
+    metrics: result.metrics,
+    caveats: result.caveats,
     datasetId: result.datasetId,
   });
 }

@@ -1,6 +1,9 @@
 import {
   buildChatContext,
+  resolveMetricReferences,
+  type ChatAnswerShape,
   type NormalizedTableShape,
+  type ResolvedMetric,
 } from "@analytics/shared";
 import type { Payload } from "payload";
 
@@ -32,7 +35,13 @@ export type ChatDeps = {
 };
 
 export type ChatResult =
-  | { ok: true; datasetId: string; answer: string; sources: string[] }
+  | {
+      ok: true;
+      datasetId: string;
+      directAnswer: string;
+      metrics: ResolvedMetric[];
+      caveats?: string;
+    }
   | { ok: false; status: number; error: string };
 
 type StoredDatasetData = {
@@ -101,19 +110,40 @@ export const runChatQuestion = async (
   const attempt = async (stricterInstruction?: string) =>
     chatClient.ask(
       context,
+      tables,
       trimmedMessage,
       stricterInstruction ? { stricterInstruction } : undefined,
     );
 
-  try {
-    const result = await attempt();
+  /**
+   * The client already validated that every metric resolves (see
+   * claudeChatClient.ts's ask); this resolves them into the actual numbers,
+   * same "validate inside the client, resolve/re-check at the call site"
+   * split as the config-generation and prompt-edit paths. errors should
+   * always be empty here -- re-checked anyway rather than trusted blindly.
+   */
+  const finalize = (result: ChatAnswerShape): ChatResult => {
+    const { resolved, errors } = resolveMetricReferences(result.metrics, tables);
+
+    if (errors.length > 0) {
+      return {
+        ok: false,
+        status: 502,
+        error: `Chat answer's metrics failed resolution at response time (already validated once inside the client): ${errors.join("; ")}`,
+      };
+    }
 
     return {
       ok: true,
       datasetId: String(datasetId),
-      answer: result.answer,
-      sources: result.sources,
+      directAnswer: result.directAnswer,
+      metrics: resolved,
+      caveats: result.caveats,
     };
+  };
+
+  try {
+    return finalize(await attempt());
   } catch (firstError: unknown) {
     if (!isOutputQualityFailure(firstError)) {
       if (firstError instanceof ChatBillingError) {
@@ -137,19 +167,15 @@ export const runChatQuestion = async (
 
     const stricter = [
       `The exact violation was: ${violation}`,
-      "Call emit_chat_answer exactly once, with a non-empty answer string and",
-      "a sources array of strings (it may be empty, but must be an array).",
+      "Call emit_chat_answer exactly once, with a non-empty directAnswer",
+      "string and a metrics array (it may be empty, but must be an array).",
+      "Every metric's sourceTable/sourceField must be a real table/column",
+      "name, verbatim, with an aggregation that suits that column's type.",
+      "Do not include a `value` field on a metric.",
     ].join(" ");
 
     try {
-      const result = await attempt(stricter);
-
-      return {
-        ok: true,
-        datasetId: String(datasetId),
-        answer: result.answer,
-        sources: result.sources,
-      };
+      return finalize(await attempt(stricter));
     } catch (secondError: unknown) {
       if (secondError instanceof ChatBillingError) {
         return { ok: false, status: 503, error: secondError.message };

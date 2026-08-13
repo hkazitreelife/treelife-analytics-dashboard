@@ -26,6 +26,20 @@ export const insightSeveritySchema = z.enum([
   "negative",
 ]);
 
+/**
+ * Section 9.1. Aggregation kinds a metric reference may ask for. A superset
+ * of aggregationTypeSchema in one direction (min/max, which a widget never
+ * needs) and a subset in another (no "none": a metric callout is always a
+ * single resolved number, so there is nothing for "none" to mean here).
+ */
+export const metricAggregationSchema = z.enum([
+  "sum",
+  "avg",
+  "count",
+  "min",
+  "max",
+]);
+
 export const widgetPositionSchema = z
   .object({
     row: z.number().int().min(0),
@@ -55,15 +69,42 @@ export const dashboardTabSchema = z
   })
   .strict();
 
+/**
+ * Section 9.1. Claude names which real column and aggregation it is citing;
+ * it never writes the number itself. `value` is deliberately absent here --
+ * see resolveMetricReferences in claudeConfigContract.ts, which is the only
+ * code allowed to produce one, computed from the dataset's real rows.
+ */
+export const insightMetricRefSchema = z
+  .object({
+    label: z.string().min(1),
+    sourceTable: z.string().min(1),
+    sourceField: z.string().min(1),
+    aggregation: metricAggregationSchema,
+  })
+  .strict();
+
+/** insightMetricRefSchema plus the server-computed value. Never model output. */
+export const resolvedInsightMetricSchema = insightMetricRefSchema.extend({
+  value: z.number(),
+});
+
 export const dashboardInsightSchema = z
   .object({
     insightId: z.string().min(1),
-    title: z.string().min(1),
-    body: z.string().min(1),
+    finding: z.string().min(1),
+    metrics: z.array(insightMetricRefSchema),
+    whyItMatters: z.string().min(1),
+    recommendedAction: z.string().min(1),
     severity: insightSeveritySchema,
     relatedTables: z.array(z.string().min(1)),
   })
   .strict();
+
+/** dashboardInsightSchema with every metric resolved to a real number. What is actually stored and rendered. */
+export const resolvedDashboardInsightSchema = dashboardInsightSchema.extend({
+  metrics: z.array(resolvedInsightMetricSchema),
+});
 
 /**
  * strict() throughout: an extra key is a validation failure, not something to
@@ -78,13 +119,34 @@ export const dashboardConfigSchema = z
   })
   .strict();
 
+/**
+ * dashboardConfigSchema with every insight's metrics resolved to real
+ * numbers. This, never dashboardConfigSchema's raw model-output shape, is
+ * what reaches Configs storage and the renderer -- resolution happens
+ * server-side, between Claude's tool call and the write, exactly once, in
+ * both the generation and edit pipelines (see resolveInsightMetrics).
+ */
+export const resolvedDashboardConfigSchema = z
+  .object({
+    datasetId: z.string().min(1),
+    title: z.string().min(1),
+    tabs: z.array(dashboardTabSchema).min(1),
+    insights: z.array(resolvedDashboardInsightSchema),
+  })
+  .strict();
+
 export type WidgetTypeValue = z.infer<typeof widgetTypeSchema>;
 export type AggregationTypeValue = z.infer<typeof aggregationTypeSchema>;
+export type MetricAggregationValue = z.infer<typeof metricAggregationSchema>;
 export type InsightSeverityValue = z.infer<typeof insightSeveritySchema>;
 export type DashboardWidgetShape = z.infer<typeof dashboardWidgetSchema>;
 export type DashboardTabShape = z.infer<typeof dashboardTabSchema>;
+export type InsightMetricRefShape = z.infer<typeof insightMetricRefSchema>;
+export type ResolvedInsightMetricShape = z.infer<typeof resolvedInsightMetricSchema>;
 export type DashboardInsightShape = z.infer<typeof dashboardInsightSchema>;
+export type ResolvedDashboardInsightShape = z.infer<typeof resolvedDashboardInsightSchema>;
 export type DashboardConfigShape = z.infer<typeof dashboardConfigSchema>;
+export type ResolvedDashboardConfigShape = z.infer<typeof resolvedDashboardConfigSchema>;
 
 /** Recorded on every Configs row so a prompt edit is never mistaken for a first pass. */
 export const CONFIG_SOURCE = {

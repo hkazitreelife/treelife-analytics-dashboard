@@ -6,11 +6,15 @@ import {
   CONFIG_SOURCE,
   dashboardConfigSchema,
   findExtraTabWidgets,
+  findUnresolvableMetrics,
   readIngestionLimits,
+  resolveInsightMetrics,
+  resolvedDashboardConfigSchema,
   type DashboardConfigShape,
   type IngestionJobData,
   type NormalizedDatasetShape,
   type NormalizedTableShape,
+  type ResolvedDashboardConfigShape,
 } from "@analytics/shared";
 import type { Queue } from "bullmq";
 import type { Payload } from "payload";
@@ -201,7 +205,7 @@ const generateConfig = async (
   tables: NormalizedTableShape[],
   relationships: unknown[],
   logger: Payload["logger"],
-): Promise<DashboardConfigShape> => {
+): Promise<ResolvedDashboardConfigShape> => {
   // Rows are read only to compute aggregates; only aggregates leave this call.
   const metadata = buildDatasetMetadata(
     datasetId,
@@ -215,6 +219,10 @@ const generateConfig = async (
    * response never escapes it; this validates so nothing invalid can reach the
    * Configs write regardless of which client implementation is in use. Storage
    * is the invariant that matters, so the check belongs next to it too.
+   *
+   * Returns Claude's raw (unresolved-metric) output. Resolution happens once,
+   * outside this closure, after a validated attempt has actually succeeded --
+   * see below.
    */
   const attempt = async (
     stricterInstruction?: string,
@@ -255,11 +263,27 @@ const generateConfig = async (
       );
     }
 
+    // Section 9.1, re-checked here for the same reason as the two checks
+    // above: an insight metric that doesn't resolve against real data is a
+    // validation failure, not something storage should ever see.
+    const unresolvableMetrics = findUnresolvableMetrics(
+      parsed.data.insights,
+      tables,
+    );
+
+    if (unresolvableMetrics.length > 0) {
+      throw new ClaudeValidationError(
+        `Config has insight metrics that don't resolve against real data: ${unresolvableMetrics.join("; ")}`,
+      );
+    }
+
     return parsed.data;
   };
 
+  let validated: DashboardConfigShape;
+
   try {
-    return await attempt();
+    validated = await attempt();
   } catch (firstError: unknown) {
     if (!isOutputQualityFailure(firstError)) {
       if (firstError instanceof ClaudeBillingError) {
@@ -289,12 +313,16 @@ const generateConfig = async (
       metadata.rawSheetTableName
         ? `Every widget's sourceTable must be exactly "${metadata.rawSheetTableName}" -- do not create a widget for any other table, even one that seems relevant. Insights may still name other tables in relatedTables.`
         : "",
+      "Every insight metric's sourceTable/sourceField must be a real table/",
+      "column name, verbatim, and its aggregation must suit that column's",
+      "type (never sum/avg/min/max a non-numeric column). Do not include a",
+      "`value` field on a metric -- you never supply one.",
     ]
       .filter(Boolean)
       .join(" ");
 
     try {
-      return await attempt(stricter);
+      validated = await attempt(stricter);
     } catch (secondError: unknown) {
       if (secondError instanceof ClaudeBillingError) {
         throw secondError;
@@ -310,6 +338,26 @@ const generateConfig = async (
       );
     }
   }
+
+  // Section 9.1: resolution happens exactly once, after a validated attempt
+  // has already confirmed every metric resolves cleanly -- so this never
+  // needs to check for its own errors. resolvedDashboardConfigSchema is
+  // re-validated anyway, matching the same "trust nothing, check again right
+  // before storage" discipline as the raw config above.
+  const resolvedConfig: ResolvedDashboardConfigShape = {
+    ...validated,
+    insights: resolveInsightMetrics(validated.insights, tables),
+  };
+
+  const revalidated = resolvedDashboardConfigSchema.safeParse(resolvedConfig);
+
+  if (!revalidated.success) {
+    throw new IngestionError(
+      `Resolved config failed schema validation before storage: ${JSON.stringify(revalidated.error.issues)}`,
+    );
+  }
+
+  return revalidated.data;
 };
 
 export const processIngestionJob = async (

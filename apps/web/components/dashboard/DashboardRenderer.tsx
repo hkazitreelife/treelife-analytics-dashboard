@@ -1,6 +1,11 @@
 "use client";
 
-import { DEFAULT_LIMITS, type DashboardConfigShape, type DashboardWidgetShape } from "@analytics/shared";
+import {
+  DEFAULT_LIMITS,
+  type DashboardWidgetShape,
+  type ResolvedDashboardConfigShape,
+  type ResolvedMetric,
+} from "@analytics/shared";
 import { useEffect, useMemo, useState } from "react";
 
 import { InsightsPanel } from "@/components/dashboard/InsightsPanel";
@@ -8,6 +13,7 @@ import {
   WidgetRenderer,
   type TableState,
 } from "@/components/dashboard/WidgetRenderer";
+import { formatNumber } from "@/lib/aggregate";
 import {
   ErrorState,
   Skeleton,
@@ -26,7 +32,7 @@ import {
 type ConfigResponse = {
   version: number;
   generatedBy: string;
-  config: DashboardConfigShape;
+  config: ResolvedDashboardConfigShape;
 };
 
 type DatasetSummary = {
@@ -43,7 +49,7 @@ type Phase =
   | {
       kind: "ready";
       dataset: DatasetSummary;
-      config: DashboardConfigShape;
+      config: ResolvedDashboardConfigShape;
       version: number;
       // Set when status is "failed" but a previous successful ingestion left
       // good data and config in place (PRD 11.3): the dashboard renders as
@@ -196,7 +202,12 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   const [chatStatus, setChatStatus] = useState<
     | { kind: "idle" }
     | { kind: "pending" }
-    | { kind: "answered"; answer: string; sources: string[] }
+    | {
+        kind: "answered";
+        directAnswer: string;
+        metrics: ResolvedMetric[];
+        caveats?: string;
+      }
     | { kind: "error"; message: string }
   >({ kind: "idle" });
 
@@ -482,8 +493,9 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
       });
 
       const body = (await response.json()) as {
-        answer?: string;
-        sources?: string[];
+        directAnswer?: string;
+        metrics?: ResolvedMetric[];
+        caveats?: string;
         error?: string;
       };
 
@@ -498,8 +510,9 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
       setChatStatus({
         kind: "answered",
-        answer: body.answer ?? "",
-        sources: body.sources ?? [],
+        directAnswer: body.directAnswer ?? "",
+        metrics: body.metrics ?? [],
+        caveats: body.caveats,
       });
     } catch (error: unknown) {
       setChatStatus({
@@ -691,10 +704,29 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
             role="status"
             className="rounded-lg border border-[color:var(--color-cloud)] bg-white p-3 text-sm text-[color:var(--color-ink)]"
           >
-            <p>{chatStatus.answer}</p>
-            {chatStatus.sources.length > 0 ? (
-              <p className="mt-2 text-xs text-[color:var(--color-steel)]">
-                Source: {chatStatus.sources.join(", ")}
+            <p>{chatStatus.directAnswer}</p>
+
+            {chatStatus.metrics.length > 0 ? (
+              <ul className="mt-2 flex flex-wrap gap-3">
+                {chatStatus.metrics.map((metric, index) => (
+                  <li
+                    key={`${metric.label}-${index}`}
+                    className="rounded-md bg-[color:var(--color-cloud)] px-2.5 py-1.5"
+                  >
+                    <p className="text-base font-semibold leading-none text-[color:var(--color-forest)]">
+                      {formatNumber(metric.value)}
+                    </p>
+                    <p className="mt-1 text-[11px] leading-none text-[color:var(--color-steel)]">
+                      {metric.label} · {metric.sourceTable}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+
+            {chatStatus.caveats ? (
+              <p className="mt-2 text-xs italic text-[color:var(--color-steel)]">
+                {chatStatus.caveats}
               </p>
             ) : null}
           </div>

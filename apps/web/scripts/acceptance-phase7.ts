@@ -120,8 +120,16 @@ const main = async (): Promise<void> => {
     }[];
     insights: {
       insightId: string;
-      title: string;
-      body: string;
+      finding: string;
+      metrics: {
+        label: string;
+        sourceTable: string;
+        sourceField: string;
+        aggregation: "sum" | "avg" | "count" | "min" | "max";
+        value: number;
+      }[];
+      whyItMatters: string;
+      recommendedAction: string;
       severity: "info" | "warning" | "positive" | "negative";
       relatedTables: string[];
     }[];
@@ -711,7 +719,7 @@ const main = async (): Promise<void> => {
     ...new Set(dashboardConfig.insights.map((i) => i.severity)),
   ];
   const allBodiesPresent = dashboardConfig.insights.every((i) =>
-    insightsHtml.includes(escapeForHtmlCompare(i.title)),
+    insightsHtml.includes(escapeForHtmlCompare(i.finding)),
   );
   const severityAttrs = severities.every((s) =>
     insightsHtml.includes(`data-severity="${s}"`),
@@ -729,7 +737,7 @@ const main = async (): Promise<void> => {
   );
 
   say("severities present in config", severities);
-  say("every insight title rendered", allBodiesPresent);
+  say("every insight finding rendered", allBodiesPresent);
   say("data-severity attribute per insight", severityAttrs);
   say("distinct colour token per severity", distinctColours);
 
