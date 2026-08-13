@@ -368,6 +368,7 @@ const main = async (): Promise<void> => {
       categoryField,
       measureFields,
       widget.aggregation,
+      source.columns,
     );
 
     if (series.length === 0) {
@@ -567,12 +568,14 @@ const main = async (): Promise<void> => {
       groupCol,
       [numericCol],
       "sum",
+      bigTable.columns,
     );
     const fullSeries = buildCategorySeries(
       bigTable.rows,
       groupCol,
       [numericCol],
       "sum",
+      bigTable.columns,
     );
 
     const previewTotal = Number(

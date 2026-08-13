@@ -232,6 +232,7 @@ const WidgetBody = ({
     categoryField,
     measureFields,
     widget.aggregation,
+    columns,
   );
 
   if (series.length === 0) {

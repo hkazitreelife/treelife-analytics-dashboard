@@ -79,6 +79,59 @@ const asNumber = (value: unknown): number | null => {
 };
 
 /**
+ * A "TOTAL"/"Grand Total" row is a rollup of the other rows in its own
+ * table, not a peer data point -- summing it alongside them double-counts
+ * whatever it's a total of. Excluded from sum/avg/count aggregation only:
+ * still a real row, still returned to and rendered by the plain table
+ * widget, still visible everywhere except the aggregation math itself.
+ *
+ * Both this file's Claude-metadata aggregates and the browser's own live
+ * aggregation (apps/web/lib/aggregate.ts) exclude it through this one
+ * implementation, so the two can never disagree about which rows count.
+ */
+const TOTAL_ROW_LABELS = new Set(["total", "grand total"]);
+
+export const isTotalRowLabel = (value: unknown): boolean =>
+  typeof value === "string" && TOTAL_ROW_LABELS.has(value.trim().toLowerCase());
+
+/**
+ * The column identifying what each row represents, so a "TOTAL" row can
+ * actually be recognized. Not a new Gemini field: deterministically the
+ * first column whose inferredType suits a row label (categorical, date, or
+ * id) -- the exact same rule apps/web/lib/aggregate.ts's resolveChartFields
+ * already uses to pick a chart's category axis. A table with no such
+ * column (e.g. all-numeric, or a pure id+numeric raw-data table) has no
+ * label column and nothing gets excluded, which is correct: there is
+ * nothing there to be labeled "TOTAL".
+ */
+export const findLabelColumnName = (
+  columns: { name: string; inferredType: string }[],
+): string | null => {
+  const match = columns.find(
+    (column) =>
+      column.inferredType === "categorical" ||
+      column.inferredType === "date" ||
+      column.inferredType === "id",
+  );
+
+  return match?.name ?? null;
+};
+
+/** `rows` with its table's TOTAL/Grand Total row (if any) removed. */
+export const excludeTotalRows = <T extends Record<string, unknown>>(
+  rows: T[],
+  columns: { name: string; inferredType: string }[],
+): T[] => {
+  const labelColumn = findLabelColumnName(columns);
+
+  if (!labelColumn) {
+    return rows;
+  }
+
+  return rows.filter((row) => !isTotalRowLabel(row[labelColumn]));
+};
+
+/**
  * Builds the metadata payload sent to Claude, for either initial generation
  * or a prompt edit. Rows are read here to compute aggregates, and only the
  * aggregates leave this function. No row ever reaches the prompt.
@@ -94,6 +147,11 @@ export const buildDatasetMetadata = (
   relationships,
   tables: tables.map((table) => {
     const numericAggregates: NumericAggregate[] = [];
+    // Excluded from the aggregates below only. rowCount and emptyCount
+    // further down deliberately still read table.rows in full: a TOTAL row
+    // is a real row that exists and has real (or blank) cells, it just
+    // isn't a peer to sum alongside.
+    const aggregatableRows = excludeTotalRows(table.rows, table.columns);
 
     for (const column of table.columns) {
       if (column.inferredType !== "numeric") {
@@ -102,7 +160,7 @@ export const buildDatasetMetadata = (
 
       const values: number[] = [];
 
-      for (const row of table.rows) {
+      for (const row of aggregatableRows) {
         const parsed = asNumber(row[column.name]);
 
         if (parsed !== null) {

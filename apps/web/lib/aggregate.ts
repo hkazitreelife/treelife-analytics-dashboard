@@ -1,4 +1,4 @@
-import type { AggregationTypeValue } from "@analytics/shared";
+import { excludeTotalRows, type AggregationTypeValue } from "@analytics/shared";
 
 /**
  * Client-side aggregation for the renderer. Pure functions, no knowledge of any
@@ -88,17 +88,23 @@ export type CategorySeries = { category: string; [measure: string]: unknown };
 /**
  * Groups rows by the category field and aggregates each measure within the
  * group. Rows with a blank category are excluded rather than bucketed under an
- * empty label, which would read as a real category.
+ * empty label, which would read as a real category. A row whose table-level
+ * label column reads "TOTAL"/"Grand Total" is also excluded here, before
+ * grouping: otherwise it forms its own bucket and shows up as an extra bar,
+ * pie slice, or line point that's actually a rollup of the other buckets,
+ * not a peer to them.
  */
 export const buildCategorySeries = (
   rows: DataRow[],
   categoryField: string,
   measureFields: string[],
   aggregation: AggregationTypeValue,
+  columns: DataColumn[],
 ): CategorySeries[] => {
   const groups = new Map<string, DataRow[]>();
+  const aggregatableRows = excludeTotalRows(rows, columns);
 
-  for (const row of rows) {
+  for (const row of aggregatableRows) {
     const raw = row[categoryField];
 
     if (isBlank(raw)) {
@@ -157,13 +163,28 @@ export const computeKpi = (
   aggregation: AggregationTypeValue,
 ): KpiResult => {
   const { measureFields } = resolveChartFields(fields, columns);
+  // A "TOTAL"/"Grand Total" row is a rollup of the other rows in this same
+  // table -- summing (or counting) it alongside them double-counts. Applies
+  // to count too: "how many records" shouldn't count the rollup row as one
+  // more record.
+  const aggregatableRows = excludeTotalRows(rows, columns);
 
   if (aggregation === "count") {
-    return { kind: "value", value: rows.length, field: null, usedRows: rows.length };
+    return {
+      kind: "value",
+      value: aggregatableRows.length,
+      field: null,
+      usedRows: aggregatableRows.length,
+    };
   }
 
   if (fields.length === 0) {
-    return { kind: "value", value: rows.length, field: null, usedRows: rows.length };
+    return {
+      kind: "value",
+      value: aggregatableRows.length,
+      field: null,
+      usedRows: aggregatableRows.length,
+    };
   }
 
   const field = measureFields[0] ?? null;
@@ -175,13 +196,13 @@ export const computeKpi = (
     return { kind: "not-numeric", field: fields[0]! };
   }
 
-  const values = rows
+  const values = aggregatableRows
     .map((row) => toNumber(row[field]))
     .filter((value): value is number => value !== null);
 
   return {
     kind: "value",
-    value: applyAggregation(values, aggregation, rows.length),
+    value: applyAggregation(values, aggregation, aggregatableRows.length),
     field,
     usedRows: values.length,
   };
