@@ -119,6 +119,12 @@ export const processDocumentIngestionJob = async (
     );
 
   let extraction;
+  // Timing instrumentation, not a permanent metric: settles which half of a
+  // run is actually slow (Gemini reading/classifying the raw file vs
+  // Claude judging what matters in the extracted text) instead of guessing
+  // from the total. Covers the retry too, if one happens, since that's
+  // still real time this step cost.
+  const extractionStartedAt = Date.now();
 
   try {
     extraction = await extractionAttempt();
@@ -166,6 +172,12 @@ export const processDocumentIngestionJob = async (
       );
     }
   }
+
+  const extractionDurationMs = Date.now() - extractionStartedAt;
+
+  payload.logger.info(
+    `Document extraction (Gemini, model "${geminiDocument.primaryModel}") took ${extractionDurationMs}ms for job ${data.jobId}.`,
+  );
 
   if (extraction.documentKind === "tabular") {
     // Section 14 has no code path today that turns an arbitrary PDF/PPTX/
@@ -225,6 +237,7 @@ export const processDocumentIngestionJob = async (
     );
 
   let summary;
+  const summaryStartedAt = Date.now();
 
   try {
     summary = await summaryAttempt();
@@ -273,6 +286,12 @@ export const processDocumentIngestionJob = async (
       );
     }
   }
+
+  const summaryDurationMs = Date.now() - summaryStartedAt;
+
+  payload.logger.info(
+    `Document summary (Claude, model "${claudeSummary.primaryModel}") took ${summaryDurationMs}ms for job ${data.jobId}.`,
+  );
 
   // Re-validated here too, immediately before storage, same
   // never-trust-a-single-check discipline as the table path's

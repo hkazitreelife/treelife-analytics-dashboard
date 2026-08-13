@@ -44,12 +44,19 @@ export const Summaries: CollectionConfig = {
       options: [
         { label: "Initial summary", value: "initial_summary" },
         { label: "Expand", value: "expand" },
+        // Section 10.2: reshapes/filters the existing keyPoints list --
+        // distinct from "Expand", which only ever adds. See
+        // apps/web/lib/documentPromptEdit.ts's doc comment.
+        { label: "Prompt edit", value: "prompt_edit" },
       ],
     },
     {
-      // Set only for an expand call, so an auto-generated initial summary is
-      // never attributed to a user who did not ask for it -- same rule as
-      // Configs.editedBy.
+      // Set for an expand or a prompt-edit call, never for the initial
+      // auto-generated summary, so that one is never attributed to a user
+      // who did not ask for it -- same rule as Configs.editedBy. Named
+      // expandedBy from Section 10.0; kept as-is rather than renamed for
+      // Section 10.2's prompt-edit (which also sets it) to avoid an
+      // unnecessary schema-push column rename on top of the changes here.
       name: "expandedBy",
       type: "relationship",
       relationTo: "users",

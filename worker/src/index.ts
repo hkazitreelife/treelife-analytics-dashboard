@@ -5,8 +5,12 @@ import {
   DOCUMENT_INGESTION_QUEUE_NAME,
   INGESTION_QUEUE_NAME,
   redisConnectionOptions,
+  WORKER_HEARTBEAT_INTERVAL_MS,
+  WORKER_HEARTBEAT_REDIS_KEY,
+  WORKER_HEARTBEAT_TTL_SECONDS,
   type DocumentIngestionJobData,
   type IngestionJobData,
+  type WorkerHeartbeatPayload,
 } from "@analytics/shared";
 import { Queue, Worker } from "bullmq";
 import dotenv from "dotenv";
@@ -229,9 +233,54 @@ payload.logger.info(
   `Worker listening on queue "${DOCUMENT_INGESTION_QUEUE_NAME}". Press Ctrl+C to stop.`,
 );
 
+/**
+ * Section 10.1 Part 2. Proves the worker's own event loop is still alive and
+ * looping, not just that it started successfully -- what actually happened
+ * earlier this session was a worker that logged its startup lines and then
+ * silently stopped consuming a queue, with no further signal either way.
+ * This does NOT prove either Worker is actively consuming (a worker can be
+ * alive and heartbeating while genuinely wedged inside a stuck job, or if
+ * this setInterval callback itself were somehow starved) -- see
+ * GET /api/health/queues in the web process for the complementary check
+ * (how long the oldest queued job has waited), which is what actually
+ * catches "alive but not consuming."
+ */
+const HEARTBEAT_QUEUES = [INGESTION_QUEUE_NAME, DOCUMENT_INGESTION_QUEUE_NAME];
+
+const writeHeartbeat = async (): Promise<void> => {
+  const heartbeat: WorkerHeartbeatPayload = {
+    timestamp: new Date().toISOString(),
+    queues: HEARTBEAT_QUEUES,
+  };
+
+  await connection.set(
+    WORKER_HEARTBEAT_REDIS_KEY,
+    JSON.stringify(heartbeat),
+    "EX",
+    WORKER_HEARTBEAT_TTL_SECONDS,
+  );
+};
+
+void writeHeartbeat().catch((error: unknown) =>
+  payload.logger.error({ err: error }, "Failed to write initial worker heartbeat."),
+);
+
+const heartbeatInterval = setInterval(() => {
+  void writeHeartbeat()
+    .then(() => {
+      payload.logger.info(
+        `Worker heartbeat: alive, listening on ${HEARTBEAT_QUEUES.join(", ")}.`,
+      );
+    })
+    .catch((error: unknown) => {
+      payload.logger.error({ err: error }, "Failed to write worker heartbeat.");
+    });
+}, WORKER_HEARTBEAT_INTERVAL_MS);
+
 const shutdown = async (signal: string): Promise<void> => {
   payload.logger.info(`Received ${signal}. Shutting down worker.`);
 
+  clearInterval(heartbeatInterval);
   await worker.close();
   await documentWorker.close();
   await ingestionQueue.close();

@@ -43,6 +43,7 @@ type UploadResponseBody = {
   datasetId?: string;
   documentId?: string;
   existingDatasetId?: string;
+  existingDocumentId?: string;
   requiresUserChoice?: boolean;
   message?: string;
   error?: string;
@@ -60,11 +61,20 @@ type UploadPhase =
   | { kind: "rejected"; reason: string }
   | { kind: "uploading"; fileName: string }
   | { kind: "upload-error"; message: string }
-  | { kind: "duplicate"; existingDatasetId: string; message: string }
+  // Section 10.1: exactly one of existingDatasetId/existingDocumentId is
+  // set, mirroring which collection the server-side collision check found
+  // the match in.
+  | {
+      kind: "duplicate";
+      existingDatasetId: string | null;
+      existingDocumentId: string | null;
+      message: string;
+    }
   | {
       kind: "collision";
       fileId: string;
-      existingDatasetId: string;
+      existingDatasetId: string | null;
+      existingDocumentId: string | null;
       message: string;
       submitting: boolean;
     }
@@ -292,20 +302,29 @@ export default function HomePage() {
         return;
       }
 
-      if (body.status === "duplicate_noop" && body.existingDatasetId) {
+      if (
+        body.status === "duplicate_noop" &&
+        (body.existingDatasetId || body.existingDocumentId)
+      ) {
         setUploadPhase({
           kind: "duplicate",
-          existingDatasetId: body.existingDatasetId,
+          existingDatasetId: body.existingDatasetId ?? null,
+          existingDocumentId: body.existingDocumentId ?? null,
           message: body.message ?? "File already processed.",
         });
         return;
       }
 
-      if (body.requiresUserChoice && body.fileId && body.existingDatasetId) {
+      if (
+        body.requiresUserChoice &&
+        body.fileId &&
+        (body.existingDatasetId || body.existingDocumentId)
+      ) {
         setUploadPhase({
           kind: "collision",
           fileId: body.fileId,
-          existingDatasetId: body.existingDatasetId,
+          existingDatasetId: body.existingDatasetId ?? null,
+          existingDocumentId: body.existingDocumentId ?? null,
           message: body.message ?? "A dataset with this filename exists.",
           submitting: false,
         });
@@ -343,7 +362,7 @@ export default function HomePage() {
       return;
     }
 
-    const { fileId, existingDatasetId } = uploadPhase;
+    const { fileId, existingDatasetId, existingDocumentId } = uploadPhase;
     setUploadPhase({ ...uploadPhase, submitting: true });
 
     try {
@@ -351,12 +370,16 @@ export default function HomePage() {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileId, existingDatasetId, choice }),
+        body: JSON.stringify(
+          existingDocumentId
+            ? { fileId, existingDocumentId, choice }
+            : { fileId, existingDatasetId, choice },
+        ),
       });
 
       const body = (await response.json()) as UploadResponseBody;
 
-      if (!response.ok || !body.jobId || !body.datasetId) {
+      if (!response.ok || !body.jobId || !(body.datasetId || body.documentId)) {
         setUploadPhase({
           kind: "upload-error",
           message: body.error ?? `Confirmation failed (status ${response.status}).`,
@@ -367,8 +390,8 @@ export default function HomePage() {
       setUploadPhase({
         kind: "processing",
         jobId: body.jobId,
-        datasetId: body.datasetId,
-        documentId: null,
+        datasetId: body.datasetId ?? null,
+        documentId: body.documentId ?? null,
         status: "queued",
       });
       startPolling(body.jobId);
@@ -480,8 +503,16 @@ export default function HomePage() {
         <div style={{ marginTop: 16, padding: 16, border: "1px solid #cce3d8", borderRadius: 8 }}>
           <p>{uploadPhase.message}</p>
           <p>
-            <a href={`/datasets/${uploadPhase.existingDatasetId}`}>
-              Go to the existing dashboard
+            <a
+              href={
+                uploadPhase.existingDocumentId
+                  ? `/documents/${uploadPhase.existingDocumentId}`
+                  : `/datasets/${uploadPhase.existingDatasetId}`
+              }
+            >
+              {uploadPhase.existingDocumentId
+                ? "Go to the existing summary"
+                : "Go to the existing dashboard"}
             </a>{" "}
             &middot; <button type="button" onClick={resetUpload}>Upload something else</button>
           </p>
@@ -497,14 +528,14 @@ export default function HomePage() {
             onClick={() => void confirmCollision("update_existing")}
             style={{ marginRight: 8 }}
           >
-            Update existing dataset
+            Update existing {uploadPhase.existingDocumentId ? "document" : "dataset"}
           </button>
           <button
             type="button"
             disabled={uploadPhase.submitting}
             onClick={() => void confirmCollision("create_new")}
           >
-            Create new dataset
+            Create new {uploadPhase.existingDocumentId ? "document" : "dataset"}
           </button>
           {uploadPhase.submitting ? <p>Submitting…</p> : null}
         </div>

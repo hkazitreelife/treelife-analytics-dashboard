@@ -7,4 +7,6 @@ export * from "./schemas/chatAnswer";
 export * from "./claudeConfigContract";
 export * from "./schemas/normalizedDocument";
 export * from "./schemas/documentSummary";
+export * from "./schemas/documentChatAnswer";
 export * from "./documentContract";
+export * from "./workerHealth";

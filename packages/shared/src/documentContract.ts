@@ -1,3 +1,4 @@
+import type { DocumentChatCitationShape } from "./schemas/documentChatAnswer";
 import type { KeyPointShape } from "./schemas/documentSummary";
 import type { DocumentSectionShape } from "./schemas/normalizedDocument";
 
@@ -51,6 +52,36 @@ export const findUnverifiableKeyPoints = (
           `keyPoint "${point.pointId}" references unknown section "${sectionId}"`,
         );
       }
+    }
+  }
+
+  return problems;
+};
+
+/**
+ * Section 10.2. Same check as findUnverifiableKeyPoints, for a chat
+ * answer's citations instead of a summary's keyPoints -- both are
+ * {quote, sectionId} claims verified the identical way, just under a
+ * different field name (a citation has no pointId/statement/importance to
+ * carry).
+ */
+export const findUnverifiableCitations = (
+  citations: DocumentChatCitationShape[],
+  fullText: string,
+  sections: DocumentSectionShape[],
+): string[] => {
+  const knownSectionIds = new Set(sections.map((section) => section.sectionId));
+  const problems: string[] = [];
+
+  for (const citation of citations) {
+    if (!quoteExistsInText(citation.quote, fullText)) {
+      problems.push(
+        `citation quote is not a verbatim substring of fullText: "${citation.quote}"`,
+      );
+    }
+
+    if (!knownSectionIds.has(citation.sectionId)) {
+      problems.push(`citation references unknown section "${citation.sectionId}"`);
     }
   }
 

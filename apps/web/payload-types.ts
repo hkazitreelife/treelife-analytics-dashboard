@@ -274,7 +274,7 @@ export interface Document {
   name: string;
   currentFile?: (number | null) | File;
   currentFileHash?: string | null;
-  status: 'processing' | 'ready' | 'failed';
+  status: 'processing' | 'ready' | 'failed' | 'updating';
   /**
    * The normalized narrative document: documentId, sourceFile, fullText, and sections[] from the Section 10.0 Step 2 contract. Written only after full validation succeeds.
    */
@@ -315,7 +315,7 @@ export interface Summary {
     | number
     | boolean
     | null;
-  generatedBy: 'initial_summary' | 'expand';
+  generatedBy: 'initial_summary' | 'expand' | 'prompt_edit';
   expandedBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;

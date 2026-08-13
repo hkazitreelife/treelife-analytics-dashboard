@@ -72,11 +72,53 @@ export async function POST(request: Request): Promise<Response> {
   const hash = sha256(bytes);
   const datasetName = baseNameWithoutExtension(uploaded.name);
 
-  // Section 10.0: a PDF/PPTX/DOCX goes to the narrative-document pipeline
-  // (Documents/Summaries), never Datasets/Configs. Self-contained branch --
-  // everything below it is the existing xlsx/csv/image flow, unmodified.
+  // Section 10.0/10.1: a PDF/PPTX/DOCX goes to the narrative-document
+  // pipeline (Documents/Summaries), never Datasets/Configs. Self-contained
+  // branch, with the exact same duplicate-hash short-circuit and
+  // name-collision prompt as the dataset flow below it -- see
+  // apps/web/app/api/uploads/confirm/route.ts's document branch for what
+  // "update existing" means for a changed document, since a summary isn't
+  // a literal parse the way tables[] is.
   if (isDocumentCandidateFileType(fileType)) {
     try {
+      // Same rule as the dataset flow: a matching hash alone is not a
+      // duplicate, only a completed Job with a Document attached counts.
+      const hashMatches = await payload.find({
+        collection: "files",
+        where: { sha256: { equals: hash } },
+        limit: 100,
+        depth: 0,
+      });
+
+      for (const candidate of hashMatches.docs) {
+        const completedJob = await payload.find({
+          collection: "jobs",
+          where: {
+            and: [
+              { file: { equals: candidate.id } },
+              { status: { equals: "completed" } },
+              { document: { exists: true } },
+            ],
+          },
+          limit: 1,
+          depth: 0,
+        });
+
+        const job = completedJob.docs[0];
+
+        if (job?.document !== null && job?.document !== undefined) {
+          return Response.json(
+            {
+              status: "duplicate_noop",
+              fileId: String(candidate.id),
+              existingDocumentId: String(job.document),
+              message: "File already processed.",
+            },
+            { status: 200 },
+          );
+        }
+      }
+
       const created = await payload.create({
         collection: "files",
         data: {
@@ -99,11 +141,28 @@ export async function POST(request: Request): Promise<Response> {
         });
       }
 
-      // Simplified duplicate/collision handling for v1 of the document
-      // pipeline (Section 10.0 does not specify this UX): every upload
-      // creates a new Document, no "update existing" choice offered yet,
-      // unlike the dataset flow's hash-duplicate short-circuit and
-      // name-collision prompt above.
+      const nameCollision = await payload.find({
+        collection: "documents",
+        where: { name: { equals: datasetName } },
+        limit: 1,
+        depth: 0,
+      });
+
+      const collidingDocument = nameCollision.docs[0];
+
+      if (collidingDocument) {
+        return Response.json(
+          {
+            requiresUserChoice: true,
+            existingDocumentId: String(collidingDocument.id),
+            fileId: String(created.id),
+            message:
+              "A document with this filename exists. Choose whether to update it or create a new document.",
+          },
+          { status: 200 },
+        );
+      }
+
       const document = await payload.create({
         collection: "documents",
         data: {

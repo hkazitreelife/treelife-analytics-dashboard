@@ -38,6 +38,10 @@ export const Documents: CollectionConfig = {
         { label: "Processing", value: "processing" },
         { label: "Ready", value: "ready" },
         { label: "Failed", value: "failed" },
+        // Section 10.1: set while a filename-collision "update existing"
+        // re-upload is being re-extracted and re-summarized. Mirrors
+        // Datasets.status's "updating" exactly.
+        { label: "Updating", value: "updating" },
       ],
     },
     {
