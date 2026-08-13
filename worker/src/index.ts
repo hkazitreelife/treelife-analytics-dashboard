@@ -2,8 +2,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  DOCUMENT_INGESTION_QUEUE_NAME,
   INGESTION_QUEUE_NAME,
   redisConnectionOptions,
+  type DocumentIngestionJobData,
   type IngestionJobData,
 } from "@analytics/shared";
 import { Queue, Worker } from "bullmq";
@@ -44,10 +46,21 @@ const { createClaudeConfigClient } = await import("./services/claudeConfig");
 const { createDatasetLock } = await import("./services/datasetLock");
 const { createDatasetEventPublisher } = await import("./services/events");
 const { processIngestionJob } = await import("./processors/ingestion");
+// Section 10.0's narrative-document pipeline: separate services, separate
+// processor, separate queue below. Nothing above this line changes.
+const { createGeminiDocumentClient } = await import("./services/geminiDocument");
+const { createClaudeDocumentSummaryClient } = await import(
+  "./services/claudeDocumentSummary"
+);
+const { processDocumentIngestionJob } = await import(
+  "./processors/documentIngestion"
+);
 
 const payload = await getPayload({ config });
 const gemini = createGeminiClient(geminiApiKey);
 const claude = createClaudeConfigClient(anthropicApiKey);
+const geminiDocument = createGeminiDocumentClient(geminiApiKey);
+const claudeSummary = createClaudeDocumentSummaryClient(anthropicApiKey);
 const datasetLock = createDatasetLock(connection);
 // Shares `connection`: publish is a normal command, not a dedicated
 // subscriber-mode client the way SUBSCRIBE is, so no second connection.
@@ -143,10 +156,84 @@ payload.logger.info(
   `Worker listening on queue "${INGESTION_QUEUE_NAME}". Press Ctrl+C to stop.`,
 );
 
+/**
+ * Section 10.0. A second Worker on a second queue in this same process --
+ * still two runtime processes total (web + worker), not a third. Mirrors
+ * recordFailure/the dataset worker above exactly, but for Documents: a
+ * failed job never overwrites already-stored document data, and the
+ * technical error is denormalized onto the Document the same way it is onto
+ * a Dataset. No dataset.updated/config.updated events: the document pipeline
+ * has no SSE route in this pass (Section 10.0 did not ask for one); the
+ * upload UI polls /api/jobs/:id, exactly like the dataset path already does
+ * before its own SSE takes over.
+ */
+const recordDocumentFailure = async (
+  data: DocumentIngestionJobData,
+  message: string,
+): Promise<void> => {
+  try {
+    await payload.update({
+      collection: "jobs",
+      id: data.jobId,
+      data: { status: "failed", error: message },
+    });
+
+    await payload.update({
+      collection: "documents",
+      id: data.documentId,
+      data: { status: "failed", lastError: message },
+    });
+  } catch (updateError: unknown) {
+    payload.logger.error(
+      { err: updateError },
+      "Could not record document job failure.",
+    );
+  }
+};
+
+const documentWorker = new Worker<DocumentIngestionJobData>(
+  DOCUMENT_INGESTION_QUEUE_NAME,
+  async (job) => {
+    try {
+      await processDocumentIngestionJob(job.data, {
+        payload,
+        geminiDocument,
+        claudeSummary,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      await recordDocumentFailure(job.data, message);
+
+      throw error;
+    }
+  },
+  {
+    connection,
+    concurrency: 1,
+  },
+);
+
+documentWorker.on("completed", (job) => {
+  payload.logger.info(`Document job ${job.data.jobId} completed.`);
+});
+
+documentWorker.on("failed", (job, error) => {
+  payload.logger.error(
+    { err: error },
+    `Document job ${job?.data.jobId ?? "unknown"} failed.`,
+  );
+});
+
+payload.logger.info(
+  `Worker listening on queue "${DOCUMENT_INGESTION_QUEUE_NAME}". Press Ctrl+C to stop.`,
+);
+
 const shutdown = async (signal: string): Promise<void> => {
   payload.logger.info(`Received ${signal}. Shutting down worker.`);
 
   await worker.close();
+  await documentWorker.close();
   await ingestionQueue.close();
   connection.disconnect();
   await payload.db.destroy?.();

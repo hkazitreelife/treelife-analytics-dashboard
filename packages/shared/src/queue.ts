@@ -8,6 +8,23 @@ export type IngestionJobData = {
 };
 
 /**
+ * Section 10.0. A second, parallel queue for the narrative-document pipeline
+ * -- deliberately not reusing INGESTION_QUEUE_NAME/IngestionJobData, which
+ * stay exactly as they are for the Section 14 table path. Consumed by a
+ * second BullMQ Worker in the same worker process (still two runtime
+ * processes total, not a third), calling processDocumentIngestionJob
+ * instead of processIngestionJob.
+ */
+export const DOCUMENT_INGESTION_QUEUE_NAME = "document-ingestion";
+
+export type DocumentIngestionJobData = {
+  jobId: string;
+  fileId: string;
+  documentId: string;
+  fileHash: string;
+};
+
+/**
  * Section 18.1. The three events the worker publishes and the SSE route
  * forwards. Frontend refetches the affected resource on receipt rather than
  * mutating state from the payload (Section 18.3/30.7) — so the payload

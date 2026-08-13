@@ -22,17 +22,26 @@ type DatasetSummary = {
   totalRows: number;
 };
 
+// Section 10.0: a PDF/PPTX/DOCX narrative document, listed alongside
+// datasets rather than merged into DatasetSummary -- it has no totalRows.
+type DocumentSummaryEntry = {
+  id: string;
+  name: string;
+  status: string;
+};
+
 type DatasetsPhase =
   | { kind: "loading" }
   | { kind: "signed-out" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; datasets: DatasetSummary[] };
+  | { kind: "ready"; datasets: DatasetSummary[]; documents: DocumentSummaryEntry[] };
 
 type UploadResponseBody = {
   status?: string;
   jobId?: string;
   fileId?: string;
   datasetId?: string;
+  documentId?: string;
   existingDatasetId?: string;
   requiresUserChoice?: boolean;
   message?: string;
@@ -43,6 +52,7 @@ type JobStatusBody = {
   status: string;
   error: string | null;
   datasetId: string | null;
+  documentId: string | null;
 };
 
 type UploadPhase =
@@ -58,9 +68,15 @@ type UploadPhase =
       message: string;
       submitting: boolean;
     }
-  | { kind: "processing"; jobId: string; datasetId: string | null; status: string }
+  | {
+      kind: "processing";
+      jobId: string;
+      datasetId: string | null;
+      documentId: string | null;
+      status: string;
+    }
   | { kind: "job-failed"; jobId: string; error: string | null }
-  | { kind: "lost-connection"; jobId: string; datasetId: string | null };
+  | { kind: "lost-connection"; jobId: string };
 
 const JOB_STEPS = [
   "queued",
@@ -102,23 +118,36 @@ export default function HomePage() {
     setDatasetsPhase({ kind: "loading" });
 
     try {
-      const response = await fetch("/api/datasets", { credentials: "include" });
+      const [datasetsResponse, documentsResponse] = await Promise.all([
+        fetch("/api/datasets", { credentials: "include" }),
+        fetch("/api/documents", { credentials: "include" }),
+      ]);
 
-      if (response.status === 401) {
+      if (datasetsResponse.status === 401 || documentsResponse.status === 401) {
         setDatasetsPhase({ kind: "signed-out" });
         return;
       }
 
-      if (!response.ok) {
+      if (!datasetsResponse.ok) {
         setDatasetsPhase({
           kind: "error",
-          message: `Could not load datasets (status ${response.status}).`,
+          message: `Could not load datasets (status ${datasetsResponse.status}).`,
         });
         return;
       }
 
-      const body = (await response.json()) as { datasets: DatasetSummary[] };
-      setDatasetsPhase({ kind: "ready", datasets: body.datasets });
+      // Section 10.0: documents load best-effort -- a datasets-only
+      // deployment error there should not blank the whole page.
+      const datasetsBody = (await datasetsResponse.json()) as { datasets: DatasetSummary[] };
+      const documentsBody = documentsResponse.ok
+        ? ((await documentsResponse.json()) as { documents: DocumentSummaryEntry[] })
+        : { documents: [] };
+
+      setDatasetsPhase({
+        kind: "ready",
+        datasets: datasetsBody.datasets,
+        documents: documentsBody.documents,
+      });
     } catch (error: unknown) {
       setDatasetsPhase({
         kind: "error",
@@ -150,7 +179,7 @@ export default function HomePage() {
         stopPolling();
         setUploadPhase((current) =>
           current.kind === "processing"
-            ? { kind: "lost-connection", jobId, datasetId: current.datasetId }
+            ? { kind: "lost-connection", jobId }
             : current,
         );
       };
@@ -178,13 +207,18 @@ export default function HomePage() {
           if (body.status === "completed") {
             stopPolling();
 
-            if (body.datasetId) {
+            // Section 10.0: a document job's completion carries documentId
+            // instead of datasetId -- checked first since the two are
+            // mutually exclusive on any one job.
+            if (body.documentId) {
+              router.push(`/documents/${body.documentId}`);
+            } else if (body.datasetId) {
               router.push(`/datasets/${body.datasetId}`);
             } else {
               setUploadPhase({
                 kind: "job-failed",
                 jobId,
-                error: "Job completed with no dataset attached.",
+                error: "Job completed with no dataset or document attached.",
               });
             }
 
@@ -201,6 +235,7 @@ export default function HomePage() {
             kind: "processing",
             jobId,
             datasetId: body.datasetId,
+            documentId: body.documentId,
             status: body.status,
           });
         } catch {
@@ -277,11 +312,12 @@ export default function HomePage() {
         return;
       }
 
-      if (body.jobId && body.datasetId) {
+      if (body.jobId && (body.datasetId || body.documentId)) {
         setUploadPhase({
           kind: "processing",
           jobId: body.jobId,
-          datasetId: body.datasetId,
+          datasetId: body.datasetId ?? null,
+          documentId: body.documentId ?? null,
           status: "queued",
         });
         startPolling(body.jobId);
@@ -332,6 +368,7 @@ export default function HomePage() {
         kind: "processing",
         jobId: body.jobId,
         datasetId: body.datasetId,
+        documentId: null,
         status: "queued",
       });
       startPolling(body.jobId);
@@ -562,24 +599,43 @@ export default function HomePage() {
       ) : null}
 
       {datasetsPhase.kind === "ready" ? (
-        datasetsPhase.datasets.length === 0 ? (
-          <p>No datasets yet. Upload a file above to get started.</p>
-        ) : (
-          <>
-            <h2>Your datasets</h2>
-            <ul>
-              {datasetsPhase.datasets.map((dataset) => (
-                <li key={dataset.id}>
-                  <a href={`/datasets/${dataset.id}`}>{dataset.name}</a>{" "}
-                  <span style={{ color: "#666" }}>
-                    ({dataset.status}, {dataset.totalRows.toLocaleString("en-IN")}{" "}
-                    rows)
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </>
-        )
+        <>
+          {datasetsPhase.datasets.length === 0 ? (
+            <p>No datasets yet. Upload a file above to get started.</p>
+          ) : (
+            <>
+              <h2>Your datasets</h2>
+              <ul>
+                {datasetsPhase.datasets.map((dataset) => (
+                  <li key={dataset.id}>
+                    <a href={`/datasets/${dataset.id}`}>{dataset.name}</a>{" "}
+                    <span style={{ color: "#666" }}>
+                      ({dataset.status}, {dataset.totalRows.toLocaleString("en-IN")}{" "}
+                      rows)
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {/* Section 10.0: narrative documents (PDF/PPTX/DOCX with no
+              tabular data), listed separately since they have no row count
+              and link to the summary page rather than a dashboard. */}
+          {datasetsPhase.documents.length > 0 ? (
+            <>
+              <h2>Your documents</h2>
+              <ul>
+                {datasetsPhase.documents.map((document) => (
+                  <li key={document.id}>
+                    <a href={`/documents/${document.id}`}>{document.name}</a>{" "}
+                    <span style={{ color: "#666" }}>({document.status})</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+        </>
       ) : null}
     </main>
   );

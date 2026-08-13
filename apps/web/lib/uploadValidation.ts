@@ -17,6 +17,9 @@ export const EXTENSION_TO_TYPE: Record<string, SupportedFileType> = {
   ".jpg": "image",
   ".jpeg": "image",
   ".pptx": "pptx",
+  // Section 10.0: routed to the narrative-document pipeline, never Section
+  // 14's table path.
+  ".docx": "docx",
 };
 
 export const supportedExtensions = (): string[] =>

@@ -20,6 +20,17 @@ export const Jobs: CollectionConfig = {
       index: true,
     },
     {
+      // Section 10.0: set instead of `dataset` for a job processing a
+      // PDF/PPTX/DOCX through the narrative-document pipeline. A job has
+      // exactly one of dataset/document set, never both -- which pipeline
+      // owns it is decided at upload time (isDocumentCandidateMimeType),
+      // before this row is even created.
+      name: "document",
+      type: "relationship",
+      relationTo: "documents",
+      index: true,
+    },
+    {
       name: "fileHash",
       type: "text",
       index: true,

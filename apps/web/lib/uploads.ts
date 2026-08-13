@@ -23,6 +23,8 @@ const MIME_TO_TYPE: Record<string, SupportedFileType> = {
   "image/jpeg": "image",
   "application/vnd.openxmlformats-officedocument.presentationml.presentation":
     "pptx",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    "docx",
 };
 
 export const readPositiveIntEnv = (name: string, fallback: number): number => {
@@ -63,3 +65,13 @@ export const resolveFileType = (
 
   return byMime;
 };
+
+/**
+ * Section 10.0: which resolved file types go to the narrative-document
+ * pipeline (Documents/Summaries, worker/src/processors/documentIngestion.ts)
+ * rather than the existing Datasets/Configs upload flow. xlsx/csv/image are
+ * untouched.
+ */
+export const isDocumentCandidateFileType = (
+  fileType: SupportedFileType,
+): boolean => fileType === "pdf" || fileType === "pptx" || fileType === "docx";

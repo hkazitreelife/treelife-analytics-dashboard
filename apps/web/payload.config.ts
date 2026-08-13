@@ -7,8 +7,10 @@ import sharp from "sharp";
 
 import { Configs } from "./collections/Configs";
 import { Datasets } from "./collections/Datasets";
+import { Documents } from "./collections/Documents";
 import { Files } from "./collections/Files";
 import { Jobs } from "./collections/Jobs";
+import { Summaries } from "./collections/Summaries";
 import { Users } from "./collections/Users";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -95,7 +97,7 @@ export default buildConfig({
     // only real fix for that half is disabling the extension for localhost.
     suppressHydrationWarning: true,
   },
-  collections: [Users, Files, Datasets, Configs, Jobs],
+  collections: [Users, Files, Datasets, Configs, Jobs, Documents, Summaries],
   secret: requireEnv("PAYLOAD_SECRET"),
   db: postgresAdapter({
     pool: {

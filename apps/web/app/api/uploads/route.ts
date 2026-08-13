@@ -1,7 +1,9 @@
 import { requireUser } from "@/lib/auth";
+import { enqueueDocumentIngestion } from "@/lib/documentQueue";
 import { enqueueIngestion } from "@/lib/queue";
 import {
   baseNameWithoutExtension,
+  isDocumentCandidateFileType,
   maxUploadBytes,
   resolveFileType,
   sha256,
@@ -69,6 +71,90 @@ export async function POST(request: Request): Promise<Response> {
   // File identity is the hash of the bytes, never the filename.
   const hash = sha256(bytes);
   const datasetName = baseNameWithoutExtension(uploaded.name);
+
+  // Section 10.0: a PDF/PPTX/DOCX goes to the narrative-document pipeline
+  // (Documents/Summaries), never Datasets/Configs. Self-contained branch --
+  // everything below it is the existing xlsx/csv/image flow, unmodified.
+  if (isDocumentCandidateFileType(fileType)) {
+    try {
+      const created = await payload.create({
+        collection: "files",
+        data: {
+          sha256: hash,
+          uploadedBy: user.id,
+        },
+        file: {
+          data: bytes,
+          mimetype: uploaded.type,
+          name: uploaded.name,
+          size: uploaded.size,
+        },
+      });
+
+      if (created.filename) {
+        await payload.update({
+          collection: "files",
+          id: created.id,
+          data: { storagePath: `media/${created.filename}` },
+        });
+      }
+
+      // Simplified duplicate/collision handling for v1 of the document
+      // pipeline (Section 10.0 does not specify this UX): every upload
+      // creates a new Document, no "update existing" choice offered yet,
+      // unlike the dataset flow's hash-duplicate short-circuit and
+      // name-collision prompt above.
+      const document = await payload.create({
+        collection: "documents",
+        data: {
+          name: datasetName,
+          currentFile: created.id,
+          currentFileHash: hash,
+          status: "processing",
+          createdBy: user.id,
+        },
+      });
+
+      const job = await payload.create({
+        collection: "jobs",
+        data: {
+          file: created.id,
+          document: document.id,
+          fileHash: hash,
+          status: "queued",
+          retryCount: 0,
+        },
+      });
+
+      await enqueueDocumentIngestion({
+        jobId: String(job.id),
+        fileId: String(created.id),
+        documentId: String(document.id),
+        fileHash: hash,
+      });
+
+      return Response.json(
+        {
+          jobId: String(job.id),
+          fileId: String(created.id),
+          documentId: String(document.id),
+          status: "queued",
+          requiresUserChoice: false,
+        },
+        { status: 202 },
+      );
+    } catch (error: unknown) {
+      payload.logger.error({ err: error }, "Document upload failed.");
+
+      return Response.json(
+        {
+          error: "Upload failed.",
+          detail: error instanceof Error ? error.message : String(error),
+        },
+        { status: 500 },
+      );
+    }
+  }
 
   try {
     // A matching hash alone is not a duplicate. The prior upload counts only if

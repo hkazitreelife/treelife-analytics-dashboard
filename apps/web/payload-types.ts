@@ -72,6 +72,8 @@ export interface Config {
     datasets: Dataset;
     configs: Config1;
     jobs: Job;
+    documents: Document;
+    summaries: Summary;
     'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
     'payload-preferences': PayloadPreference;
@@ -84,6 +86,8 @@ export interface Config {
     datasets: DatasetsSelect<false> | DatasetsSelect<true>;
     configs: ConfigsSelect<false> | ConfigsSelect<true>;
     jobs: JobsSelect<false> | JobsSelect<true>;
+    documents: DocumentsSelect<false> | DocumentsSelect<true>;
+    summaries: SummariesSelect<false> | SummariesSelect<true>;
     'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
     'payload-preferences': PayloadPreferencesSelect<false> | PayloadPreferencesSelect<true>;
@@ -252,11 +256,67 @@ export interface Job {
   id: number;
   file: number | File;
   dataset?: (number | null) | Dataset;
+  document?: (number | null) | Document;
   fileHash?: string | null;
   status: 'queued' | 'processing' | 'validating' | 'generating_config' | 'completed' | 'failed' | 'duplicate_noop';
   retryCount: number;
   error?: string | null;
   completedAt?: string | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "documents".
+ */
+export interface Document {
+  id: number;
+  name: string;
+  currentFile?: (number | null) | File;
+  currentFileHash?: string | null;
+  status: 'processing' | 'ready' | 'failed';
+  /**
+   * The normalized narrative document: documentId, sourceFile, fullText, and sections[] from the Section 10.0 Step 2 contract. Written only after full validation succeeds.
+   */
+  data?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  /**
+   * The technical error from the most recent failed job against this document, including the explicit 'this file appears tabular' verdict when Gemini classifies it that way.
+   */
+  lastError?: string | null;
+  createdBy?: (number | null) | User;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "summaries".
+ */
+export interface Summary {
+  id: number;
+  document: number | Document;
+  version: number;
+  /**
+   * The full keyPoints[] list as of this version (Section 10.0 Step 3 contract).
+   */
+  keyPoints?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  generatedBy: 'initial_summary' | 'expand';
+  expandedBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;
 }
@@ -303,6 +363,14 @@ export interface PayloadLockedDocument {
     | ({
         relationTo: 'jobs';
         value: number | Job;
+      } | null)
+    | ({
+        relationTo: 'documents';
+        value: number | Document;
+      } | null)
+    | ({
+        relationTo: 'summaries';
+        value: number | Summary;
       } | null);
   globalSlug?: string | null;
   user: {
@@ -432,11 +500,40 @@ export interface ConfigsSelect<T extends boolean = true> {
 export interface JobsSelect<T extends boolean = true> {
   file?: T;
   dataset?: T;
+  document?: T;
   fileHash?: T;
   status?: T;
   retryCount?: T;
   error?: T;
   completedAt?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "documents_select".
+ */
+export interface DocumentsSelect<T extends boolean = true> {
+  name?: T;
+  currentFile?: T;
+  currentFileHash?: T;
+  status?: T;
+  data?: T;
+  lastError?: T;
+  createdBy?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "summaries_select".
+ */
+export interface SummariesSelect<T extends boolean = true> {
+  document?: T;
+  version?: T;
+  keyPoints?: T;
+  generatedBy?: T;
+  expandedBy?: T;
   updatedAt?: T;
   createdAt?: T;
 }

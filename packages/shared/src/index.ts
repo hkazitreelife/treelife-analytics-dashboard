@@ -5,3 +5,6 @@ export * from "./schemas/normalizedDataset";
 export * from "./schemas/dashboardConfig";
 export * from "./schemas/chatAnswer";
 export * from "./claudeConfigContract";
+export * from "./schemas/normalizedDocument";
+export * from "./schemas/documentSummary";
+export * from "./documentContract";

@@ -29,6 +29,10 @@ export async function GET(
       datasetId: job.dataset === null || job.dataset === undefined
         ? null
         : String(job.dataset),
+      // Section 10.0: set instead of datasetId for a narrative-document job.
+      documentId: job.document === null || job.document === undefined
+        ? null
+        : String(job.document),
       updatedAt: job.updatedAt,
       completedAt: job.completedAt ?? null,
       retryCount: job.retryCount,

@@ -12,6 +12,7 @@ export const supportedFileTypeSchema = z.enum([
   "pdf",
   "image",
   "pptx",
+  "docx",
 ]);
 
 export const inferredColumnTypeSchema = z.enum([

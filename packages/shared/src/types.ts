@@ -18,7 +18,11 @@ export type SupportedFileType =
   | "csv"
   | "pdf"
   | "image"
-  | "pptx";
+  | "pptx"
+  // Section 10.0: recognized at upload, routed to the narrative document
+  // pipeline (worker/src/processors/documentIngestion.ts), never the
+  // Section 14 table pipeline.
+  | "docx";
 
 export type InferredColumnType =
   | "numeric"
