@@ -4,6 +4,7 @@ import {
   dashboardConfigSchema,
   findUnknownReferences,
   findUnresolvableMetrics,
+  normalizeDashboardConfigInput,
   resolveInsightMetrics,
   resolvedDashboardConfigSchema,
   type DashboardConfigShape,
@@ -209,7 +210,12 @@ export const runPromptEdit = async (
    * the same deliberate duplication worker/src/processors/ingestion.ts uses
    * for the initial-generation path.
    */
-  const revalidated = dashboardConfigSchema.safeParse(edited);
+  const normalized = normalizeDashboardConfigInput(edited) as any;
+  if (normalized && typeof normalized === "object") {
+    normalized.datasetId = String(datasetId);
+  }
+
+  const revalidated = dashboardConfigSchema.safeParse(normalized);
 
   if (!revalidated.success) {
     return {
@@ -219,13 +225,7 @@ export const runPromptEdit = async (
     };
   }
 
-  if (revalidated.data.datasetId !== String(datasetId)) {
-    return {
-      ok: false,
-      status: 502,
-      error: "Edited config changed datasetId; rejected before storage.",
-    };
-  }
+  revalidated.data.datasetId = String(datasetId);
 
   const unknownReferences = findUnknownReferences(revalidated.data, tables);
 

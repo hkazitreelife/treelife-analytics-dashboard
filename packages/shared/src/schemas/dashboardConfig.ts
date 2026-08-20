@@ -284,6 +284,53 @@ export const normalizePresentation = (
   return { shape: "table-row" };
 };
 
+const normalizeWidgetType = (
+  raw: unknown,
+): "kpi_card" | "bar" | "horizontal_bar" | "line" | "pie" | "table" => {
+  const str = String(raw ?? "")
+    .toLowerCase()
+    .replace(/[-_\s]+/g, "");
+  if (
+    str.includes("kpi") ||
+    str.includes("card") ||
+    str.includes("metric") ||
+    str.includes("stat") ||
+    str.includes("scalar") ||
+    str.includes("number")
+  ) {
+    return "kpi_card";
+  }
+  if (str.includes("horizontal") || str.includes("hbar")) {
+    return "horizontal_bar";
+  }
+  if (str.includes("bar") || str.includes("column") || str.includes("histogram")) {
+    return "bar";
+  }
+  if (
+    str.includes("line") ||
+    str.includes("trend") ||
+    str.includes("area") ||
+    str.includes("sparkline") ||
+    str.includes("time") ||
+    str.includes("series")
+  ) {
+    return "line";
+  }
+  if (
+    str.includes("pie") ||
+    str.includes("donut") ||
+    str.includes("radial") ||
+    str.includes("distribution")
+  ) {
+    return "pie";
+  }
+  // Convert any raw table widgets to horizontal_bar charts for rich executive visualization
+  if (str.includes("table") || str.includes("grid")) {
+    return "horizontal_bar";
+  }
+  return "bar";
+};
+
 export const normalizeDashboardConfigInput = (input: unknown): unknown => {
   if (typeof input !== "object" || input === null) {
     return input;
@@ -295,13 +342,18 @@ export const normalizeDashboardConfigInput = (input: unknown): unknown => {
     const nonRawTabs = config.tabs.filter((tab: unknown) => {
       if (typeof tab !== "object" || tab === null) return true;
       const tName = String((tab as Record<string, unknown>).tabName ?? "");
-      return !/^(raw data|records detail|raw records|all records|raw sheet)$/i.test(tName.trim());
+      return !/^(raw data|records detail|raw records|all records|raw sheet)$/i.test(
+        tName.trim(),
+      );
     });
     const candidateTabs = nonRawTabs.length > 0 ? nonRawTabs : config.tabs;
 
-    config.tabs = candidateTabs.map((tab: unknown) => {
+    config.tabs = candidateTabs.map((tab: unknown, tabIdx: number) => {
       if (typeof tab !== "object" || tab === null) return tab;
       const tabObj = { ...(tab as Record<string, unknown>) };
+      if (!tabObj.tabId) tabObj.tabId = `tab_${tabIdx + 1}`;
+      if (!tabObj.tabName) tabObj.tabName = `Tab ${tabIdx + 1}`;
+
       if (Array.isArray(tabObj.widgets)) {
         tabObj.widgets = tabObj.widgets
           .filter((widget: unknown) => {
@@ -310,28 +362,93 @@ export const normalizeDashboardConfigInput = (input: unknown): unknown => {
             const title = String(w.title ?? "").toLowerCase();
             // Filter out raw data table widgets that display row-level personal records
             if (w.type === "table") {
-              const fields = Array.isArray(w.fields) ? w.fields.map((f) => String(f).toLowerCase()) : [];
+              const fields = Array.isArray(w.fields)
+                ? w.fields.map((f) => String(f).toLowerCase())
+                : [];
               const hasRawIdentifiers = fields.some((f) =>
                 ["name", "sr no", "sr. no", "comments", "details"].includes(f),
               );
-              if (hasRawIdentifiers || title.includes("raw") || title.includes("detail") || title.includes("records")) {
+              if (
+                hasRawIdentifiers ||
+                title.includes("raw") ||
+                title.includes("detail") ||
+                title.includes("records")
+              ) {
                 return false;
               }
             }
             return true;
           })
-          .map((widget: unknown) => {
+          .map((widget: unknown, widgetIdx: number) => {
             if (typeof widget !== "object" || widget === null) return widget;
             const w = { ...(widget as Record<string, unknown>) };
+            if (!w.widgetId) w.widgetId = `widget_${tabIdx + 1}_${widgetIdx + 1}`;
+            if (!w.title) w.title = "Metric Analysis";
+
+            // Normalize widget type strictly to one of the enum values
+            w.type = normalizeWidgetType(w.type);
+
+            // Ensure fields is a non-empty array of strings
+            const rawFields = Array.isArray(w.fields)
+              ? w.fields
+              : typeof w.fields === "string"
+                ? [w.fields]
+                : ["Category", "Value"];
+            const cleanFields = (rawFields as unknown[])
+              .map((f) => String(f || "").trim())
+              .filter((f) => f.length > 0);
+            w.fields = cleanFields.length > 0 ? cleanFields : ["Value"];
+
+            // Ensure position is valid numbers within grid bounds
+            const pos =
+              typeof w.position === "object" && w.position !== null
+                ? (w.position as Record<string, unknown>)
+                : {};
+            const col = Number(pos.col);
+            const row = Number(pos.row);
+            const width = Number(pos.w);
+            const height = Number(pos.h);
+            w.position = {
+              col: Number.isFinite(col) && col >= 0 && col <= 11 ? col : 0,
+              row: Number.isFinite(row) && row >= 0 ? row : 0,
+              w:
+                Number.isFinite(width) && width >= 1 && width <= 12
+                  ? width
+                  : w.type === "kpi_card"
+                    ? 3
+                    : 6,
+              h:
+                Number.isFinite(height) && height >= 1 && height <= 12
+                  ? height
+                  : w.type === "kpi_card"
+                    ? 2
+                    : 4,
+            };
+
             const validAggs = ["none", "sum", "count", "avg", "distinct"];
-            const rawAgg = String(w.aggregation ?? "").toLowerCase();
-            if (!validAggs.includes(rawAgg)) {
-              if (rawAgg === "average") w.aggregation = "avg";
-              else if (rawAgg === "total" || rawAgg === "percentage") w.aggregation = "count";
-              else if (rawAgg === "unique") w.aggregation = "distinct";
-              else w.aggregation = w.type === "table" ? "none" : "count";
-            } else {
+            const rawAgg = String(w.aggregation ?? "")
+              .toLowerCase()
+              .replace(/[-_\s]+/g, "");
+            if (
+              rawAgg.includes("avg") ||
+              rawAgg.includes("average") ||
+              rawAgg.includes("mean")
+            ) {
+              w.aggregation = "avg";
+            } else if (rawAgg.includes("distinct") || rawAgg.includes("unique")) {
+              w.aggregation = "distinct";
+            } else if (rawAgg.includes("sum") || rawAgg.includes("total")) {
+              w.aggregation = "sum";
+            } else if (
+              rawAgg.includes("count") ||
+              rawAgg.includes("freq") ||
+              rawAgg.includes("percentage")
+            ) {
+              w.aggregation = "count";
+            } else if (validAggs.includes(rawAgg)) {
               w.aggregation = rawAgg;
+            } else {
+              w.aggregation = w.type === "kpi_card" ? "count" : "sum";
             }
             return w;
           });
@@ -341,11 +458,18 @@ export const normalizeDashboardConfigInput = (input: unknown): unknown => {
   }
 
   if (Array.isArray(config.insights)) {
-    config.insights = config.insights.map((insight: unknown) => {
+    config.insights = config.insights.map((insight: unknown, insIdx: number) => {
       if (typeof insight !== "object" || insight === null) {
         return insight;
       }
       const item = { ...(insight as Record<string, unknown>) };
+      if (!item.insightId) item.insightId = `ins_${insIdx + 1}`;
+      if (!item.finding) item.finding = "Operational metric analysis.";
+      if (!item.whyItMatters) item.whyItMatters = "Informs strategic resource allocation.";
+      if (!item.recommendedAction)
+        item.recommendedAction = "Review trends with department leaders.";
+      if (!item.severity) item.severity = "info";
+
       item.presentation = normalizePresentation(item.presentation);
       if (!Array.isArray(item.metrics)) {
         item.metrics = [];
