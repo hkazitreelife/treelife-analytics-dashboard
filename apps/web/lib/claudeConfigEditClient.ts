@@ -4,6 +4,8 @@ import {
   findUnknownReferences,
   findUnresolvableMetrics,
   isClaudeBillingRejection,
+  normalizeDashboardConfigInput,
+  resolveClaudeModel,
   type DashboardConfigShape,
   type DatasetMetadataForClaude,
   type NormalizedTableShape,
@@ -53,7 +55,7 @@ export class ClaudeEditValidationError extends Error {
 }
 
 const DEFAULT_MODEL = "claude-sonnet-5";
-const DEFAULT_RETRY_MODEL = "claude-opus-5";
+const DEFAULT_RETRY_MODEL = "claude-haiku-5";
 
 const SYSTEM_INSTRUCTION = [
   "You are editing an EXISTING dashboard configuration. You are not designing",
@@ -71,7 +73,17 @@ const SYSTEM_INSTRUCTION = [
   "Per the editing scope, you may change: a widget's type, title, position,",
   "the fields it uses, and its aggregation; tab order and tab names; whether a",
   "widget is present at all (omit it to hide it, or add a new one); and",
-  "insight emphasis (which insights exist, their severity, their wording).",
+  "insight emphasis (which insights exist, their severity, their wording, and",
+  "their presentation shape).",
+  "",
+  "- STRICT RULE: NEVER SHOW RAW ROW-LEVEL DATA: Dashboards are executive summaries, not raw spreadsheets. NEVER create or keep raw data table widgets or raw record tabs displaying individual rows (e.g. columns representing a unique identifier field, label field, free-text field, or detail field). Raw row-level records must NEVER appear on the main dashboard.",
+  "- Focus 100% on Executive Aggregations: Build high-level KPI cards, aggregated category charts (grouped by category_field, region_field, status_field, or date_buckets), and strategic actionable insights.",
+  "- Horizontal vs Vertical Charts: When the admin asks for a 'horizontal bar graph' / 'horizontal bar chart' or to make a chart horizontal, set orientation:\"horizontal\" (or layout:\"horizontal\", or type:\"horizontal_bar\") on that widget. Never just append '(Horizontal)' to the title without setting the orientation/type.",
+  "- Chart Color Customization: When the admin asks to change the color of a chart or widget (e.g. 'make this chart blue', 'change this chart to emerald / red / purple / teal / amber / #hex'), set the `color` field on that widget (e.g. color:\"blue\", color:\"emerald\", color:\"#3b82f6\").",
+  "- Fuzzy Name & Action Matching: The admin may reference a tab or widget with approximate wording (e.g. 'remove category_field Over Time', 'delete the detail tab', 'drop the reference table', 'make chart into horizontal bar graph', 'change chart color to blue'). Match the closest corresponding tab or widget and execute the modification faithfully.",
+  "- Complete Deletion: When asked to delete, drop, or remove a tab or widget, completely remove it from the emitted `tabs` array.",
+  "- Filter Precision: If adding or modifying filtered KPI cards (e.g. a specific category subset, filtered status, or value range subset), apply the exact filter object `{ column, op, value }`.",
+  "- Reshaping Categories: An edit request can reshape presentation category, e.g. \"turn this into a stop start continue framework\". Assign the correct presentation fields if you reshape it.",
   "",
   "A widget's aggregation is one of exactly: none, sum, count, avg, distinct.",
   "count and distinct are NOT interchangeable: count is the number of ROWS;",
@@ -169,16 +181,21 @@ export const createClaudeConfigEditClient = (
     );
   }
 
-  const client = new Anthropic({ apiKey });
-  const effectiveRetryModel =
-    retryModel && retryModel.trim().length > 0 ? retryModel : model;
+  const client = new Anthropic({
+    apiKey,
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+  const resolvedModel = resolveClaudeModel(model);
+  const resolvedRetryModel = resolveClaudeModel(
+    retryModel && retryModel.trim().length > 0 ? retryModel : model
+  );
 
   return {
-    primaryModel: model,
-    retryModelName: effectiveRetryModel,
+    primaryModel: resolvedModel,
+    retryModelName: resolvedRetryModel,
     editConfig: async (currentConfig, metadata, tables, prompt, options) => {
       const isRetry = Boolean(options?.stricterInstruction);
-      const activeModel = isRetry ? effectiveRetryModel : model;
+      const activeModel = isRetry ? resolvedRetryModel : resolvedModel;
 
       if (isRetry) {
         logger.info(`Retrying config edit with model "${activeModel}".`);
@@ -251,7 +268,8 @@ export const createClaudeConfigEditClient = (
         );
       }
 
-      const result = dashboardConfigSchema.safeParse(toolUse.input);
+      const normalizedInput = normalizeDashboardConfigInput(toolUse.input);
+      const result = dashboardConfigSchema.safeParse(normalizedInput);
 
       if (!result.success) {
         throw new ClaudeEditValidationError(

@@ -1,6 +1,7 @@
 import { readIngestionLimits } from "@analytics/shared";
 
 import { requireUser } from "@/lib/auth";
+import { getCache, setCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
 
@@ -13,6 +14,8 @@ const DEFAULT_LIMIT = 100;
 // arbitrarily smaller number. A table can never have stored more rows than
 // that limit, so this is "at most everything", never a true unbounded fetch.
 const MAX_LIMIT = readIngestionLimits().maxRowsPerTable;
+
+const pendingDatasetQueries = new Map<string, Promise<any>>();
 
 type StoredTable = {
   tableName: string;
@@ -54,23 +57,47 @@ export async function GET(
   const limit = Math.min(readInt(url.searchParams.get("limit"), DEFAULT_LIMIT), MAX_LIMIT);
   const offset = readInt(url.searchParams.get("offset"), 0);
 
-  try {
-    const dataset = await payload.findByID({
-      collection: "datasets",
-      id,
-      depth: 0,
-    });
+  const cacheKey = `dataset_data_${id}_${requestedTable || "first"}_${limit}_${offset}`;
+  const cached = getCache<Record<string, unknown>>(cacheKey);
+  if (cached) {
+    return Response.json(cached);
+  }
 
-    const stored = dataset.data as { tables?: StoredTable[] } | null;
-    const tables = stored?.tables ?? [];
+  try {
+    const datasetCacheKey = `dataset_record_${id}`;
+    let cachedDataset = getCache<{ status: string; tables: StoredTable[] }>(datasetCacheKey);
+
+    if (!cachedDataset) {
+      let datasetPromise = pendingDatasetQueries.get(id);
+      if (!datasetPromise) {
+        datasetPromise = payload.findByID({
+          collection: "datasets",
+          id,
+          depth: 0,
+        }).finally(() => {
+          pendingDatasetQueries.delete(id);
+        });
+        pendingDatasetQueries.set(id, datasetPromise);
+      }
+
+      const dataset = await datasetPromise;
+      const stored = dataset.data as { tables?: StoredTable[] } | null;
+      cachedDataset = {
+        status: dataset.status,
+        tables: stored?.tables ?? [],
+      };
+      setCache(datasetCacheKey, cachedDataset, 120_000);
+    }
+
+    const { status, tables } = cachedDataset;
 
     if (tables.length === 0) {
       return Response.json(
         {
           datasetId: id,
-          status: dataset.status,
+          status,
           error:
-            dataset.status === "failed"
+            status === "failed"
               ? "This dataset failed to parse. No data is stored."
               : "This dataset has no stored tables yet.",
           availableTables: [],
@@ -95,7 +122,7 @@ export async function GET(
 
     const rows = table.rows.slice(offset, offset + limit);
 
-    return Response.json({
+    const body = {
       datasetId: id,
       table: table.tableName,
       tableRole: table.tableRole,
@@ -113,7 +140,11 @@ export async function GET(
         tableRole: candidate.tableRole,
         rowCount: candidate.rows.length,
       })),
-    });
+    };
+
+    setCache(cacheKey, body, 60_000);
+
+    return Response.json(body);
   } catch (error: unknown) {
     payload.logger.error({ err: error }, "Failed to load dataset data.");
 

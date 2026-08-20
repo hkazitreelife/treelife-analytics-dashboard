@@ -1,9 +1,14 @@
-import { insightMetricJsonSchema } from "./schemas/dashboardConfig";
+import {
+  insightMetricJsonSchema,
+  presentationJsonSchema,
+  widgetFilterJsonSchema,
+} from "./schemas/dashboardConfig";
 import type {
   DashboardConfigShape,
   DashboardInsightShape,
   InsightMetricRefShape,
   ResolvedDashboardInsightShape,
+  ResolvedMetric,
 } from "./schemas/dashboardConfig";
 import type { NormalizedTableShape } from "./schemas/normalizedDataset";
 
@@ -283,7 +288,88 @@ export const findNamedFigureRows = (table: {
  * findUnknownReferences/findExtraTabWidgets, not something this function
  * papers over.
  */
-export type ResolvedMetric = InsightMetricRefShape & { value: number };
+export type FilterSpec = {
+  column: string;
+  op?: "eq" | "neq" | "lt" | "lte" | "gt" | "gte" | "contains" | "in";
+  value: unknown;
+};
+
+export const applyFilterToRows = (
+  rows: Record<string, unknown>[],
+  filter?: FilterSpec | null,
+  filters?: FilterSpec[] | null,
+): Record<string, unknown>[] => {
+  const allFilters: FilterSpec[] = [];
+  if (filter && typeof filter === "object" && filter.column) {
+    allFilters.push(filter);
+  }
+  if (Array.isArray(filters)) {
+    for (const f of filters) {
+      if (f && typeof f === "object" && f.column) {
+        allFilters.push(f);
+      }
+    }
+  }
+
+  if (allFilters.length === 0) {
+    return rows;
+  }
+
+  return rows.filter((row) =>
+    allFilters.every((f) => {
+      const cellVal = row[f.column];
+      if (cellVal === undefined || cellVal === null) {
+        return false;
+      }
+      const op = f.op ?? "eq";
+      const targetVal = f.value;
+
+      if (op === "eq") {
+        if (typeof targetVal === "number") {
+          return asNumber(cellVal) === targetVal;
+        }
+        return String(cellVal).trim().toLowerCase() === String(targetVal).trim().toLowerCase();
+      }
+      if (op === "neq") {
+        if (typeof targetVal === "number") {
+          return asNumber(cellVal) !== targetVal;
+        }
+        return String(cellVal).trim().toLowerCase() !== String(targetVal).trim().toLowerCase();
+      }
+      if (op === "lt") {
+        const num = asNumber(cellVal);
+        const target = asNumber(targetVal);
+        return num !== null && target !== null && num < target;
+      }
+      if (op === "lte") {
+        const num = asNumber(cellVal);
+        const target = asNumber(targetVal);
+        return num !== null && target !== null && num <= target;
+      }
+      if (op === "gt") {
+        const num = asNumber(cellVal);
+        const target = asNumber(targetVal);
+        return num !== null && target !== null && num > target;
+      }
+      if (op === "gte") {
+        const num = asNumber(cellVal);
+        const target = asNumber(targetVal);
+        return num !== null && target !== null && num >= target;
+      }
+      if (op === "contains") {
+        return String(cellVal).toLowerCase().includes(String(targetVal).toLowerCase());
+      }
+      if (op === "in") {
+        if (Array.isArray(targetVal)) {
+          const lowerArr = targetVal.map((v) => String(v).toLowerCase());
+          return lowerArr.includes(String(cellVal).toLowerCase());
+        }
+        return false;
+      }
+      return true;
+    }),
+  );
+};
 
 export const resolveMetricReferences = (
   metrics: InsightMetricRefShape[],
@@ -334,16 +420,22 @@ export const resolveMetricReferences = (
         continue;
       }
 
-      const numericValue = asNumber(matchingRow[ref.valueColumn]);
+      const rawVal = matchingRow[ref.valueColumn];
 
-      if (numericValue === null) {
+      if (rawVal === null || rawVal === undefined || rawVal === "") {
         errors.push(
-          `metric "${ref.label}" found row "${ref.labelValue}" in "${ref.sourceTable}" but its "${ref.valueColumn}" value is not numeric`,
+          `metric "${ref.label}" found row "${ref.labelValue}" in "${ref.sourceTable}" but its "${ref.valueColumn}" value is empty`,
         );
         continue;
       }
 
-      resolved.push({ ...ref, value: Number(numericValue.toFixed(6)) });
+      const numericValue = asNumber(rawVal);
+
+      if (numericValue !== null) {
+        resolved.push({ ...ref, value: Number(numericValue.toFixed(6)) });
+      } else {
+        resolved.push({ ...ref, value: String(rawVal) });
+      }
       continue;
     }
 
@@ -357,9 +449,14 @@ export const resolveMetricReferences = (
     }
 
     const aggregatableRows = excludeTotalRows(table.rows, table.columns);
+    const targetRows = applyFilterToRows(
+      aggregatableRows,
+      (ref as any).filter,
+      (ref as any).filters,
+    );
 
     if (ref.aggregation === "count") {
-      const count = aggregatableRows.filter(
+      const count = targetRows.filter(
         (row) => !isBlankCell(row[ref.sourceField]),
       ).length;
 
@@ -374,7 +471,7 @@ export const resolveMetricReferences = (
       continue;
     }
 
-    const values = aggregatableRows
+    const values = targetRows
       .map((row) => asNumber(row[ref.sourceField]))
       .filter((value): value is number => value !== null);
 
@@ -465,7 +562,7 @@ export const identifyRawSheet = (
 ): string | null => {
   const dataRoleTables = tables.filter((table) => table.tableRole === "data");
 
-  if (dataRoleTables.length === 0) {
+  if (dataRoleTables.length !== 1) {
     return null;
   }
 
@@ -730,7 +827,7 @@ export const dashboardConfigToolSchema = {
                 widgetId: { type: "string" },
                 type: {
                   type: "string",
-                  enum: ["kpi_card", "bar", "line", "pie", "table"],
+                  enum: ["kpi_card", "bar", "horizontal_bar", "line", "pie", "table"],
                 },
                 title: { type: "string" },
                 sourceTable: { type: "string" },
@@ -738,6 +835,22 @@ export const dashboardConfigToolSchema = {
                 aggregation: {
                   type: "string",
                   enum: ["none", "sum", "count", "avg", "distinct"],
+                },
+                orientation: {
+                  type: "string",
+                  enum: ["vertical", "horizontal"],
+                },
+                layout: {
+                  type: "string",
+                  enum: ["vertical", "horizontal"],
+                },
+                color: {
+                  type: "string",
+                  description: "Custom primary color name (e.g. 'blue', 'emerald', 'purple', 'red', 'amber', 'teal', 'coral') or hex string.",
+                },
+                colorScheme: {
+                  type: "string",
+                  description: "Color scheme palette name.",
                 },
                 position: {
                   type: "object",
@@ -749,6 +862,11 @@ export const dashboardConfigToolSchema = {
                   },
                   required: ["row", "col", "w", "h"],
                   additionalProperties: false,
+                },
+                filter: widgetFilterJsonSchema,
+                filters: {
+                  type: "array",
+                  items: widgetFilterJsonSchema,
                 },
               },
               required: [
@@ -786,6 +904,7 @@ export const dashboardConfigToolSchema = {
             enum: ["info", "warning", "positive", "negative"],
           },
           relatedTables: { type: "array", items: { type: "string" } },
+          presentation: presentationJsonSchema,
         },
         required: [
           "insightId",
@@ -795,6 +914,7 @@ export const dashboardConfigToolSchema = {
           "recommendedAction",
           "severity",
           "relatedTables",
+          "presentation",
         ],
         additionalProperties: false,
       },
@@ -803,3 +923,25 @@ export const dashboardConfigToolSchema = {
   required: ["datasetId", "title", "tabs", "insights"],
   additionalProperties: false,
 };
+
+/**
+ * Resolves the Claude model string to support OpenRouter base URLs and aliases.
+ */
+export const resolveClaudeModel = (model: string): string => {
+  const isOpenRouter = process.env.ANTHROPIC_BASE_URL?.includes("openrouter.ai");
+  if (!isOpenRouter) {
+    return model;
+  }
+  const normalized = model.toLowerCase();
+  if (normalized.includes("sonnet")) {
+    return "anthropic/claude-sonnet-5";
+  }
+  if (normalized.includes("haiku")) {
+    return "anthropic/claude-haiku-4.5";
+  }
+  if (normalized.includes("opus")) {
+    return "anthropic/claude-3-opus";
+  }
+  return model;
+};
+

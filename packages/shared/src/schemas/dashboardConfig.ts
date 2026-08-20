@@ -12,6 +12,7 @@ import { z } from "zod";
 export const widgetTypeSchema = z.enum([
   "kpi_card",
   "bar",
+  "horizontal_bar",
   "line",
   "pie",
   "table",
@@ -65,6 +66,23 @@ export const widgetPositionSchema = z
   })
   .strict();
 
+export const widgetFilterOpSchema = z.enum(["eq", "neq", "lt", "lte", "gt", "gte", "contains", "in"]);
+
+export const widgetFilterSpecSchema = z
+  .object({
+    column: z.string().min(1),
+    op: widgetFilterOpSchema.default("eq"),
+    value: z.union([
+      z.string(),
+      z.number(),
+      z.boolean(),
+      z.array(z.union([z.string(), z.number()])),
+    ]),
+  })
+  .strip();
+
+export type WidgetFilterSpecShape = z.infer<typeof widgetFilterSpecSchema>;
+
 export const dashboardWidgetSchema = z
   .object({
     widgetId: z.string().min(1),
@@ -74,8 +92,14 @@ export const dashboardWidgetSchema = z
     fields: z.array(z.string().min(1)),
     aggregation: aggregationTypeSchema,
     position: widgetPositionSchema,
+    orientation: z.enum(["vertical", "horizontal"]).optional().nullable().transform((v) => v ?? undefined),
+    layout: z.enum(["vertical", "horizontal"]).optional().nullable().transform((v) => v ?? undefined),
+    color: z.string().optional().nullable().transform((v) => v ?? undefined),
+    colorScheme: z.string().optional().nullable().transform((v) => v ?? undefined),
+    filter: widgetFilterSpecSchema.optional().nullable().transform((v) => v ?? undefined),
+    filters: z.array(widgetFilterSpecSchema).optional().nullable().transform((v) => v ?? undefined),
   })
-  .strict();
+  .strip();
 
 export const dashboardTabSchema = z
   .object({
@@ -117,8 +141,10 @@ export const aggregateMetricRefSchema = z
     sourceTable: z.string().min(1),
     sourceField: z.string().min(1),
     aggregation: metricAggregationSchema,
+    filter: widgetFilterSpecSchema.optional().nullable().transform((v) => v ?? undefined),
+    filters: z.array(widgetFilterSpecSchema).optional().nullable().transform((v) => v ?? undefined),
   })
-  .strict();
+  .strip();
 
 export const rowMetricRefSchema = z
   .object({
@@ -146,12 +172,36 @@ export const resolvedAggregateMetricSchema = aggregateMetricRefSchema.extend({
   value: z.number(),
 });
 export const resolvedRowMetricSchema = rowMetricRefSchema.extend({
-  value: z.number(),
+  value: z.union([z.number(), z.string()]),
 });
 export const resolvedInsightMetricSchema = z.discriminatedUnion("kind", [
   resolvedAggregateMetricSchema,
   resolvedRowMetricSchema,
 ]);
+
+export const widgetFilterJsonSchema = {
+  type: "object" as const,
+  properties: {
+    column: { type: "string" as const },
+    op: {
+      type: "string" as const,
+      enum: ["eq", "neq", "lt", "lte", "gt", "gte", "contains", "in"],
+    },
+    value: {
+      anyOf: [
+        { type: "string" as const },
+        { type: "number" as const },
+        { type: "boolean" as const },
+        {
+          type: "array" as const,
+          items: { anyOf: [{ type: "string" as const }, { type: "number" as const }] },
+        },
+      ],
+    },
+  },
+  required: ["column", "value"],
+  additionalProperties: false,
+};
 
 /**
  * Section 9.2. Raw JSON schema for a metric reference, shared by
@@ -169,6 +219,11 @@ export const aggregateMetricJsonSchema = {
     aggregation: {
       type: "string" as const,
       enum: ["sum", "avg", "count", "min", "max"],
+    },
+    filter: widgetFilterJsonSchema,
+    filters: {
+      type: "array" as const,
+      items: widgetFilterJsonSchema,
     },
   },
   required: ["kind", "label", "sourceTable", "sourceField", "aggregation"],
@@ -193,6 +248,130 @@ export const insightMetricJsonSchema = {
   anyOf: [aggregateMetricJsonSchema, rowMetricJsonSchema],
 };
 
+export const presentationShapeSchema = z.enum(["table-row", "tracker-item", "category-box"]);
+
+export const presentationDetailsSchema = z
+  .object({
+    shape: presentationShapeSchema.default("table-row"),
+    status: z.string().optional().nullable().transform((v) => v ?? undefined),
+    owner: z.string().optional().nullable().transform((v) => v ?? undefined),
+    by: z.string().optional().nullable().transform((v) => v ?? undefined),
+    categoryName: z.string().optional().nullable().transform((v) => v ?? undefined),
+    colorIntent: z.string().optional().nullable().transform((v) => v ?? undefined),
+  })
+  .strip();
+
+export const normalizePresentation = (
+  input: unknown,
+): { shape: "table-row" | "tracker-item" | "category-box"; [key: string]: unknown } => {
+  if (!input) {
+    return { shape: "table-row" };
+  }
+  if (typeof input === "string") {
+    if (input === "tracker-item" || input === "category-box" || input === "table-row") {
+      return { shape: input };
+    }
+    return { shape: "table-row" };
+  }
+  if (typeof input === "object" && input !== null) {
+    const obj = { ...(input as Record<string, unknown>) };
+    const validShapes = ["table-row", "tracker-item", "category-box"];
+    if (typeof obj.shape !== "string" || !validShapes.includes(obj.shape)) {
+      obj.shape = "table-row";
+    }
+    return obj as { shape: "table-row" | "tracker-item" | "category-box" };
+  }
+  return { shape: "table-row" };
+};
+
+export const normalizeDashboardConfigInput = (input: unknown): unknown => {
+  if (typeof input !== "object" || input === null) {
+    return input;
+  }
+  const config = { ...(input as Record<string, unknown>) };
+
+  if (Array.isArray(config.tabs)) {
+    // 1. Filter out raw data record tabs if multiple tabs exist
+    const nonRawTabs = config.tabs.filter((tab: unknown) => {
+      if (typeof tab !== "object" || tab === null) return true;
+      const tName = String((tab as Record<string, unknown>).tabName ?? "");
+      return !/^(raw data|records detail|raw records|all records|raw sheet)$/i.test(tName.trim());
+    });
+    const candidateTabs = nonRawTabs.length > 0 ? nonRawTabs : config.tabs;
+
+    config.tabs = candidateTabs.map((tab: unknown) => {
+      if (typeof tab !== "object" || tab === null) return tab;
+      const tabObj = { ...(tab as Record<string, unknown>) };
+      if (Array.isArray(tabObj.widgets)) {
+        tabObj.widgets = tabObj.widgets
+          .filter((widget: unknown) => {
+            if (typeof widget !== "object" || widget === null) return true;
+            const w = widget as Record<string, unknown>;
+            const title = String(w.title ?? "").toLowerCase();
+            // Filter out raw data table widgets that display row-level personal records
+            if (w.type === "table") {
+              const fields = Array.isArray(w.fields) ? w.fields.map((f) => String(f).toLowerCase()) : [];
+              const hasRawIdentifiers = fields.some((f) =>
+                ["name", "sr no", "sr. no", "comments", "details"].includes(f),
+              );
+              if (hasRawIdentifiers || title.includes("raw") || title.includes("detail") || title.includes("records")) {
+                return false;
+              }
+            }
+            return true;
+          })
+          .map((widget: unknown) => {
+            if (typeof widget !== "object" || widget === null) return widget;
+            const w = { ...(widget as Record<string, unknown>) };
+            const validAggs = ["none", "sum", "count", "avg", "distinct"];
+            const rawAgg = String(w.aggregation ?? "").toLowerCase();
+            if (!validAggs.includes(rawAgg)) {
+              if (rawAgg === "average") w.aggregation = "avg";
+              else if (rawAgg === "total" || rawAgg === "percentage") w.aggregation = "count";
+              else if (rawAgg === "unique") w.aggregation = "distinct";
+              else w.aggregation = w.type === "table" ? "none" : "count";
+            } else {
+              w.aggregation = rawAgg;
+            }
+            return w;
+          });
+      }
+      return tabObj;
+    });
+  }
+
+  if (Array.isArray(config.insights)) {
+    config.insights = config.insights.map((insight: unknown) => {
+      if (typeof insight !== "object" || insight === null) {
+        return insight;
+      }
+      const item = { ...(insight as Record<string, unknown>) };
+      item.presentation = normalizePresentation(item.presentation);
+      if (!Array.isArray(item.metrics)) {
+        item.metrics = [];
+      }
+      if (!Array.isArray(item.relatedTables)) {
+        item.relatedTables = [];
+      }
+      return item;
+    });
+  }
+  return config;
+};
+
+export const presentationJsonSchema = {
+  type: "object" as const,
+  properties: {
+    shape: { type: "string" as const, enum: ["table-row", "tracker-item", "category-box"] },
+    status: { type: "string" as const },
+    owner: { type: "string" as const },
+    by: { type: "string" as const },
+    categoryName: { type: "string" as const },
+    colorIntent: { type: "string" as const },
+  },
+  required: ["shape"],
+};
+
 export const dashboardInsightSchema = z
   .object({
     insightId: z.string().min(1),
@@ -202,6 +381,7 @@ export const dashboardInsightSchema = z
     recommendedAction: z.string().min(1),
     severity: insightSeveritySchema,
     relatedTables: z.array(z.string().min(1)),
+    presentation: presentationDetailsSchema,
   })
   .strict();
 
@@ -251,6 +431,9 @@ export type InsightMetricRefShape = z.infer<typeof insightMetricRefSchema>;
 export type ResolvedAggregateMetricShape = z.infer<typeof resolvedAggregateMetricSchema>;
 export type ResolvedRowMetricShape = z.infer<typeof resolvedRowMetricSchema>;
 export type ResolvedInsightMetricShape = z.infer<typeof resolvedInsightMetricSchema>;
+export type ResolvedMetric = ResolvedInsightMetricShape;
+export type PresentationShapeValue = z.infer<typeof presentationShapeSchema>;
+export type PresentationDetailsShape = z.infer<typeof presentationDetailsSchema>;
 export type DashboardInsightShape = z.infer<typeof dashboardInsightSchema>;
 export type ResolvedDashboardInsightShape = z.infer<typeof resolvedDashboardInsightSchema>;
 export type DashboardConfigShape = z.infer<typeof dashboardConfigSchema>;

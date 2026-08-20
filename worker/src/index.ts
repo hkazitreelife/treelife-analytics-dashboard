@@ -1,378 +1,231 @@
-import { randomUUID } from "node:crypto";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import "dotenv/config";
+import { Worker, type Job } from "bullmq";
+import { Pool } from "pg";
+import * as XLSX from "xlsx";
 
 import {
-  DOCUMENT_INGESTION_QUEUE_NAME,
-  INGESTION_QUEUE_NAME,
-  redisConnectionOptions,
-  WORKER_HEARTBEAT_INTERVAL_MS,
-  WORKER_HEARTBEAT_REDIS_KEY,
-  WORKER_HEARTBEAT_TTL_SECONDS,
-  type DocumentIngestionJobData,
-  type IngestionJobData,
-  type WorkerHeartbeatPayload,
-} from "@analytics/shared";
-import { Queue, Worker } from "bullmq";
-import dotenv from "dotenv";
-import { Redis } from "ioredis";
+  QUEUE_NAMES,
+  createRedisConnection,
+  type DatasetIngestionJobData,
+} from "./queue.js";
+import { downloadFileBuffer } from "./services/storage.js";
+import {
+  extractMetadataWithGemini,
+  generateDashboardWithClaude,
+} from "./services/ai.js";
 
-const dirname = path.dirname(fileURLToPath(import.meta.url));
+// Initialize PostgreSQL Connection Pool
+const createPgPool = (): Pool => {
+  const connectionString =
+    process.env.DATABASE_URI ||
+    "postgresql://postgres:postgres@127.0.0.1:5432/analytics_dashboard";
 
-// The worker shares the web app's environment file. It is loaded before the
-// Payload config is imported, because that config reads env at module scope.
-dotenv.config({
-  path: path.resolve(dirname, "../../apps/web/.env.local"),
-  quiet: true,
-});
+  const isTls =
+    connectionString.includes("sslmode=require") ||
+    connectionString.includes("neon.tech") ||
+    connectionString.includes("supabase.co");
 
-const requireEnv = (name: string): string => {
-  const value = process.env[name];
-
-  if (!value) {
-    throw new Error(
-      `Missing required environment variable ${name}. See apps/web/.env.local.`,
-    );
-  }
-
-  return value;
+  return new Pool({
+    connectionString,
+    ssl: isTls ? { rejectUnauthorized: false } : undefined,
+    max: 10,
+    idleTimeoutMillis: 30000,
+  });
 };
 
-// bullmq 6 treats ioredis as an optional peer and cannot require it lazily from
-// a native ESM context, so the client is constructed here and passed in.
-const connection = new Redis(requireEnv("REDIS_URL"), redisConnectionOptions);
-const geminiApiKey = requireEnv("GEMINI_API_KEY");
-const anthropicApiKey = requireEnv("ANTHROPIC_API_KEY");
-
-const { getPayload } = await import("payload");
-const { default: config } = await import("@payload-config");
-const { createGeminiClient } = await import("./services/gemini");
-const { createClaudeConfigClient } = await import("./services/claudeConfig");
-const { createDatasetLock } = await import("./services/datasetLock");
-const { createDatasetEventPublisher } = await import("./services/events");
-const { processIngestionJob } = await import("./processors/ingestion");
-// Section 10.0's narrative-document pipeline: separate services, separate
-// processor, separate queue below. Nothing above this line changes.
-const { createGeminiDocumentClient } = await import("./services/geminiDocument");
-const { createClaudeDocumentSummaryClient } = await import(
-  "./services/claudeDocumentSummary"
-);
-const { processDocumentIngestionJob } = await import(
-  "./processors/documentIngestion"
-);
-
-const payload = await getPayload({ config });
+const pgPool = createPgPool();
 
 /**
- * Section 10.6. This exact failure -- a worker process from an earlier
- * session still alive, still connected to Redis/BullMQ, silently grabbing
- * jobs meant for a fresher instance -- has now happened three times this
- * session, each discovered only by hand (checking process start times,
- * killing PIDs by guesswork). This is the fix: a single Redis key
- * (WORKER_HEARTBEAT_REDIS_KEY, already written every 30s by every
- * instance) doubles as a single-owner lock, checked here before either
- * Worker subscribes to anything.
- *
- * Chosen approach: TAKE OVER, don't refuse to start. Refusing to start
- * would leave the actually-harmful process (the stale one) still running
- * and still silently able to grab jobs -- it would only stop a fresh,
- * correct instance from becoming available, which is the opposite of
- * what's wanted. Starting a new worker process is a deliberate operator
- * action (a restart after a code change, or exactly this kind of
- * incident response); the new instance is who SHOULD end up owning the
- * queues. So: this instance writes its own instanceId into the key
- * immediately, and the periodic heartbeat tick below checks, every time,
- * whether the key still holds ITS OWN id -- if some other instance has
- * since overwritten it, THIS instance (now the stale one) shuts itself
- * down. That is the "old one is forced to release" half: cooperative, via
- * the same heartbeat mechanism, not an OS-level kill -- one process
- * cannot safely or portably force-kill another it has no PID/handle for,
- * but it CAN reliably notice "I am no longer the current owner" and exit.
- *
- * Limit worth stating plainly: this only works between instances that
- * both run this code. A worker already running from BEFORE this change
- * has no eviction check in it at all and will never notice being taken
- * over -- it has to be killed by hand once, same as the three times this
- * already happened. This prevents the failure going forward, it does not
- * retroactively fix an already-running old-code zombie.
+ * Updates a job record status and error details in PostgreSQL.
  */
-const instanceId = randomUUID();
-
-const existingHeartbeatRaw = await connection.get(WORKER_HEARTBEAT_REDIS_KEY);
-let existingHeartbeat: WorkerHeartbeatPayload | null = null;
-
-if (existingHeartbeatRaw) {
+const updateJobStatus = async (
+  jobId: string,
+  status: "pending" | "processing" | "ready" | "failed",
+  errorMessage?: string,
+): Promise<void> => {
   try {
-    existingHeartbeat = JSON.parse(existingHeartbeatRaw) as WorkerHeartbeatPayload;
-  } catch {
-    existingHeartbeat = null;
+    const query = `
+      UPDATE jobs 
+      SET status = $1, error = $2, updated_at = NOW() 
+      WHERE id = $3
+    `;
+    await pgPool.query(query, [status, errorMessage || null, jobId]);
+  } catch (err: unknown) {
+    console.error(`[DB] Failed to update job ${jobId} status to ${status}:`, err);
   }
-}
+};
 
-if (existingHeartbeat) {
-  const priorAgeSeconds = Math.round(
-    (Date.now() - new Date(existingHeartbeat.timestamp).getTime()) / 1000,
-  );
+/**
+ * Parses an Excel or CSV file buffer into structured table schemas.
+ */
+const parseWorkbookBuffer = (
+  buffer: Buffer,
+): Array<{ name: string; columns: string[]; rowCount: number; sampleRows: any[] }> => {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const tables: Array<{ name: string; columns: string[]; rowCount: number; sampleRows: any[] }> = [];
 
-  payload.logger.warn(
-    `Detected a pre-existing worker heartbeat (instance ${existingHeartbeat.instanceId}, last updated ${priorAgeSeconds}s ago). This new instance (${instanceId}) is taking over as the active worker on both queues. The previous instance will detect this and shut itself down on its next heartbeat tick, within ${WORKER_HEARTBEAT_INTERVAL_MS / 1000}s, if it is running code new enough to check for this; if it predates this safeguard, it will keep running and must be stopped manually.`,
-  );
-} else {
-  payload.logger.info(
-    `No pre-existing worker heartbeat found. Starting as the active instance (${instanceId}).`,
-  );
-}
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
 
-const HEARTBEAT_QUEUES = [INGESTION_QUEUE_NAME, DOCUMENT_INGESTION_QUEUE_NAME];
+    const rawRows: any[] = XLSX.utils.sheet_to_json(sheet, { defval: null });
+    if (rawRows.length === 0) continue;
 
-const writeHeartbeat = async (): Promise<void> => {
-  const heartbeat: WorkerHeartbeatPayload = {
-    instanceId,
-    timestamp: new Date().toISOString(),
-    queues: HEARTBEAT_QUEUES,
+    const firstRow = rawRows[0] || {};
+    const columns = Object.keys(firstRow);
+
+    tables.push({
+      name: sheetName,
+      columns,
+      rowCount: rawRows.length,
+      sampleRows: rawRows.slice(0, 10),
+    });
+  }
+
+  return tables;
+};
+
+/**
+ * Core processing function for dataset ingestion jobs.
+ */
+const processDatasetIngestionJob = async (job: Job<DatasetIngestionJobData>): Promise<any> => {
+  const { jobId, fileId, datasetId, fileKey, fileName, intentPrompt } = job.data;
+  console.log(`[Worker] 🚀 Started processing job ${job.id} (Job ID: ${jobId}, File: ${fileName || fileKey})`);
+
+  try {
+    // Step 1: Update status to 'processing'
+    await updateJobStatus(jobId, "processing");
+
+    // Step 2: Download file buffer from S3 / Cloudflare R2
+    const targetKey = fileKey || fileName || fileId;
+    console.log(`[Worker] 📥 Downloading file "${targetKey}" from storage...`);
+    const { buffer } = await downloadFileBuffer(targetKey);
+
+    // Step 3: Parse spreadsheet data
+    console.log(`[Worker] 📊 Parsing spreadsheet workbook tables...`);
+    const tables = parseWorkbookBuffer(buffer);
+
+    if (tables.length === 0) {
+      throw new Error(`The uploaded file "${fileName || targetKey}" contains no valid sheets or tabular data.`);
+    }
+
+    // Step 4: Extract semantic metadata with Gemini 2.5 Flash
+    console.log(`[Worker] 🧠 Calling Gemini API for metadata and domain extraction...`);
+    const extractedMetadata = await extractMetadataWithGemini(
+      tables.map((t) => ({ name: t.name, columns: t.columns, sampleRows: t.sampleRows })),
+    );
+
+    // Step 5: Generate executive dashboard layout with Claude 3.5 Sonnet
+    console.log(`[Worker] 🎨 Calling Claude API for executive dashboard layout generation...`);
+    const dashboardLayout = await generateDashboardWithClaude(
+      extractedMetadata,
+      tables.map((t) => ({ name: t.name, columns: t.columns, rowCount: t.rowCount })),
+      intentPrompt,
+    );
+
+    // Step 6: Persist results into PostgreSQL
+    console.log(`[Worker] 💾 Saving generated dashboard config and dataset metadata into PostgreSQL...`);
+    if (datasetId) {
+      await pgPool.query(
+        `UPDATE datasets 
+         SET status = 'ready', metadata = $1, updated_at = NOW() 
+         WHERE id = $2`,
+        [JSON.stringify({ ...extractedMetadata, tables }), datasetId],
+      );
+
+      await pgPool.query(
+        `INSERT INTO configs (dataset_id, config, created_at, updated_at) 
+         VALUES ($1, $2, NOW(), NOW())
+         ON CONFLICT (dataset_id) DO UPDATE SET config = $2, updated_at = NOW()`,
+        [datasetId, JSON.stringify(dashboardLayout)],
+      );
+    }
+
+    // Step 7: Finalize job status to 'ready'
+    await updateJobStatus(jobId, "ready");
+    console.log(`[Worker] ✅ Job ${jobId} successfully completed!`);
+
+    return {
+      status: "ready",
+      datasetId,
+      metadata: extractedMetadata,
+      layout: dashboardLayout,
+    };
+  } catch (error: unknown) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[Worker] ❌ Job ${jobId} failed:`, errorMsg);
+
+    // Update job status to 'failed'
+    await updateJobStatus(jobId, "failed", errorMsg);
+    throw error;
+  }
+};
+
+/**
+ * Bootstraps and starts the BullMQ Worker processes.
+ */
+export const startWorker = async (): Promise<void> => {
+  console.log("==========================================");
+  console.log("🚀 Starting Treelife AI Background Worker");
+  console.log("==========================================");
+
+  const redisConnection = createRedisConnection();
+
+  redisConnection.on("connect", () => {
+    console.log("[Redis] 🟢 Connected to Redis successfully.");
+  });
+
+  redisConnection.on("error", (err) => {
+    console.error("[Redis] 🔴 Redis connection error:", err.message);
+  });
+
+  // Start workers on both generic and legacy queue names
+  const queuesToListen = [
+    QUEUE_NAMES.DATASET_INGESTION,
+    QUEUE_NAMES.INGESTION,
+    QUEUE_NAMES.DOCUMENT_INGESTION,
+  ];
+
+  const workers: Worker[] = queuesToListen.map((queueName) => {
+    console.log(`[Queue] 👂 Listening for jobs on queue: "${queueName}"`);
+
+    const worker = new Worker(queueName, processDatasetIngestionJob, {
+      connection: redisConnection,
+      concurrency: 5,
+    });
+
+    worker.on("completed", (job) => {
+      console.log(`[Worker] Job ${job.id} on queue "${queueName}" completed.`);
+    });
+
+    worker.on("failed", (job, err) => {
+      console.error(`[Worker] Job ${job?.id} on queue "${queueName}" failed:`, err.message);
+    });
+
+    return worker;
+  });
+
+  // Graceful shutdown handling
+  const shutdown = async (signal: string) => {
+    console.log(`\n[Worker] 🛑 Received ${signal}. Gracefully closing workers and connections...`);
+    try {
+      await Promise.all(workers.map((w) => w.close()));
+      await redisConnection.quit();
+      await pgPool.end();
+      console.log("[Worker] 🟢 Shutdown complete.");
+      process.exit(0);
+    } catch (err) {
+      console.error("[Worker] 🔴 Error during shutdown:", err);
+      process.exit(1);
+    }
   };
 
-  await connection.set(
-    WORKER_HEARTBEAT_REDIS_KEY,
-    JSON.stringify(heartbeat),
-    "EX",
-    WORKER_HEARTBEAT_TTL_SECONDS,
-  );
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 };
 
-// Claims the key -- overwriting whatever was there -- before either Worker
-// below subscribes to anything. This is the "take over" half; the
-// "previous instance releases" half is that same previous instance's own
-// heartbeat tick noticing the mismatch (see the interval further down).
-await writeHeartbeat();
-
-const gemini = createGeminiClient(geminiApiKey);
-const claude = createClaudeConfigClient(anthropicApiKey);
-const geminiDocument = createGeminiDocumentClient(geminiApiKey);
-const claudeSummary = createClaudeDocumentSummaryClient(anthropicApiKey);
-const datasetLock = createDatasetLock(connection);
-// Shares `connection`: publish is a normal command, not a dedicated
-// subscriber-mode client the way SUBSCRIBE is, so no second connection.
-const events = createDatasetEventPublisher(connection);
-
-// Shares `connection` rather than opening a second Redis connection: BullMQ
-// supports a Queue (producer) and a Worker (consumer) on the same client.
-// Used only to requeue a job that lost a per-dataset lock race, with a delay.
-const ingestionQueue = new Queue<IngestionJobData>(INGESTION_QUEUE_NAME, {
-  connection,
+// Start the worker process
+startWorker().catch((err) => {
+  console.error("[Worker] 💥 Fatal bootstrap error:", err);
+  process.exit(1);
 });
-
-const recordFailure = async (
-  data: IngestionJobData,
-  message: string,
-): Promise<void> => {
-  try {
-    await payload.update({
-      collection: "jobs",
-      id: data.jobId,
-      data: { status: "failed", error: message },
-    });
-
-    const jobRecord = await payload.findByID({
-      collection: "jobs",
-      id: data.jobId,
-      depth: 0,
-    });
-
-    // The Dataset is marked failed so nothing presents as complete, but its
-    // data, tableNames and totalRows are deliberately left untouched. A failed
-    // parse must never overwrite a working dataset. lastError is denormalized
-    // here so the dashboard can show the real technical reason instead of a
-    // generic canned string, whether or not a previous good dataset survives.
-    if (jobRecord.dataset !== null && jobRecord.dataset !== undefined) {
-      await payload.update({
-        collection: "datasets",
-        id: jobRecord.dataset,
-        data: { status: "failed", lastError: message },
-      });
-
-      await events.publish("dataset.updated", String(jobRecord.dataset), data.jobId);
-    }
-
-    await events.publish("job.updated", data.datasetId, data.jobId);
-  } catch (updateError: unknown) {
-    payload.logger.error({ err: updateError }, "Could not record job failure.");
-  }
-};
-
-const worker = new Worker<IngestionJobData>(
-  INGESTION_QUEUE_NAME,
-  async (job) => {
-    try {
-      await processIngestionJob(job.data, {
-        payload,
-        gemini,
-        claude,
-        datasetLock,
-        queue: ingestionQueue,
-        events,
-      });
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      await recordFailure(job.data, message);
-
-      throw error;
-    }
-  },
-  {
-    connection,
-    // One job at a time. This is process-level serialization; the per-dataset
-    // Redis lock in services/datasetLock.ts is what actually protects against
-    // two jobs writing to the same Dataset if concurrency is ever raised
-    // above 1.
-    concurrency: 1,
-  },
-);
-
-worker.on("completed", (job) => {
-  payload.logger.info(`Job ${job.data.jobId} completed.`);
-});
-
-worker.on("failed", (job, error) => {
-  payload.logger.error(
-    { err: error },
-    `Job ${job?.data.jobId ?? "unknown"} failed.`,
-  );
-});
-
-payload.logger.info(
-  `Worker listening on queue "${INGESTION_QUEUE_NAME}". Press Ctrl+C to stop.`,
-);
-
-/**
- * Section 10.0. A second Worker on a second queue in this same process --
- * still two runtime processes total (web + worker), not a third. Mirrors
- * recordFailure/the dataset worker above exactly, but for Documents: a
- * failed job never overwrites already-stored document data, and the
- * technical error is denormalized onto the Document the same way it is onto
- * a Dataset. No dataset.updated/config.updated events: the document pipeline
- * has no SSE route in this pass (Section 10.0 did not ask for one); the
- * upload UI polls /api/jobs/:id, exactly like the dataset path already does
- * before its own SSE takes over.
- */
-const recordDocumentFailure = async (
-  data: DocumentIngestionJobData,
-  message: string,
-): Promise<void> => {
-  try {
-    await payload.update({
-      collection: "jobs",
-      id: data.jobId,
-      data: { status: "failed", error: message },
-    });
-
-    await payload.update({
-      collection: "documents",
-      id: data.documentId,
-      data: { status: "failed", lastError: message },
-    });
-  } catch (updateError: unknown) {
-    payload.logger.error(
-      { err: updateError },
-      "Could not record document job failure.",
-    );
-  }
-};
-
-const documentWorker = new Worker<DocumentIngestionJobData>(
-  DOCUMENT_INGESTION_QUEUE_NAME,
-  async (job) => {
-    try {
-      await processDocumentIngestionJob(job.data, {
-        payload,
-        geminiDocument,
-        claudeSummary,
-      });
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      await recordDocumentFailure(job.data, message);
-
-      throw error;
-    }
-  },
-  {
-    connection,
-    concurrency: 1,
-  },
-);
-
-documentWorker.on("completed", (job) => {
-  payload.logger.info(`Document job ${job.data.jobId} completed.`);
-});
-
-documentWorker.on("failed", (job, error) => {
-  payload.logger.error(
-    { err: error },
-    `Document job ${job?.data.jobId ?? "unknown"} failed.`,
-  );
-});
-
-payload.logger.info(
-  `Worker listening on queue "${DOCUMENT_INGESTION_QUEUE_NAME}". Press Ctrl+C to stop.`,
-);
-
-/**
- * Section 10.1 Part 2 / Section 10.6. Proves the worker's own event loop is
- * still alive and looping, not just that it started successfully -- what
- * actually happened earlier this session was a worker that logged its
- * startup lines and then silently stopped consuming a queue, with no
- * further signal either way. This does NOT prove either Worker is actively
- * consuming (a worker can be alive and heartbeating while genuinely wedged
- * inside a stuck job, or if this setInterval callback itself were somehow
- * starved) -- see GET /api/health/queues in the web process for the
- * complementary check (how long the oldest queued job has waited), which
- * is what actually catches "alive but not consuming."
- *
- * Section 10.6's addition: every tick first checks whether this instance
- * still owns the key. If a newer instance has overwritten it with a
- * different instanceId, this one is the stale loser of a takeover and
- * shuts itself down rather than keep silently competing for jobs.
- */
-const heartbeatInterval = setInterval(() => {
-  void (async (): Promise<void> => {
-    try {
-      const currentRaw = await connection.get(WORKER_HEARTBEAT_REDIS_KEY);
-      const current = currentRaw
-        ? (JSON.parse(currentRaw) as WorkerHeartbeatPayload)
-        : null;
-
-      if (current && current.instanceId !== instanceId) {
-        payload.logger.error(
-          `This worker's heartbeat lock was taken over by another instance (${current.instanceId}). Shutting down to avoid running as a stale, silently-competing worker.`,
-        );
-        await shutdown("lock-taken-over");
-        return;
-      }
-
-      await writeHeartbeat();
-      payload.logger.info(
-        `Worker heartbeat: alive, listening on ${HEARTBEAT_QUEUES.join(", ")}.`,
-      );
-    } catch (error: unknown) {
-      payload.logger.error({ err: error }, "Failed to write worker heartbeat.");
-    }
-  })();
-}, WORKER_HEARTBEAT_INTERVAL_MS);
-
-const shutdown = async (signal: string): Promise<void> => {
-  payload.logger.info(`Received ${signal}. Shutting down worker.`);
-
-  clearInterval(heartbeatInterval);
-  await worker.close();
-  await documentWorker.close();
-  await ingestionQueue.close();
-  connection.disconnect();
-  await payload.db.destroy?.();
-
-  process.exit(0);
-};
-
-process.on("SIGINT", () => void shutdown("SIGINT"));
-process.on("SIGTERM", () => void shutdown("SIGTERM"));

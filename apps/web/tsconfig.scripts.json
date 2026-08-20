@@ -5,5 +5,7 @@
     // transform and expecting React in scope. Scripts that render components
     // directly need the automatic runtime instead.
     "jsx": "react-jsx"
-  }
+  },
+  "include": ["scripts/**/*"],
+  "exclude": ["node_modules"]
 }

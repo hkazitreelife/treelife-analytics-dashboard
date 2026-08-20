@@ -1,4 +1,4 @@
-import { DashboardRenderer } from "@/components/dashboard/DashboardRenderer";
+import { LegacyRedirect } from "@/components/shell/LegacyRedirect";
 
 export const dynamic = "force-dynamic";
 
@@ -9,9 +9,5 @@ export default async function DatasetDashboardPage({
 }) {
   const { id } = await params;
 
-  return (
-    <main className="mx-auto max-w-[1600px] p-6">
-      <DashboardRenderer datasetId={id} />
-    </main>
-  );
+  return <LegacyRedirect lookupUrl={`/api/datasets/${id}/session`} label="dataset" />;
 }

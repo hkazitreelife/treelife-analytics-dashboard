@@ -19,3 +19,8 @@ redis_data/
 # Local acceptance fixture and transient process logs
 treelife-fy27-demo-dataset-v2.xlsx
 *.pid
+dump.rdb
+env.local
+*.rdb
+.claude/
+.impeccable/

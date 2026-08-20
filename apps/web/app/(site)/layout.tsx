@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import "../globals.css";
+
 /**
  * Its own complete root layout (Next.js "multiple root layouts" pattern):
  * this app has no shared top-level app/layout.tsx, because
@@ -9,10 +11,11 @@ import type { ReactNode } from "react";
  * on every /admin page. Each top-level route group -- this one, (dashboard),
  * (payload) -- now provides its own <html>/<body> independently instead.
  *
- * Deliberately no CSS import here: the homepage stays plain-styled (inline
- * styles only), the same convention it already used before this fix.
- * (dashboard)'s Tailwind globals.css is scoped to (dashboard) only, exactly
- * as its own comment already documented -- unrelated to this fix.
+ * Prompt 12.0: the homepage now shares the same three-column shell
+ * (sidebar/center/right panel) as the dataset and document pages, so it
+ * needs the same Tailwind tokens. app/globals.css moved out of (dashboard)
+ * to a location both this layout and (dashboard)/layout.tsx can import;
+ * (payload) still doesn't, so /admin is unaffected.
  *
  * suppressHydrationWarning on both tags: browser extensions (seen so far --
  * a "data-qb-installed" attribute, Grammarly's data-gr-ext-installed /
@@ -25,14 +28,16 @@ import type { ReactNode } from "react";
  */
 
 export const metadata = {
-  title: "Analytics Dashboard",
-  description: "Upload-driven intelligent analytics dashboard",
+  title: "Treelife AI - Executive Intelligence & Analytics",
+  description: "Upload-driven intelligent analytics powered by Treelife's Bot",
 };
 
 export default function SiteLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body suppressHydrationWarning>{children}</body>
+      <body className="app-shell-root" suppressHydrationWarning>
+        {children}
+      </body>
     </html>
   );
 }

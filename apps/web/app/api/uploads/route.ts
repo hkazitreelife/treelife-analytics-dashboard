@@ -41,6 +41,16 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  // Prompt 15.0 Part 4: optional, free-text intent typed alongside the
+  // upload on /new. Purely additive -- absent, this behaves identically to
+  // before. Stored on the Job row; the worker reads it and passes it into
+  // the initial config/summary-generation call as framing only.
+  const intentField = formData.get("intent");
+  const intentPrompt =
+    typeof intentField === "string" && intentField.trim().length > 0
+      ? intentField.trim().slice(0, 2000)
+      : undefined;
+
   const limit = maxUploadBytes();
 
   if (uploaded.size > limit) {
@@ -182,6 +192,7 @@ export async function POST(request: Request): Promise<Response> {
           fileHash: hash,
           status: "queued",
           retryCount: 0,
+          intentPrompt,
         },
       });
 
@@ -323,6 +334,7 @@ export async function POST(request: Request): Promise<Response> {
         fileHash: hash,
         status: "queued",
         retryCount: 0,
+        intentPrompt,
       },
     });
 

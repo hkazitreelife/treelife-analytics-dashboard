@@ -1,0 +1,1 @@
+import config from './apps/web/payload.config'; import { getPayload } from 'payload'; async function run() { const payload = await getPayload({ config }); await payload.delete({ collection: 'users', where: { email: { equals: 'admin@example.com' } } }); console.log('Deleted'); process.exit(0); } run();  

@@ -152,41 +152,64 @@ export const createGeminiDocumentClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
+      const maxAttempts = 3;
+      let lastError: unknown;
       let response;
 
-      try {
-        response = await ai.models.generateContent({
-          model: activeModel,
-          contents: [
-            {
-              inlineData: {
-                data: fileBytes.toString("base64"),
-                mimeType,
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: activeModel,
+            contents: [
+              {
+                inlineData: {
+                  data: fileBytes.toString("base64"),
+                  mimeType,
+                },
               },
+            ],
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema,
+              temperature: 0,
             },
-          ],
-          config: {
-            systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema,
-            temperature: 0,
-          },
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
+          });
+          lastError = null;
+          break;
+        } catch (error: unknown) {
+          lastError = error;
+          const detail = error instanceof Error ? error.message : String(error);
 
-        if (isBillingOrTierRejection(detail)) {
-          throw new GeminiBillingError(
-            `BILLING OR TIER REJECTION from model "${activeModel}"${isRetry ? " on the validation retry" : ""}. This is a payment or quota problem, not bad model output. Either enable billing for the key, or set ${isRetry ? "GEMINI_RETRY_MODEL" : "GEMINI_MODEL"} to a model the key can use. Provider detail: ${detail}`,
+          if (isBillingOrTierRejection(detail)) {
+            throw new GeminiBillingError(
+              `BILLING OR TIER REJECTION from model "${activeModel}"${isRetry ? " on the validation retry" : ""}. This is a payment or quota problem, not bad model output. Either enable billing for the key, or set ${isRetry ? "GEMINI_RETRY_MODEL" : "GEMINI_MODEL"} to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          const isTransient =
+            detail.includes("503") ||
+            detail.toLowerCase().includes("high demand") ||
+            detail.toLowerCase().includes("unavailable") ||
+            detail.toLowerCase().includes("econnreset") ||
+            detail.toLowerCase().includes("etimedout");
+
+          if (isTransient && attempt < maxAttempts) {
+            const delayMs = attempt * 2000;
+            logger.warn(
+              `Gemini document extraction on "${activeModel}" returned transient error (attempt ${attempt}/${maxAttempts}): ${detail}. Retrying in ${delayMs}ms...`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            continue;
+          }
+
+          throw new GeminiError(
+            `Gemini document extraction failed on model "${activeModel}": ${detail}`,
           );
         }
-
-        throw new GeminiError(
-          `Gemini document extraction failed on model "${activeModel}": ${detail}`,
-        );
       }
 
-      const text = response.text;
+      const text = response?.text;
 
       if (!text) {
         throw new GeminiValidationError(

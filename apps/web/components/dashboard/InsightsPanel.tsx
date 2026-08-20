@@ -1,27 +1,20 @@
 "use client";
 
-import type {
-  InsightSeverityValue,
-  ResolvedDashboardInsightShape,
+import React from "react";
+import {
+  excludeTotalRows,
+  type InsightSeverityValue,
+  type ResolvedDashboardInsightShape,
 } from "@analytics/shared";
 
-import { formatNumber } from "@/lib/aggregate";
+import { applyWidgetFilters, formatNumber, resolveMetricValue, toNumber } from "@/lib/aggregate";
 import { EmptyState } from "@/components/ui/primitives";
+import type { TableState } from "@/components/dashboard/WidgetRenderer";
 
 /**
  * Section 9.2 item 6: a config written before Section 9.1 stores insights in
  * the old {title, body} shape, not {finding, metrics, whyItMatters,
- * recommendedAction}. There is no way to retroactively know what column or
- * aggregation an old insight's number came from, so a migration script
- * could only ever fabricate empty metrics -- functionally identical to what
- * this rendering-layer fallback already does, except a script would also
- * permanently rewrite a stored config version, in tension with this
- * codebase's "config is versioned, never silently mutated" rule (CLAUDE.md
- * rule 10). Chosen instead: detect the old shape at render time and show it
- * degraded but clearly labeled as legacy, with no fabricated metrics/why/
- * action. The dataset self-heals the moment its config is next regenerated
- * or prompt-edited, through the existing pipeline, with no separate script
- * or new CONFIG_SOURCE to maintain.
+ * recommendedAction}.
  */
 type LegacyInsightShape = {
   insightId: string;
@@ -43,94 +36,117 @@ const isCurrentInsight = (
 ): insight is ResolvedDashboardInsightShape =>
   typeof insight === "object" && insight !== null && "finding" in insight;
 
-/**
- * Severity drives colour, icon glyph and border weight, not just a text label,
- * so the four levels are distinguishable at a glance.
- */
-const SEVERITY_STYLE: Record<
+const SEVERITY_CONFIG: Record<
   InsightSeverityValue,
-  { border: string; badgeBg: string; badgeText: string; glyph: string; label: string }
+  {
+    border: string;
+    headerBg: string;
+    badgeBg: string;
+    badgeText: string;
+    glyph: string;
+    label: string;
+    actionBg: string;
+    actionBorder: string;
+  }
 > = {
   positive: {
-    border: "var(--color-risk-low)",
-    badgeBg: "rgba(39, 174, 96, 0.12)",
-    badgeText: "var(--color-risk-low)",
-    glyph: "▲",
+    border: "rgba(16, 185, 129, 0.25)",
+    headerBg: "rgba(16, 185, 129, 0.06)",
+    badgeBg: "rgba(16, 185, 129, 0.15)",
+    badgeText: "#047857",
+    glyph: "↑",
     label: "Positive",
+    actionBg: "rgba(16, 185, 129, 0.05)",
+    actionBorder: "rgba(16, 185, 129, 0.2)",
   },
   negative: {
-    border: "var(--color-risk-high)",
-    badgeBg: "rgba(192, 57, 43, 0.12)",
-    badgeText: "var(--color-risk-high)",
-    glyph: "▼",
-    label: "Negative",
+    border: "rgba(239, 68, 68, 0.25)",
+    headerBg: "rgba(239, 68, 68, 0.06)",
+    badgeBg: "rgba(239, 68, 68, 0.15)",
+    badgeText: "#b91c1c",
+    glyph: "↓",
+    label: "Risk / Negative",
+    actionBg: "rgba(239, 68, 68, 0.05)",
+    actionBorder: "rgba(239, 68, 68, 0.2)",
   },
   warning: {
-    border: "var(--color-risk-med)",
-    badgeBg: "rgba(230, 126, 34, 0.14)",
-    badgeText: "var(--color-risk-med)",
+    border: "rgba(245, 158, 11, 0.25)",
+    headerBg: "rgba(245, 158, 11, 0.06)",
+    badgeBg: "rgba(245, 158, 11, 0.15)",
+    badgeText: "#b45309",
     glyph: "!",
-    label: "Warning",
+    label: "Attention Needed",
+    actionBg: "rgba(245, 158, 11, 0.05)",
+    actionBorder: "rgba(245, 158, 11, 0.2)",
   },
   info: {
-    border: "var(--color-cobalt)",
-    badgeBg: "rgba(91, 141, 184, 0.14)",
-    badgeText: "var(--color-cobalt)",
+    border: "rgba(59, 130, 246, 0.25)",
+    headerBg: "rgba(59, 130, 246, 0.06)",
+    badgeBg: "rgba(59, 130, 246, 0.15)",
+    badgeText: "#1d4ed8",
     glyph: "i",
-    label: "Info",
+    label: "Strategic Info",
+    actionBg: "rgba(59, 130, 246, 0.05)",
+    actionBorder: "rgba(59, 130, 246, 0.2)",
   },
 };
 
-export const InsightsPanel = ({ insights }: { insights: unknown[] }) => {
+export const InsightsPanel = ({
+  insights,
+  tables,
+}: {
+  insights: unknown[];
+  tables?: Record<string, TableState>;
+}) => {
   if (insights.length === 0) {
     return <EmptyState message="No insights were generated for this dataset." />;
   }
 
   return (
-    <ul className="grid gap-3 md:grid-cols-2">
-      {insights.map((rawInsight) => {
+    <ul className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2">
+      {insights.map((rawInsight, idx) => {
         if (isLegacyInsight(rawInsight)) {
           const insight = rawInsight;
-          const style = SEVERITY_STYLE[insight.severity] ?? SEVERITY_STYLE.info;
+          const style = SEVERITY_CONFIG[insight.severity] ?? SEVERITY_CONFIG.info;
 
           return (
             <li
-              key={insight.insightId}
+              key={insight.insightId || idx}
               data-severity={insight.severity}
               data-legacy-shape="true"
-              className="rounded-lg border border-dashed border-[color:var(--color-cloud)] bg-white p-4 shadow-sm"
-              style={{ borderLeft: `4px solid ${style.border}` }}
+              className="group flex flex-col justify-between overflow-hidden rounded-xl border border-[color:var(--color-cloud)] bg-white p-4 shadow-xs transition-all duration-200 hover:shadow-md"
             >
               <div className="flex items-start gap-3">
                 <span
                   aria-hidden="true"
-                  className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-bold"
+                  className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold shadow-2xs"
                   style={{ background: style.badgeBg, color: style.badgeText }}
                 >
                   {style.glyph}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold text-[color:var(--color-forest)]">
+                  <p className="text-sm font-bold text-[color:var(--color-forest)]">
                     {insight.title}
                   </p>
-                  <p className="mt-1 text-sm leading-relaxed text-[color:var(--color-ink)]">
+                  <p className="mt-1 text-xs leading-relaxed text-[color:var(--color-ink)]">
                     {insight.body}
                   </p>
-                  <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--color-steel)]">
+                  <div className="mt-3 flex flex-wrap items-center gap-2 pt-2 border-t border-[color:var(--color-cloud)]/60 text-[11px] text-[color:var(--color-steel)]">
                     <span
-                      className="rounded px-1.5 py-0.5 font-medium"
+                      className="rounded-full px-2 py-0.5 font-semibold text-[10px]"
                       style={{ background: style.badgeBg, color: style.badgeText }}
                     >
                       {style.label}
                     </span>
-                    <span className="italic">
-                      Generated before structured insights -- regenerate or
-                      prompt-edit this dashboard to update.
+                    <span className="italic text-[10px]">
+                      Legacy format · regenerate to update
                     </span>
                     {insight.relatedTables.length > 0 ? (
-                      <span>{insight.relatedTables.join(", ")}</span>
+                      <span className="ml-auto text-[10px] text-[color:var(--color-steel-light)]">
+                        {insight.relatedTables.join(", ")}
+                      </span>
                     ) : null}
-                  </p>
+                  </div>
                 </div>
               </div>
             </li>
@@ -138,79 +154,121 @@ export const InsightsPanel = ({ insights }: { insights: unknown[] }) => {
         }
 
         if (!isCurrentInsight(rawInsight)) {
-          // Neither shape recognized -- render nothing rather than throw,
-          // so one unexpected record never blanks the whole panel.
           return null;
         }
 
         const insight = rawInsight;
-        const style = SEVERITY_STYLE[insight.severity] ?? SEVERITY_STYLE.info;
+        const style = SEVERITY_CONFIG[insight.severity] ?? SEVERITY_CONFIG.info;
 
         return (
           <li
-            key={insight.insightId}
+            key={insight.insightId || idx}
             data-severity={insight.severity}
-            className="rounded-lg border border-[color:var(--color-cloud)] bg-white p-4 shadow-sm"
-            style={{ borderLeft: `4px solid ${style.border}` }}
+            className="group flex flex-col justify-between overflow-hidden rounded-2xl border border-[color:var(--color-cloud)] bg-white shadow-xs transition-all duration-200 hover:border-[color:var(--color-steel-light)]/40 hover:shadow-md"
           >
-            <div className="flex items-start gap-3">
-              <span
-                aria-hidden="true"
-                className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-bold"
-                style={{ background: style.badgeBg, color: style.badgeText }}
-              >
-                {style.glyph}
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-semibold text-[color:var(--color-forest)]">
-                  {insight.finding}
-                </p>
+            {/* Tinted Accent Top Bar */}
+            <div
+              className="flex items-center justify-between px-4 py-2.5 border-b border-[color:var(--color-cloud)]/70"
+              style={{ background: style.headerBg }}
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  aria-hidden="true"
+                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-extrabold shadow-2xs"
+                  style={{ background: style.badgeBg, color: style.badgeText }}
+                >
+                  {style.glyph}
+                </span>
+                <span
+                  className="text-xs font-bold uppercase tracking-wider"
+                  style={{ color: style.badgeText }}
+                >
+                  {style.label}
+                </span>
+              </div>
 
-                {insight.metrics.length > 0 ? (
-                  <div className="mt-2 flex flex-wrap gap-3">
-                    {insight.metrics.map((metric, metricIndex) => (
+              {insight.relatedTables.length > 0 ? (
+                <div className="flex flex-wrap gap-1">
+                  {insight.relatedTables.map((tbl) => (
+                    <span
+                      key={tbl}
+                      className="rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-medium text-[color:var(--color-steel)] border border-[color:var(--color-cloud)]"
+                    >
+                      {tbl}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            {/* Card Content Area */}
+            <div className="p-4 sm:p-5 flex-1 flex flex-col gap-3.5">
+              {/* Finding Headline */}
+              <h4 className="text-sm md:text-base font-extrabold leading-snug text-[color:var(--color-forest)]">
+                {insight.finding}
+              </h4>
+
+              {/* Metric Chips with Tabular Numerals */}
+              {insight.metrics.length > 0 ? (
+                <div className="flex flex-wrap gap-2 pt-0.5">
+                  {insight.metrics.map((metric, metricIndex) => {
+                    const resolvedVal = resolveMetricValue(metric, tables);
+                    const formatted =
+                      typeof resolvedVal === "number"
+                        ? formatNumber(resolvedVal)
+                        : resolvedVal !== null && resolvedVal !== undefined
+                          ? String(resolvedVal)
+                          : "n/a";
+                    return (
                       <div
                         key={`${metric.label}-${metricIndex}`}
-                        className="rounded-md bg-[color:var(--color-cloud)] px-2.5 py-1.5"
+                        className="inline-flex flex-col rounded-xl border border-[color:var(--color-cloud)] bg-[color:var(--color-cloud-light)]/80 px-3 py-1.5 shadow-2xs transition-all duration-150 group-hover:bg-white group-hover:border-[color:var(--color-forest-bright)]/30"
                       >
-                        <p className="text-base font-semibold leading-none text-[color:var(--color-forest)]">
-                          {formatNumber(metric.value)}
-                        </p>
-                        <p className="mt-1 text-[11px] leading-none text-[color:var(--color-steel)]">
+                        <span className="font-mono text-sm md:text-base font-black tabular-nums leading-tight text-[color:var(--color-forest)]">
+                          {formatted}
+                        </span>
+                        <span className="mt-0.5 text-[10px] font-bold leading-none text-[color:var(--color-steel)] uppercase tracking-wide">
                           {metric.label}
-                        </p>
+                        </span>
                       </div>
-                    ))}
+                    );
+                  })}
+                </div>
+              ) : null}
+
+              {/* Why It Matters Context */}
+              <p className="text-xs leading-relaxed text-[color:var(--color-ink)] font-normal">
+                {insight.whyItMatters}
+              </p>
+
+              {/* High-Contrast Recommended Action Box */}
+              {insight.recommendedAction ? (
+                <div
+                  className="mt-auto rounded-xl p-3.5 text-xs leading-relaxed border transition-colors shadow-2xs"
+                  style={{
+                    background: style.actionBg,
+                    borderColor: style.actionBorder,
+                  }}
+                >
+                  <div className="flex items-start gap-2.5">
+                    <span
+                      aria-hidden="true"
+                      className="font-bold text-sm leading-none shrink-0 mt-0.5"
+                      style={{ color: style.badgeText }}
+                    >
+                      →
+                    </span>
+                    <div>
+                      <span className="font-extrabold text-[color:var(--color-forest)]">
+                        Recommended Action:{" "}
+                      </span>
+                      <span className="text-[color:var(--color-ink)] font-medium">
+                        {insight.recommendedAction}
+                      </span>
+                    </div>
                   </div>
-                ) : null}
-
-                <p className="mt-2 text-sm leading-relaxed text-[color:var(--color-ink)]">
-                  {insight.whyItMatters}
-                </p>
-
-                <p className="mt-2 flex items-start gap-1.5 text-sm leading-relaxed text-[color:var(--color-ink)]">
-                  <span
-                    aria-hidden="true"
-                    className="mt-0.5 shrink-0 text-xs font-bold"
-                    style={{ color: style.badgeText }}
-                  >
-                    →
-                  </span>
-                  <span>{insight.recommendedAction}</span>
-                </p>
-
-                <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--color-steel)]">
-                  <span
-                    className="rounded px-1.5 py-0.5 font-medium"
-                    style={{ background: style.badgeBg, color: style.badgeText }}
-                  >
-                    {style.label}
-                  </span>
-                  {insight.relatedTables.length > 0 ? (
-                    <span>{insight.relatedTables.join(", ")}</span>
-                  ) : null}
-                </p>
-              </div>
+                </div>
+              ) : null}
             </div>
           </li>
         );
@@ -218,3 +276,4 @@ export const InsightsPanel = ({ insights }: { insights: unknown[] }) => {
     </ul>
   );
 };
+

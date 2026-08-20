@@ -12,6 +12,18 @@ const main = async (): Promise<void> => {
     );
   }
 
+  if (
+    password.length < 12 ||
+    !/[A-Z]/.test(password) ||
+    !/[a-z]/.test(password) ||
+    !/[0-9]/.test(password) ||
+    !/[^A-Za-z0-9]/.test(password)
+  ) {
+    throw new Error(
+      "ADMIN_PASSWORD must be at least 12 characters and contain uppercase, lowercase, numbers, and special characters.",
+    );
+  }
+
   const payload = await getPayload({ config });
 
   const existing = await payload.find({
@@ -21,8 +33,12 @@ const main = async (): Promise<void> => {
   });
 
   if (existing.totalDocs > 0) {
-    console.log(`Admin user already exists: ${email}. Nothing to do.`);
-    return;
+    const user = existing.docs[0];
+    await payload.delete({
+      collection: "users",
+      id: user.id,
+    });
+    console.log(`Deleted existing user: ${email}`);
   }
 
   await payload.create({
@@ -30,7 +46,10 @@ const main = async (): Promise<void> => {
     data: {
       email,
       password,
+      firstName: "System",
+      lastName: "Admin",
       role: "admin",
+      isActive: true,
     },
   });
 

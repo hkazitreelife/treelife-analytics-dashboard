@@ -27,19 +27,27 @@ import {
 export const chatAnswerSchema = z
   .object({
     directAnswer: z.string().min(1),
-    metrics: z.array(insightMetricRefSchema),
-    caveats: z.string().optional(),
+    metrics: z
+      .array(insightMetricRefSchema)
+      .optional()
+      .nullable()
+      .transform((v) => v ?? []),
+    caveats: z.string().optional().nullable().transform((v) => v ?? undefined),
   })
-  .strict();
+  .strip();
 
-/** chatAnswerSchema with every metric resolved to a real number. */
+/** chatAnswerSchema with every metric resolved to a real number or string. */
 export const resolvedChatAnswerSchema = z
   .object({
     directAnswer: z.string().min(1),
-    metrics: z.array(resolvedInsightMetricSchema),
-    caveats: z.string().optional(),
+    metrics: z
+      .array(resolvedInsightMetricSchema)
+      .optional()
+      .nullable()
+      .transform((v) => v ?? []),
+    caveats: z.string().optional().nullable().transform((v) => v ?? undefined),
   })
-  .strict();
+  .strip();
 
 export type ChatAnswerShape = z.infer<typeof chatAnswerSchema>;
 export type ResolvedChatAnswerShape = z.infer<typeof resolvedChatAnswerSchema>;

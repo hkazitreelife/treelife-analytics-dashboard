@@ -3,6 +3,7 @@ import {
   documentSummaryToolSchema,
   findUnverifiableKeyPoints,
   isClaudeBillingRejection,
+  resolveClaudeModel,
   type DocumentSectionShape,
   type DocumentSummaryShape,
 } from "@analytics/shared";
@@ -47,8 +48,8 @@ export class ClaudeSummaryValidationError extends Error {
  * doesn't silently move chat/prompt-edit/expand (which stay on
  * ANTHROPIC_MODEL) to a different tier too.
  */
-const DEFAULT_MODEL = "claude-opus-5";
-const DEFAULT_RETRY_MODEL = "claude-opus-5";
+const DEFAULT_MODEL = "claude-sonnet-5";
+const DEFAULT_RETRY_MODEL = "claude-haiku-5";
 
 const SYSTEM_INSTRUCTION = [
   "You read one narrative document (a memo, report, or slide deck) and",
@@ -58,9 +59,13 @@ const SYSTEM_INSTRUCTION = [
   "You must call the emit_document_summary tool exactly once. Return no",
   "prose, no markdown, no code fences, and no commentary.",
   "",
-  "For each key point, provide:",
+  "You must return the `keyPoints` field as a JSON array of objects. For each key point, provide an object in the `keyPoints` array with:",
   "- pointId: a short, unique identifier you invent (e.g. \"point-1\").",
-  "- statement: the point itself, in your own words, one to two sentences.",
+  "- statement: the point itself, in your own words. Write actionable, punchy",
+  "  framing (a real headline, a specific finding, a concrete action or owner",
+  "  where the source supports one), not a restated paragraph. If the source",
+  "  doesn't contain enough specificity for an owner or action, say so honestly",
+  "  rather than inventing one.",
   "- importance: critical, high, or medium. These are defined, not vague:",
   "    critical = directly changes a decision or outcome the reader would",
   "      act on (a recommendation, a chosen option, a number that decides",
@@ -73,6 +78,10 @@ const SYSTEM_INSTRUCTION = [
   "  critical, and do not force a fixed count of each level. A short memo",
   "  might have 2 critical points and nothing else; a long deck might have",
   "  many medium points and only a few critical ones.",
+  "- presentation: assign each point a presentation shape. table-row (Area/",
+  "  Finding/Action), tracker-item (open decision needing owner/status, requires",
+  "  status/owner/by), or category-box (grouped theme like Stop/Start/Continue,",
+  "  requires categoryName/colorIntent).",
   "- supportingSectionIds: the sectionId(s) (given to you in the document's",
   "  structure) that this point is drawn from, verbatim.",
   "- quote: a short excerpt copied VERBATIM from fullText that supports this",
@@ -96,6 +105,8 @@ const SYSTEM_INSTRUCTION = [
 export type GenerateSummaryOptions = {
   /** Appended to the system instruction on the stricter retry. */
   stricterInstruction?: string;
+  /** Prompt 15.0 Part 4: same admin-intent framing as claudeConfig.ts's GenerateConfigOptions.adminIntent. */
+  adminIntent?: string;
 };
 
 export type ClaudeDocumentSummaryClient = {
@@ -126,16 +137,21 @@ export const createClaudeDocumentSummaryClient = (
     );
   }
 
-  const client = new Anthropic({ apiKey });
-  const effectiveRetryModel =
-    retryModel && retryModel.trim().length > 0 ? retryModel : model;
+  const client = new Anthropic({
+    apiKey,
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+  const resolvedModel = resolveClaudeModel(model);
+  const resolvedRetryModel = resolveClaudeModel(
+    retryModel && retryModel.trim().length > 0 ? retryModel : model
+  );
 
   return {
-    primaryModel: model,
-    retryModelName: effectiveRetryModel,
+    primaryModel: resolvedModel,
+    retryModelName: resolvedRetryModel,
     generateSummary: async (fullText, sections, options) => {
       const isRetry = Boolean(options?.stricterInstruction);
-      const activeModel = isRetry ? effectiveRetryModel : model;
+      const activeModel = isRetry ? resolvedRetryModel : resolvedModel;
 
       if (isRetry) {
         logger.info(`Retrying document summary with model "${activeModel}".`);
@@ -164,12 +180,17 @@ export const createClaudeDocumentSummaryClient = (
             {
               role: "user",
               content: [
+                options?.adminIntent
+                  ? `The admin who uploaded this file said, about what they want from this summary: "${options.adminIntent}". Follow this framing where it doesn't conflict with the rules above -- e.g. weight importance toward the angle it names -- but every quote must still be a real, verbatim excerpt of fullText.\n`
+                  : "",
                 "Document sections (structure only):",
                 JSON.stringify(sections),
                 "",
                 "Document fullText:",
                 fullText,
-              ].join("\n"),
+              ]
+                .filter(Boolean)
+                .join("\n"),
             },
           ],
         });

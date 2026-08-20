@@ -11,5 +11,8 @@
     "start": "pnpm --filter @analytics/web start",
     "typecheck": "pnpm --filter @analytics/web typecheck",
     "worker": "pnpm --filter worker dev"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
   }
 }

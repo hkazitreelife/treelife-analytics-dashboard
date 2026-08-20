@@ -287,36 +287,58 @@ export const createGeminiClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
+      const maxAttempts = 3;
+      let lastError: unknown;
       let response;
 
-      try {
-        response = await ai.models.generateContent({
-          model: activeModel,
-          contents: buildMetadataPrompt(parsed),
-          config: {
-            systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema,
-            // Structural classification should be reproducible.
-            temperature: 0,
-          },
-        });
-      } catch (error: unknown) {
-        // The key must never reach a log or an error message.
-        const detail = error instanceof Error ? error.message : String(error);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: activeModel,
+            contents: buildMetadataPrompt(parsed),
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema,
+              // Structural classification should be reproducible.
+              temperature: 0,
+            },
+          });
+          lastError = null;
+          break;
+        } catch (error: unknown) {
+          lastError = error;
+          const detail = error instanceof Error ? error.message : String(error);
 
-        if (isBillingOrTierRejection(detail)) {
-          throw new GeminiBillingError(
-            `BILLING OR TIER REJECTION from model "${activeModel}"${isRetry ? " on the validation retry" : ""}. This is a payment or quota problem, not bad model output. The API key's tier does not permit this model, or its quota is exhausted. Either enable billing for the key, or set ${isRetry ? "GEMINI_RETRY_MODEL" : "GEMINI_MODEL"} to a model the key can use. Provider detail: ${detail}`,
+          if (isBillingOrTierRejection(detail)) {
+            throw new GeminiBillingError(
+              `BILLING OR TIER REJECTION from model "${activeModel}"${isRetry ? " on the validation retry" : ""}. This is a payment or quota problem, not bad model output. The API key's tier does not permit this model, or its quota is exhausted. Either enable billing for the key, or set ${isRetry ? "GEMINI_RETRY_MODEL" : "GEMINI_MODEL"} to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          const isTransient =
+            detail.includes("503") ||
+            detail.toLowerCase().includes("high demand") ||
+            detail.toLowerCase().includes("unavailable") ||
+            detail.toLowerCase().includes("econnreset") ||
+            detail.toLowerCase().includes("etimedout");
+
+          if (isTransient && attempt < maxAttempts) {
+            const delayMs = attempt * 2000;
+            logger.warn(
+              `Gemini model "${activeModel}" returned transient error (attempt ${attempt}/${maxAttempts}): ${detail}. Retrying in ${delayMs}ms...`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            continue;
+          }
+
+          throw new GeminiError(
+            `Gemini request failed on model "${activeModel}": ${detail}`,
           );
         }
-
-        throw new GeminiError(
-          `Gemini request failed on model "${activeModel}": ${detail}`,
-        );
       }
 
-      const text = response.text;
+      const text = response?.text;
 
       if (!text) {
         throw new GeminiValidationError(

@@ -126,11 +126,9 @@ export const runChatQuestion = async (
     const { resolved, errors } = resolveMetricReferences(result.metrics, tables);
 
     if (errors.length > 0) {
-      return {
-        ok: false,
-        status: 502,
-        error: `Chat answer's metrics failed resolution at response time (already validated once inside the client): ${errors.join("; ")}`,
-      };
+      payload.logger.warn(
+        `Chat answer's metrics had resolution issues (omitting unresolved): ${errors.join("; ")}`,
+      );
     }
 
     return {

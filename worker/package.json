@@ -12,17 +12,21 @@
   "dependencies": {
     "@analytics/shared": "workspace:*",
     "@anthropic-ai/sdk": "^0.116.0",
+    "@aws-sdk/client-s3": "^3.758.0",
     "@google/genai": "^2.16.0",
+    "@google/generative-ai": "^0.24.0",
     "@payloadcms/db-postgres": "3.87.1",
     "bullmq": "^6.0.10",
     "dotenv": "^17.4.2",
     "ioredis": "^6.0.0",
     "payload": "3.87.1",
+    "pg": "^8.13.3",
     "xlsx": "^0.18.5",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
+    "@types/pg": "^8.11.11",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3"
   }

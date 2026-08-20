@@ -3,6 +3,7 @@ import {
   documentSummaryToolSchema,
   findUnverifiableKeyPoints,
   isClaudeBillingRejection,
+  resolveClaudeModel,
   type DocumentSectionShape,
   type DocumentSummaryShape,
   type KeyPointShape,
@@ -51,7 +52,7 @@ export class ClaudeDocumentEditValidationError extends Error {
 // Same tier as the dataset's prompt-edit: Sonnet primary, Opus retry,
 // ANTHROPIC_MODEL/ANTHROPIC_RETRY_MODEL.
 const DEFAULT_MODEL = "claude-sonnet-5";
-const DEFAULT_RETRY_MODEL = "claude-opus-5";
+const DEFAULT_RETRY_MODEL = "claude-haiku-5";
 
 const SYSTEM_INSTRUCTION = [
   "You are RESHAPING an existing key-points summary for one document. You",
@@ -79,6 +80,8 @@ const SYSTEM_INSTRUCTION = [
   "- Rewrite a point's statement, importance, or supportingSectionIds, and",
   "  if you rewrite it, its quote may change too, as long as the new quote",
   "  is still a real verbatim excerpt.",
+  "- Reshape a point's presentation category (e.g. \"turn this into a stop start",
+  "  continue framework\"). Assign the correct presentation fields if you reshape it.",
   "",
   "Every point in your output, whether carried over untouched or newly",
   "written, must satisfy the same rules the original summary used: quote is",
@@ -132,16 +135,21 @@ export const createClaudeDocumentEditClient = (
     );
   }
 
-  const client = new Anthropic({ apiKey });
-  const effectiveRetryModel =
-    retryModel && retryModel.trim().length > 0 ? retryModel : model;
+  const client = new Anthropic({
+    apiKey,
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+  const resolvedModel = resolveClaudeModel(model);
+  const resolvedRetryModel = resolveClaudeModel(
+    retryModel && retryModel.trim().length > 0 ? retryModel : model
+  );
 
   return {
-    primaryModel: model,
-    retryModelName: effectiveRetryModel,
+    primaryModel: resolvedModel,
+    retryModelName: resolvedRetryModel,
     editSummary: async (currentKeyPoints, fullText, sections, prompt, options) => {
       const isRetry = Boolean(options?.stricterInstruction);
-      const activeModel = isRetry ? effectiveRetryModel : model;
+      const activeModel = isRetry ? resolvedRetryModel : resolvedModel;
 
       if (isRetry) {
         logger.info(`Retrying document summary edit with model "${activeModel}".`);

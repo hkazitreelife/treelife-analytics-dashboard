@@ -15,16 +15,46 @@ export const toNumber = (value: unknown): number | null => {
   }
 
   if (typeof value === "string") {
-    // Tolerates currency symbols, thousands separators and stray spaces.
-    const cleaned = value.replace(/[^0-9.eE+-]/g, "");
+    let str = value.trim();
 
-    if (cleaned.length === 0) {
+    if (str.length === 0) {
       return null;
     }
 
-    const parsed = Number.parseFloat(cleaned);
+    // Handle negative numbers in accounting parentheses format: (1,234.56) or ($1,234.56)
+    let isNegative = false;
+    if (/^\(.*\)$/.test(str)) {
+      isNegative = true;
+      str = str.slice(1, -1).trim();
+    } else if (str.startsWith("-")) {
+      isNegative = true;
+      str = str.slice(1).trim();
+    }
 
-    return Number.isFinite(parsed) ? parsed : null;
+    // Strip currency symbols and whitespace
+    str = str.replace(/[$€£¥₹\s]|USD|EUR|GBP|INR|CAD|AUD/gi, "");
+
+    // European format check: contains comma as decimal with dot as thousand separator (e.g. 1.234,56 or 1234,56)
+    if (/^\d{1,3}(\.\d{3})*,\d+$/.test(str) || (!str.includes(".") && str.includes(","))) {
+      str = str.replace(/\./g, "").replace(/,/g, ".");
+    } else {
+      // Standard US format (1,234.56) -> remove commas
+      str = str.replace(/,/g, "");
+    }
+
+    // Remove percentage sign if present
+    const isPercentage = str.endsWith("%");
+    if (isPercentage) {
+      str = str.slice(0, -1).trim();
+    }
+
+    const parsed = Number.parseFloat(str);
+
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+
+    return isNegative ? -parsed : parsed;
   }
 
   return null;
@@ -110,17 +140,113 @@ export type CategorySeries = { category: string; [measure: string]: unknown };
  * pie slice, or line point that's actually a rollup of the other buckets,
  * not a peer to them.
  */
+export type WidgetFilterSpec = {
+  column: string;
+  op?: "eq" | "neq" | "lt" | "lte" | "gt" | "gte" | "contains" | "in";
+  value: unknown;
+};
+
+export const applyWidgetFilters = (
+  rows: DataRow[],
+  filter?: WidgetFilterSpec | null,
+  filters?: WidgetFilterSpec[] | null,
+  title?: string,
+  columns?: DataColumn[],
+): DataRow[] => {
+  const allFilters: WidgetFilterSpec[] = [];
+  if (filter && typeof filter === "object" && filter.column) {
+    allFilters.push(filter);
+  }
+  if (Array.isArray(filters)) {
+    for (const f of filters) {
+      if (f && typeof f === "object" && f.column) {
+        allFilters.push(f);
+      }
+    }
+  }
+
+  if (allFilters.length === 0) {
+    return rows;
+  }
+
+  return rows.filter((row) =>
+    allFilters.every((f) => {
+      const colKey = Object.keys(row).find(
+        (k) => k.trim().toLowerCase() === f.column.trim().toLowerCase(),
+      ) ?? f.column;
+      const cellVal = row[colKey];
+      if (cellVal === undefined || cellVal === null) {
+        return false;
+      }
+      const op = f.op ?? "eq";
+      const targetVal = f.value;
+
+      if (op === "eq") {
+        if (typeof targetVal === "number") {
+          return toNumber(cellVal) === targetVal;
+        }
+        return String(cellVal).trim().toLowerCase() === String(targetVal).trim().toLowerCase();
+      }
+      if (op === "neq") {
+        if (typeof targetVal === "number") {
+          return toNumber(cellVal) !== targetVal;
+        }
+        return String(cellVal).trim().toLowerCase() !== String(targetVal).trim().toLowerCase();
+      }
+      if (op === "lt") {
+        const num = toNumber(cellVal);
+        const target = toNumber(targetVal);
+        return num !== null && target !== null && num < target;
+      }
+      if (op === "lte") {
+        const num = toNumber(cellVal);
+        const target = toNumber(targetVal);
+        return num !== null && target !== null && num <= target;
+      }
+      if (op === "gt") {
+        const num = toNumber(cellVal);
+        const target = toNumber(targetVal);
+        return num !== null && target !== null && num > target;
+      }
+      if (op === "gte") {
+        const num = toNumber(cellVal);
+        const target = toNumber(targetVal);
+        return num !== null && target !== null && num >= target;
+      }
+      if (op === "contains") {
+        return String(cellVal).toLowerCase().includes(String(targetVal).toLowerCase());
+      }
+      if (op === "in") {
+        if (Array.isArray(targetVal)) {
+          const lowerArr = targetVal.map((v) => String(v).toLowerCase());
+          return lowerArr.includes(String(cellVal).toLowerCase());
+        }
+        return false;
+      }
+      return true;
+    }),
+  );
+};
+
+/**
+ * Groups rows by the category field and aggregates each measure within the
+ * group.
+ */
 export const buildCategorySeries = (
   rows: DataRow[],
   categoryField: string,
   measureFields: string[],
   aggregation: AggregationTypeValue,
   columns: DataColumn[],
+  filter?: WidgetFilterSpec | null,
+  filters?: WidgetFilterSpec[] | null,
+  title?: string,
 ): CategorySeries[] => {
   const groups = new Map<string, DataRow[]>();
   const aggregatableRows = excludeTotalRows(rows, columns);
+  const targetRows = applyWidgetFilters(aggregatableRows, filter, filters, title, columns);
 
-  for (const row of aggregatableRows) {
+  for (const row of targetRows) {
     const raw = row[categoryField];
 
     if (isBlank(raw)) {
@@ -142,6 +268,10 @@ export const buildCategorySeries = (
 
     if (measureFields.length === 0) {
       entry.count = bucket.length;
+      entry.value = bucket.length;
+      if (categoryField && categoryField !== "category") {
+        entry[categoryField] = bucket.length;
+      }
 
       return entry;
     }
@@ -177,22 +307,14 @@ export const computeKpi = (
   fields: string[],
   columns: DataColumn[],
   aggregation: AggregationTypeValue,
+  filter?: WidgetFilterSpec | null,
+  filters?: WidgetFilterSpec[] | null,
+  title?: string,
 ): KpiResult => {
   const { measureFields } = resolveChartFields(fields, columns);
-  // A "TOTAL"/"Grand Total" row is a rollup of the other rows in this same
-  // table -- summing (or counting) it alongside them double-counts. Applies
-  // to count too: "how many records" shouldn't count the rollup row as one
-  // more record.
   const aggregatableRows = excludeTotalRows(rows, columns);
+  const targetRows = applyWidgetFilters(aggregatableRows, filter, filters, title, columns);
 
-  // Section 10.5: distinct is field-specific, unlike count -- "how many
-  // DIFFERENT values" needs an actual field to count unique values of, so
-  // it must be handled before the fields.length===0 shortcut below (which
-  // exists for count/sum/avg on a fieldless widget, not for this) and
-  // before measureFields resolution, which only looks at numeric columns.
-  // Any column type can be distinct-counted (a Department name is
-  // categorical, not numeric), so this reads fields[0] directly rather
-  // than going through resolveChartFields.
   if (aggregation === "distinct") {
     const field = fields[0];
 
@@ -201,7 +323,7 @@ export const computeKpi = (
     }
 
     const distinctValues = new Set(
-      aggregatableRows
+      targetRows
         .map((row) => row[field])
         .filter((value) => !isBlank(value))
         .map((value) => String(value)),
@@ -211,44 +333,41 @@ export const computeKpi = (
       kind: "value",
       value: distinctValues.size,
       field,
-      usedRows: aggregatableRows.length,
+      usedRows: targetRows.length,
     };
   }
 
   if (aggregation === "count") {
     return {
       kind: "value",
-      value: aggregatableRows.length,
+      value: targetRows.length,
       field: null,
-      usedRows: aggregatableRows.length,
+      usedRows: targetRows.length,
     };
   }
 
   if (fields.length === 0) {
     return {
       kind: "value",
-      value: aggregatableRows.length,
+      value: targetRows.length,
       field: null,
-      usedRows: aggregatableRows.length,
+      usedRows: targetRows.length,
     };
   }
 
   const field = measureFields[0] ?? null;
 
-  // sum/avg/none on a field that isn't numeric would otherwise fall through to
-  // toNumber, which strips non-digit characters from strings such as ids and
-  // returns a fabricated number. Refuse instead of guessing.
   if (!field) {
     return { kind: "not-numeric", field: fields[0]! };
   }
 
-  const values = aggregatableRows
+  const values = targetRows
     .map((row) => toNumber(row[field]))
     .filter((value): value is number => value !== null);
 
   return {
     kind: "value",
-    value: applyAggregation(values, aggregation, aggregatableRows.length),
+    value: applyAggregation(values, aggregation, targetRows.length),
     field,
     usedRows: values.length,
   };
@@ -282,4 +401,93 @@ export const formatCell = (value: unknown): string => {
   }
 
   return String(value);
+};
+
+export const resolveMetricValue = (
+  metric: any,
+  tables?: Record<string, { status: string; rows?: Record<string, unknown>[]; columns?: DataColumn[] }>,
+): number | null => {
+  if (!metric) return null;
+
+  if (typeof metric.value === "number" && Number.isFinite(metric.value)) {
+    return metric.value;
+  }
+
+  const parsed = toNumber(metric.value);
+  if (parsed !== null) {
+    return parsed;
+  }
+
+  if (tables) {
+    const tableKeys = Object.keys(tables);
+    const targetKey = metric.sourceTable
+      ? tableKeys.find((k) => k.trim().toLowerCase() === String(metric.sourceTable).trim().toLowerCase())
+      : (tableKeys.length === 1 ? tableKeys[0] : null);
+
+    if (targetKey && tables[targetKey]) {
+      const tableState = tables[targetKey];
+      if (tableState && tableState.status === "ready" && tableState.rows && tableState.columns) {
+        if (metric.kind === "row" && metric.labelColumn && metric.valueColumn) {
+          const target = String(metric.labelValue ?? "").trim().toLowerCase();
+          const match = tableState.rows.find((r: any) => {
+            const lKey = Object.keys(r).find(
+              (k) => k.trim().toLowerCase() === String(metric.labelColumn).trim().toLowerCase(),
+            ) ?? metric.labelColumn;
+            const cell = String(r[lKey] ?? "").trim().toLowerCase();
+            return cell === target || cell.includes(target) || target.includes(cell);
+          });
+          if (match) {
+            const vKey = Object.keys(match).find(
+              (k) => k.trim().toLowerCase() === String(metric.valueColumn).trim().toLowerCase(),
+            ) ?? metric.valueColumn;
+            const val = toNumber(match[vKey]);
+            if (val !== null) return val;
+          }
+        } else {
+          const aggregatableRows = excludeTotalRows(tableState.rows, tableState.columns);
+          const filtered = applyWidgetFilters(
+            aggregatableRows,
+            metric.filter,
+            metric.filters,
+            metric.label,
+            tableState.columns,
+          );
+
+          if (metric.aggregation === "count" || !metric.sourceField) {
+            return filtered.length;
+          }
+
+          const sKey = metric.sourceField
+            ? (Object.keys(aggregatableRows[0] ?? {}).find(
+                (k) => k.trim().toLowerCase() === String(metric.sourceField).trim().toLowerCase(),
+              ) ?? metric.sourceField)
+            : null;
+
+          if (!sKey) {
+            return filtered.length;
+          }
+
+          const vals = filtered
+            .map((r: any) => toNumber(r[sKey]))
+            .filter((v): v is number => v !== null);
+
+          if (vals.length > 0) {
+            if (metric.aggregation === "avg") {
+              return vals.reduce((a, b) => a + b, 0) / vals.length;
+            }
+            if (metric.aggregation === "min") {
+              return Math.min(...vals);
+            }
+            if (metric.aggregation === "max") {
+              return Math.max(...vals);
+            }
+            return vals.reduce((a, b) => a + b, 0);
+          }
+          return filtered.length;
+        }
+      }
+    }
+  }
+
+  return null;
 };

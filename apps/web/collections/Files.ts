@@ -5,6 +5,21 @@ import type { CollectionConfig } from "payload";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const mediaDirectory = process.env.MEDIA_DIR
+  ? path.resolve(process.env.MEDIA_DIR)
+  : path.resolve(dirname, "../media");
+
+const ALLOWED_MIME_TYPES = [
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "text/csv",
+  "application/csv",
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+];
+
 /**
  * Upload collection.
  *
@@ -19,7 +34,8 @@ export const Files: CollectionConfig = {
     useAsTitle: "filename",
   },
   upload: {
-    staticDir: path.resolve(dirname, "../media"),
+    staticDir: mediaDirectory,
+    mimeTypes: ALLOWED_MIME_TYPES,
   },
   fields: [
     {

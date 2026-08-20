@@ -1,0 +1,87 @@
+name: analytics-dashboard-prod
+
+services:
+  # 1. PostgreSQL 16 Database
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-treelife_secure_db_pass_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics_dashboard}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-analytics_dashboard}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 2. Redis 7 Cache & BullMQ Queues
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 3. Next.js 15 Web Application
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URI: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-treelife_secure_db_pass_2026}@postgres:5432/${POSTGRES_DB:-analytics_dashboard}
+      REDIS_URL: redis://redis:6379
+      PAYLOAD_SECRET: ${PAYLOAD_SECRET:-treelife_production_payload_secret_32_chars_min}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@treelife.com}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-AdminPassword123!}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+    volumes:
+      - media_prod_data:/app/apps/web/media
+
+  # 4. BullMQ Background AI Ingestion Worker
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URI: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-treelife_secure_db_pass_2026}@postgres:5432/${POSTGRES_DB:-analytics_dashboard}
+      REDIS_URL: redis://redis:6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+    volumes:
+      - media_prod_data:/app/apps/web/media
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+  media_prod_data:

@@ -3,11 +3,19 @@ import {
   documentChatAnswerToolSchema,
   findUnverifiableCitations,
   isClaudeBillingRejection,
+  resolveClaudeModel,
   type DocumentChatAnswerShape,
   type DocumentSectionShape,
   type KeyPointShape,
 } from "@analytics/shared";
 import Anthropic from "@anthropic-ai/sdk";
+
+import {
+  computeLlmCacheKey,
+  getCachedLlmResponse,
+  logTokenUsage,
+  setCachedLlmResponse,
+} from "./llmCache";
 
 /**
  * Section 10.2. Read-only, document-scoped chat -- the same relationship to
@@ -46,7 +54,7 @@ export class DocumentChatValidationError extends Error {
 // ANTHROPIC_RETRY_MODEL -- chat stays on this tier regardless of document
 // vs dataset, per the model split already settled in Section 9.1/9.2.
 const DEFAULT_MODEL = "claude-sonnet-5";
-const DEFAULT_RETRY_MODEL = "claude-opus-5";
+const DEFAULT_RETRY_MODEL = "claude-haiku-5";
 
 const SYSTEM_INSTRUCTION = [
   "You answer natural-language questions about ONE document, using only the",
@@ -120,16 +128,21 @@ export const createDocumentChatClient = (
     );
   }
 
-  const client = new Anthropic({ apiKey });
-  const effectiveRetryModel =
-    retryModel && retryModel.trim().length > 0 ? retryModel : model;
+  const client = new Anthropic({
+    apiKey,
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+  const resolvedModel = resolveClaudeModel(model);
+  const resolvedRetryModel = resolveClaudeModel(
+    retryModel && retryModel.trim().length > 0 ? retryModel : model
+  );
 
   return {
-    primaryModel: model,
-    retryModelName: effectiveRetryModel,
+    primaryModel: resolvedModel,
+    retryModelName: resolvedRetryModel,
     ask: async (fullText, sections, existingKeyPoints, message, options) => {
       const isRetry = Boolean(options?.stricterInstruction);
-      const activeModel = isRetry ? effectiveRetryModel : model;
+      const activeModel = isRetry ? resolvedRetryModel : resolvedModel;
 
       if (isRetry) {
         logger.info(`Retrying document chat answer with model "${activeModel}".`);
@@ -138,6 +151,22 @@ export const createDocumentChatClient = (
       const systemInstruction = options?.stricterInstruction
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
+
+      const cacheKey = computeLlmCacheKey(
+        activeModel,
+        { message, systemInstruction },
+        { fullText: fullText.slice(0, 5000), sections, existingKeyPoints },
+      );
+      const cached = getCachedLlmResponse<DocumentChatAnswerShape>(cacheKey);
+
+      if (cached && !isRetry) {
+        logTokenUsage({
+          action: "document_chat",
+          model: activeModel,
+          cached: true,
+        });
+        return cached;
+      }
 
       let response;
 
@@ -191,6 +220,14 @@ export const createDocumentChatClient = (
         );
       }
 
+      logTokenUsage({
+        action: "document_chat",
+        model: activeModel,
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cached: false,
+      });
+
       const toolUse = response.content.find(
         (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
       );
@@ -220,6 +257,8 @@ export const createDocumentChatClient = (
           `Document chat answer from model "${activeModel}" has citations that don't verify against the source text: ${unverifiable.join("; ")}`,
         );
       }
+
+      setCachedLlmResponse(cacheKey, result.data);
 
       return result.data;
     },

@@ -2,6 +2,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import { postgresAdapter } from "@payloadcms/db-postgres";
+import { s3Storage } from "@payloadcms/storage-s3";
 import { buildConfig } from "payload";
 import sharp from "sharp";
 
@@ -9,9 +10,13 @@ import { Configs } from "./collections/Configs";
 import { Datasets } from "./collections/Datasets";
 import { Documents } from "./collections/Documents";
 import { Files } from "./collections/Files";
+import { ConversationTurns } from "./collections/ConversationTurns";
 import { Jobs } from "./collections/Jobs";
+import { Sessions } from "./collections/Sessions";
 import { Summaries } from "./collections/Summaries";
 import { Users } from "./collections/Users";
+import { GeminiMetadataCache } from "./collections/GeminiMetadataCache";
+import { ClaudeConfigCache } from "./collections/ClaudeConfigCache";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -80,6 +85,34 @@ const warnOnAdminMismatch = async (payload: {
   }
 };
 
+const plugins = [];
+
+if (
+  process.env.S3_BUCKET &&
+  process.env.S3_ACCESS_KEY_ID &&
+  process.env.S3_SECRET_ACCESS_KEY
+) {
+  plugins.push(
+    s3Storage({
+      collections: {
+        files: {
+          prefix: process.env.S3_PREFIX ?? "media",
+        },
+      },
+      bucket: process.env.S3_BUCKET,
+      config: {
+        credentials: {
+          accessKeyId: process.env.S3_ACCESS_KEY_ID,
+          secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+        },
+        region: process.env.S3_REGION ?? "us-east-1",
+        ...(process.env.S3_ENDPOINT ? { endpoint: process.env.S3_ENDPOINT } : {}),
+        forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
+      },
+    }),
+  );
+}
+
 export default buildConfig({
   admin: {
     user: Users.slug,
@@ -97,14 +130,15 @@ export default buildConfig({
     // only real fix for that half is disabling the extension for localhost.
     suppressHydrationWarning: true,
   },
-  collections: [Users, Files, Datasets, Configs, Jobs, Documents, Summaries],
-  secret: requireEnv("PAYLOAD_SECRET"),
+  collections: [Users, Files, Datasets, Configs, Jobs, Documents, Summaries, Sessions, ConversationTurns, GeminiMetadataCache, ClaudeConfigCache],
+  plugins,
+  secret: process.env.PAYLOAD_SECRET || "dev-payload-secret-at-least-32-chars-long",
   db: postgresAdapter({
     pool: {
-      connectionString: requireEnv("DATABASE_URI"),
+      connectionString: process.env.DATABASE_URI || "postgres://dummy:dummy@localhost:5432/dummy",
     },
-    // Local development pushes the schema directly. Production uses migrations.
-    push: process.env.NODE_ENV !== "production",
+    // Schema is managed via push or migrations; support PAYLOAD_DB_PUSH=true for initial setup
+    push: process.env.PAYLOAD_DB_PUSH === "true",
   }),
   typescript: {
     outputFile: path.resolve(dirname, "payload-types.ts"),

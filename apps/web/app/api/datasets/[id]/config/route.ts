@@ -1,4 +1,5 @@
 import { requireUser } from "@/lib/auth";
+import { getCache, setCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
 
@@ -18,6 +19,12 @@ export async function GET(
 
   const { payload } = auth;
   const { id } = await context.params;
+
+  const cacheKey = `dataset_config_${id}`;
+  const cached = getCache<Record<string, unknown>>(cacheKey);
+  if (cached) {
+    return Response.json(cached);
+  }
 
   try {
     const result = await payload.find({
@@ -45,7 +52,7 @@ export async function GET(
       );
     }
 
-    return Response.json({
+    const body = {
       id: String(latest.id),
       datasetId: id,
       version: latest.version,
@@ -54,7 +61,11 @@ export async function GET(
       insights: latest.insights,
       createdAt: latest.createdAt,
       updatedAt: latest.updatedAt,
-    });
+    };
+
+    setCache(cacheKey, body, 60_000);
+
+    return Response.json(body);
   } catch (error: unknown) {
     payload.logger.error({ err: error }, "Failed to load dashboard config.");
 

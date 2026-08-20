@@ -19,6 +19,7 @@ import {
   isDocumentCandidateMimeType,
   resolveDocumentSourceType,
 } from "../services/documentDetector";
+import { ensureSingleSourceSession } from "../services/sessionWrapper";
 import {
   GeminiBillingError,
   GeminiValidationError,
@@ -42,10 +43,12 @@ export class DocumentIngestionError extends Error {
   }
 }
 
-const MEDIA_DIR = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../../apps/web/media",
-);
+const MEDIA_DIR = process.env.MEDIA_DIR
+  ? path.resolve(process.env.MEDIA_DIR)
+  : path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../apps/web/media",
+    );
 
 const isOutputQualityFailure = (error: unknown): boolean =>
   error instanceof GeminiValidationError ||
@@ -266,11 +269,15 @@ export const processDocumentIngestionJob = async (
     `Post-extraction writes (schema validation, document + job status update) took ${postExtractionDurationMs}ms for job ${data.jobId}.`,
   );
 
+  const adminIntent = jobRecordForTiming.intentPrompt ?? undefined;
+
   const summaryAttempt = async (stricterInstruction?: string) =>
     claudeSummary.generateSummary(
       normalized.data.fullText,
       normalized.data.sections,
-      stricterInstruction ? { stricterInstruction } : undefined,
+      stricterInstruction || adminIntent
+        ? { stricterInstruction, adminIntent }
+        : undefined,
     );
 
   let summary;
@@ -376,6 +383,15 @@ export const processDocumentIngestionJob = async (
       generatedBy: "initial_summary",
     },
   });
+
+  // Prompt 15.0 Part 1: every document is wrapped in its own single-source
+  // session the moment its own ingestion succeeds, same as the dataset path.
+  const documentRecord = await payload.findByID({
+    collection: "documents",
+    id: data.documentId,
+    depth: 0,
+  });
+  await ensureSingleSourceSession(payload, "document", data.documentId, documentRecord.name);
 
   await payload.update({
     collection: "jobs",

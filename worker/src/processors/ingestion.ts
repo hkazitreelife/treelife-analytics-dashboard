@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,7 @@ import {
   type NormalizedDatasetShape,
   type NormalizedTableShape,
   type ResolvedDashboardConfigShape,
+  type GeminiMetadata,
 } from "@analytics/shared";
 import type { Queue } from "bullmq";
 import type { Payload } from "payload";
@@ -29,6 +31,9 @@ import {
 
 import { type DatasetLock } from "../services/datasetLock";
 import { type DatasetEventPublisher } from "../services/events";
+import { ensureSingleSourceSession } from "../services/sessionWrapper";
+import { getCachedClaudeConfig, storeClaudeConfig } from "../services/claudeCache";
+import { getCachedGeminiMetadata, storeGeminiMetadata } from "../services/geminiCache";
 import {
   GeminiBillingError,
   GeminiValidationError,
@@ -64,10 +69,12 @@ export class IngestionError extends Error {
 
 // fileURLToPath, not URL.pathname: the latter leaves percent-encoding in place,
 // which breaks any path containing a space.
-const MEDIA_DIR = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../../apps/web/media",
-);
+const MEDIA_DIR = process.env.MEDIA_DIR
+  ? path.resolve(process.env.MEDIA_DIR)
+  : path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../apps/web/media",
+    );
 
 /**
  * Whether a failure was about the shape of the model's output, which is the only
@@ -124,16 +131,17 @@ const inferAndMerge = async (
   datasetId: string,
   sourceFile: NormalizedDatasetShape["sourceFile"],
   logger: Payload["logger"],
-): Promise<MergeResult> => {
+): Promise<MergeResult & { metadata: GeminiMetadata }> => {
   const attempt = async (
     stricterInstruction?: string,
-  ): Promise<MergeResult> => {
+  ): Promise<MergeResult & { metadata: GeminiMetadata }> => {
     const metadata = await gemini.inferMetadata(
       parsed,
       stricterInstruction ? { stricterInstruction } : undefined,
     );
 
-    return mergeDataset({ datasetId, sourceFile, parsed, metadata });
+    const merged = mergeDataset({ datasetId, sourceFile, parsed, metadata });
+    return { ...merged, metadata };
   };
 
   try {
@@ -205,6 +213,7 @@ const generateConfig = async (
   tables: NormalizedTableShape[],
   relationships: unknown[],
   logger: Payload["logger"],
+  adminIntent?: string,
 ): Promise<ResolvedDashboardConfigShape> => {
   // Rows are read only to compute aggregates; only aggregates leave this call.
   const metadata = buildDatasetMetadata(
@@ -230,7 +239,9 @@ const generateConfig = async (
     const raw = await claude.generateConfig(
       metadata,
       tables,
-      stricterInstruction ? { stricterInstruction } : undefined,
+      stricterInstruction || adminIntent
+        ? { stricterInstruction, adminIntent }
+        : undefined,
     );
 
     const parsed = dashboardConfigSchema.safeParse(raw);
@@ -471,19 +482,47 @@ export const processIngestionJob = async (
   }
 
   try {
-    const { dataset: normalized, totalDataRows } = await inferAndMerge(
+    const effectiveHash = data.fileHash || createHash("sha256").update(bytes).digest("hex");
+
+  // Check for cached Gemini metadata to avoid extra API calls
+  const cachedMetadata = await getCachedGeminiMetadata(payload, effectiveHash);
+  let normalized;
+  let totalDataRows;
+
+  if (cachedMetadata) {
+    // Merge without invoking Gemini since we have prior metadata
+    const result = await mergeDataset({
+      datasetId,
+      sourceFile: { name: fileRecord.filename, type: fileType, hash: effectiveHash },
+      parsed,
+      metadata: cachedMetadata,
+    });
+    normalized = result.dataset;
+    totalDataRows = result.totalDataRows;
+  } else {
+    const result = await inferAndMerge(
       gemini,
       parsed,
       datasetId,
       {
         name: fileRecord.filename,
         type: fileType,
-        hash: data.fileHash,
+        hash: effectiveHash,
       },
       payload.logger,
     );
+    // Store the freshly obtained metadata for future runs
+    await storeGeminiMetadata(payload, effectiveHash, result.metadata);
+    // Use the result for further processing
+    normalized = result.dataset;
+    totalDataRows = result.totalDataRows;
+  }
 
     // Only now, after full validation, is stored data replaced.
+    // If we used cached metadata, we already performed merge above and can skip this block.
+    if (cachedMetadata) {
+      // Metadata already merged; continue to config generation.
+    } else {
     await payload.update({
       collection: "datasets",
       id: datasetId,
@@ -497,7 +536,7 @@ export const processIngestionJob = async (
         })),
         totalRows: totalDataRows,
         currentFile: fileRecord.id,
-        currentFileHash: data.fileHash,
+        currentFileHash: effectiveHash,
         status: "ready",
         // A successful parse clears any error recorded by a previous failed
         // job against this dataset, so the dashboard never shows a stale
@@ -506,6 +545,7 @@ export const processIngestionJob = async (
       },
     });
     await events.publish("dataset.updated", datasetId, data.jobId);
+    }
 
     // Config generation is part of this pipeline, not a separate trigger, so
     // the job stays open until a Config exists. A dataset that is ready with
@@ -517,14 +557,24 @@ export const processIngestionJob = async (
       depth: 0,
     });
 
-    const config = await generateConfig(
-      claude,
-      datasetId,
-      datasetRecord.name,
-      normalized.tables,
-      normalized.relationships,
-      payload.logger,
-    );
+    let config: ResolvedDashboardConfigShape;
+    // Check for cached Claude config to avoid extra API calls
+    const cachedConfig = await getCachedClaudeConfig(payload, effectiveHash);
+    if (cachedConfig) {
+      config = cachedConfig;
+    } else {
+      config = await generateConfig(
+        claude,
+        datasetId,
+        datasetRecord.name,
+        normalized.tables,
+        normalized.relationships,
+        payload.logger,
+        jobRecord.intentPrompt ?? undefined,
+      );
+      // Store the freshly generated config for future runs
+      await storeClaudeConfig(payload, effectiveHash, config);
+    }
 
     // Version is never hardcoded: re-ingesting the same dataset (a corrected
     // re-upload after an earlier failure, or any future re-run) must not
@@ -550,6 +600,11 @@ export const processIngestionJob = async (
       },
     });
     await events.publish("config.updated", datasetId, data.jobId);
+
+    // Prompt 15.0 Part 1: every dataset is wrapped in its own single-source
+    // session the moment its own ingestion succeeds -- after the config
+    // exists, so a session never points at a dataset with nothing to show.
+    await ensureSingleSourceSession(payload, "dataset", datasetId, datasetRecord.name);
 
     await payload.update({
       collection: "jobs",

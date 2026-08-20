@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { presentationDetailsSchema, presentationJsonSchema } from "./dashboardConfig";
 
 /**
  * Section 10.0 Step 3. Claude's prioritized-summary contract for a narrative
@@ -24,6 +25,7 @@ export const keyPointSchema = z
     // be a substring, case-insensitive and whitespace-tolerant -- never
     // merely "plausible."
     quote: z.string().min(1),
+    presentation: presentationDetailsSchema,
   })
   .strict();
 
@@ -56,8 +58,9 @@ export const keyPointJsonSchema = {
       items: { type: "string" as const },
     },
     quote: { type: "string" as const },
+    presentation: presentationJsonSchema,
   },
-  required: ["pointId", "statement", "importance", "supportingSectionIds", "quote"],
+  required: ["pointId", "statement", "importance", "supportingSectionIds", "quote", "presentation"],
   additionalProperties: false,
 };
 

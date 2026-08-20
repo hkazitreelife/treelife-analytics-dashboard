@@ -4,16 +4,15 @@ import {
   DEFAULT_LIMITS,
   type DashboardWidgetShape,
   type ResolvedDashboardConfigShape,
-  type ResolvedMetric,
 } from "@analytics/shared";
 import { useEffect, useMemo, useState } from "react";
 
+import { DashboardExportBar } from "@/components/dashboard/ExportActions";
 import { InsightsPanel } from "@/components/dashboard/InsightsPanel";
 import {
   WidgetRenderer,
   type TableState,
 } from "@/components/dashboard/WidgetRenderer";
-import { formatNumber } from "@/lib/aggregate";
 import {
   ErrorState,
   Skeleton,
@@ -22,11 +21,21 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/primitives";
+import { TreelifeLogo } from "@/components/ui/BrandLogo";
 
 /**
  * The renderer. It draws whatever the config describes and nothing else: no
  * dataset-specific components, no assumed tab or widget count, no hardcoded
  * table or column names. A new dataset needs no code change here.
+ *
+ * Impeccable critique 2026-08-13, P1 "duplicate, unsynchronized chat/edit
+ * surfaces": this used to also carry its own embedded prompt-edit and chat
+ * forms, doing the identical two actions ContextChatEditPanel.tsx's right
+ * rail already does against the identical endpoints, with no shared
+ * history between them. Per the critique's resolution (right rail
+ * canonical), both are removed here. Config edits made via the right rail
+ * still land here exactly as before, through the SSE config.updated
+ * listener below -- that path never depended on which form wrote the edit.
  */
 
 type ConfigResponse = {
@@ -68,6 +77,7 @@ const AGGREGATE_ROW_LIMIT = DEFAULT_LIMITS.maxRowsPerTable;
 
 const CHART_WIDGET_TYPES = new Set<DashboardWidgetShape["type"]>([
   "bar",
+  "horizontal_bar",
   "line",
   "pie",
 ]);
@@ -79,6 +89,8 @@ const needsFullTableAggregation = (widget: DashboardWidgetShape): boolean =>
 type SetTableState = (
   updater: (current: Record<string, TableState>) => Record<string, TableState>,
 ) => void;
+
+import { fetchJsonCached, invalidateClientCache } from "@/lib/clientCache";
 
 /**
  * Fetches each named table's rows into a state map, up to `limit` rows.
@@ -112,34 +124,16 @@ const loadTablesInto = (
 
   const loadTable = async (tableName: string): Promise<void> => {
     try {
-      const response = await fetch(
-        `/api/datasets/${datasetId}/data?table=${encodeURIComponent(tableName)}&limit=${limit}`,
-        { credentials: "include" },
-      );
+      const url = `/api/datasets/${datasetId}/data?table=${encodeURIComponent(tableName)}&limit=${limit}`;
+      const body = await fetchJsonCached<{
+        columns: { name: string; inferredType: string }[];
+        rows: Record<string, unknown>[];
+        totalRows: number;
+      }>(url, 120_000);
 
       if (cancelled) {
         return;
       }
-
-      if (!response.ok) {
-        const body = (await response.json()) as { error?: string };
-
-        setState((current) => ({
-          ...current,
-          [tableName]: {
-            status: "error",
-            message: body.error ?? `Request returned ${response.status}.`,
-          },
-        }));
-
-        return;
-      }
-
-      const body = (await response.json()) as {
-        columns: { name: string; inferredType: string }[];
-        rows: Record<string, unknown>[];
-        totalRows: number;
-      };
 
       setState((current) => ({
         ...current,
@@ -182,35 +176,6 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
   // table-fetch effects below without touching config or reloading the page.
   const [dataRefreshToken, setDataRefreshToken] = useState(0);
 
-  // Section 13: prompt-based editing. A minimal control surface for the
-  // existing POST /api/datasets/:id/config/prompt endpoint -- the SSE
-  // listener below already refetches config on success, so this only needs
-  // to submit the request and show a pending/result state.
-  const [promptValue, setPromptValue] = useState("");
-  const [promptStatus, setPromptStatus] = useState<
-    | { kind: "idle" }
-    | { kind: "pending" }
-    | { kind: "success"; version: number }
-    | { kind: "error"; message: string }
-  >({ kind: "idle" });
-
-  // Section 17: read-only chat. Same minimal shape as the prompt-edit
-  // control above -- an input, a submit, a pending/result state -- with no
-  // SSE involvement, since a chat answer changes nothing that needs
-  // re-rendering elsewhere.
-  const [chatMessage, setChatMessage] = useState("");
-  const [chatStatus, setChatStatus] = useState<
-    | { kind: "idle" }
-    | { kind: "pending" }
-    | {
-        kind: "answered";
-        directAnswer: string;
-        metrics: ResolvedMetric[];
-        caveats?: string;
-      }
-    | { kind: "error"; message: string }
-  >({ kind: "idle" });
-
   useEffect(() => {
     let cancelled = false;
 
@@ -218,78 +183,29 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
       setPhase({ kind: "loading" });
 
       try {
-        const [datasetResponse, configResponse] = await Promise.all([
-          fetch(`/api/datasets/${datasetId}`, { credentials: "include" }),
-          fetch(`/api/datasets/${datasetId}/config`, { credentials: "include" }),
+        const [dataset, configBody] = await Promise.all([
+          fetchJsonCached<DatasetSummary>(`/api/datasets/${datasetId}`, 60_000),
+          fetchJsonCached<ConfigResponse>(`/api/datasets/${datasetId}/config`, 60_000),
         ]);
 
         if (cancelled) {
           return;
         }
 
-        if (datasetResponse.status === 401 || configResponse.status === 401) {
-          setPhase({
-            kind: "error",
-            title: "Not signed in",
-            detail: "Sign in at /login, then reload this page.",
-          });
+        const latestVersion = configBody.version;
+        const config = configBody.config;
 
-          return;
-        }
+        const failureBanner =
+          dataset.status === "failed"
+            ? (dataset.lastError ?? "The latest dataset processing failed.")
+            : null;
 
-        if (!datasetResponse.ok) {
-          setPhase({
-            kind: "error",
-            title: "Dataset not found",
-            detail: `GET /api/datasets/${datasetId} returned ${datasetResponse.status}.`,
-          });
-
-          return;
-        }
-
-        const dataset = (await datasetResponse.json()) as DatasetSummary;
-
-        // No config has ever been generated for this dataset (the pipeline
-        // creates a Config only after a Dataset's data write succeeds, so
-        // this means no ingestion has ever completed successfully). There is
-        // nothing to render.
-        if (!configResponse.ok) {
-          const body = (await configResponse.json()) as { error?: string };
-
-          setPhase({
-            kind: "error",
-            title:
-              dataset.status === "failed"
-                ? `Dataset "${dataset.name}" failed to process`
-                : "No dashboard configuration",
-            detail:
-              dataset.status === "failed"
-                ? (dataset.lastError ??
-                  "No stored data or dashboard configuration is available for this dataset.")
-                : (body.error ??
-                  `GET /api/datasets/${datasetId}/config returned ${configResponse.status}.`),
-          });
-
-          return;
-        }
-
-        const configBody = (await configResponse.json()) as ConfigResponse;
-
-        // status "failed" with a config already in hand means a later job
-        // (a bad re-upload, or a config-generation failure after a good
-        // re-parse) failed, but a working dashboard from an earlier success
-        // is still on record. Render it, with the real error as a banner,
-        // rather than presenting a blank "no data" screen (PRD 11.3).
         setPhase({
           kind: "ready",
           dataset,
-          config: configBody.config,
-          version: configBody.version,
-          failureBanner:
-            dataset.status === "failed"
-              ? (dataset.lastError ??
-                "The most recent update to this dataset failed. Showing the last successful version.")
-              : null,
+          config,
+          version: latestVersion,
+          failureBanner,
         });
       } catch (error: unknown) {
         if (!cancelled) {
@@ -320,6 +236,17 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     for (const tab of phase.config.tabs) {
       for (const widget of tab.widgets) {
         names.add(widget.sourceTable);
+      }
+    }
+
+    for (const insight of phase.config.insights ?? []) {
+      for (const table of (insight as any).relatedTables ?? []) {
+        names.add(table);
+      }
+      for (const metric of (insight as any).metrics ?? []) {
+        if (metric.sourceTable) {
+          names.add(metric.sourceTable);
+        }
       }
     }
 
@@ -421,107 +348,6 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
     };
   }, [datasetId, phase.kind]);
 
-  const handlePromptSubmit = async (
-    event: React.FormEvent<HTMLFormElement>,
-  ): Promise<void> => {
-    event.preventDefault();
-
-    const trimmed = promptValue.trim();
-
-    if (!trimmed || promptStatus.kind === "pending") {
-      return;
-    }
-
-    setPromptStatus({ kind: "pending" });
-
-    try {
-      const response = await fetch(
-        `/api/datasets/${datasetId}/config/prompt`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: trimmed }),
-        },
-      );
-
-      const body = (await response.json()) as {
-        configVersion?: number;
-        error?: string;
-      };
-
-      if (!response.ok) {
-        setPromptStatus({
-          kind: "error",
-          message: body.error ?? `Request returned ${response.status}.`,
-        });
-
-        return;
-      }
-
-      // Deliberately no manual config refetch here: config.updated over SSE
-      // already does it (Section 18.3). This just confirms success.
-      setPromptStatus({ kind: "success", version: body.configVersion ?? 0 });
-      setPromptValue("");
-    } catch (error: unknown) {
-      setPromptStatus({
-        kind: "error",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const handleChatSubmit = async (
-    event: React.FormEvent<HTMLFormElement>,
-  ): Promise<void> => {
-    event.preventDefault();
-
-    const trimmed = chatMessage.trim();
-
-    if (!trimmed || chatStatus.kind === "pending") {
-      return;
-    }
-
-    setChatStatus({ kind: "pending" });
-
-    try {
-      const response = await fetch(`/api/datasets/${datasetId}/chat`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: trimmed }),
-      });
-
-      const body = (await response.json()) as {
-        directAnswer?: string;
-        metrics?: ResolvedMetric[];
-        caveats?: string;
-        error?: string;
-      };
-
-      if (!response.ok) {
-        setChatStatus({
-          kind: "error",
-          message: body.error ?? `Request returned ${response.status}.`,
-        });
-
-        return;
-      }
-
-      setChatStatus({
-        kind: "answered",
-        directAnswer: body.directAnswer ?? "",
-        metrics: body.metrics ?? [],
-        caveats: body.caveats,
-      });
-    } catch (error: unknown) {
-      setChatStatus({
-        kind: "error",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
   if (phase.kind === "loading") {
     return (
       <div className="space-y-4" aria-busy="true" aria-live="polite">
@@ -564,55 +390,26 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
         />
       ) : null}
 
-      <header>
-        <h1 className="text-xl font-semibold text-[color:var(--color-forest)]">
-          {config.title}
-        </h1>
-        <p className="mt-1 text-sm text-[color:var(--color-steel)]">
-          {dataset.name} · {dataset.totalRows.toLocaleString("en-IN")} rows ·
-          status {dataset.status} · config v{version}
-        </p>
-      </header>
+      <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-3 border-b border-[color:var(--color-cloud)]/70">
+        <div className="flex items-center gap-3.5">
+          <TreelifeLogo size="md" className="h-12 sm:h-16 w-auto max-w-[260px] shrink-0" />
+          <div>
+            <h1 className="text-xl font-bold text-[color:var(--color-forest)]">
+              {config.title}
+            </h1>
+            <p className="mt-0.5 text-xs text-[color:var(--color-steel)]">
+              {dataset.name} · {dataset.totalRows.toLocaleString("en-IN")} rows ·
+              status {dataset.status} · config v{version}
+            </p>
+          </div>
+        </div>
 
-      <form
-        onSubmit={handlePromptSubmit}
-        className="flex flex-wrap items-center gap-2 rounded-lg border border-[color:var(--color-cloud)] bg-white p-3"
-      >
-        <label htmlFor="dashboard-prompt" className="sr-only">
-          Reshape this dashboard
-        </label>
-        <input
-          id="dashboard-prompt"
-          type="text"
-          value={promptValue}
-          onChange={(event) => setPromptValue(event.target.value)}
-          placeholder='Reshape this dashboard, e.g. "Change the revenue chart to a pie chart."'
-          disabled={promptStatus.kind === "pending"}
-          className="min-w-64 flex-1 rounded-md border border-[color:var(--color-cloud)] px-3 py-1.5 text-sm text-[color:var(--color-ink)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-cobalt)] disabled:opacity-60"
+        <DashboardExportBar
+          title={config.title}
+          datasetName={dataset.name}
+          tables={tables as any}
         />
-        <button
-          type="submit"
-          disabled={
-            promptStatus.kind === "pending" || promptValue.trim().length === 0
-          }
-          className="rounded-md bg-[color:var(--color-forest)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          {promptStatus.kind === "pending" ? "Applying…" : "Apply"}
-        </button>
-        {promptStatus.kind === "success" ? (
-          <span
-            role="status"
-            className="text-xs text-[color:var(--color-risk-low)]"
-          >
-            Applied as config v{promptStatus.version}.
-          </span>
-        ) : null}
-        {promptStatus.kind === "error" ? (
-          <span role="alert" className="text-xs text-[color:var(--color-risk-high)]">
-            {promptStatus.message}
-          </span>
-        ) : null}
-      </form>
+      </header>
 
       <Tabs defaultValue={firstTab.tabId}>
         <TabsList>
@@ -624,7 +421,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
         </TabsList>
 
         {config.tabs.map((tab) => (
-          <TabsContent key={tab.tabId} value={tab.tabId} className="mt-4">
+          <TabsContent key={tab.tabId} value={tab.tabId} forceMount className="mt-4 data-[state=inactive]:hidden">
             {tab.widgets.length === 0 ? (
               <ErrorState
                 title={`Tab "${tab.tabName}" has no widgets`}
@@ -633,7 +430,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
             ) : (
               <div
                 className="grid grid-cols-1 gap-4 md:grid-cols-12"
-                style={{ gridAutoRows: "minmax(7rem, auto)" }}
+                style={{ gridAutoRows: "minmax(5.25rem, auto)" }}
               >
                 {[...tab.widgets]
                   .sort(
@@ -666,77 +463,130 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
         <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
           Insights
         </h2>
-        <InsightsPanel insights={config.insights} />
-      </section>
-
-      <section className="space-y-3">
-        <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
-          Ask about this data
-        </h2>
-        <form
-          onSubmit={handleChatSubmit}
-          className="flex flex-wrap items-center gap-2 rounded-lg border border-[color:var(--color-cloud)] bg-white p-3"
-        >
-          <label htmlFor="dashboard-chat" className="sr-only">
-            Ask a question about this dataset
-          </label>
-          <input
-            id="dashboard-chat"
-            type="text"
-            value={chatMessage}
-            onChange={(event) => setChatMessage(event.target.value)}
-            placeholder='e.g. "What is the gap to commit?"'
-            disabled={chatStatus.kind === "pending"}
-            className="min-w-64 flex-1 rounded-md border border-[color:var(--color-cloud)] px-3 py-1.5 text-sm text-[color:var(--color-ink)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-cobalt)] disabled:opacity-60"
-          />
-          <button
-            type="submit"
-            disabled={
-              chatStatus.kind === "pending" || chatMessage.trim().length === 0
-            }
-            className="rounded-md bg-[color:var(--color-forest)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-          >
-            {chatStatus.kind === "pending" ? "Asking…" : "Ask"}
-          </button>
-        </form>
-        {chatStatus.kind === "answered" ? (
-          <div
-            role="status"
-            className="rounded-lg border border-[color:var(--color-cloud)] bg-white p-3 text-sm text-[color:var(--color-ink)]"
-          >
-            <p>{chatStatus.directAnswer}</p>
-
-            {chatStatus.metrics.length > 0 ? (
-              <ul className="mt-2 flex flex-wrap gap-3">
-                {chatStatus.metrics.map((metric, index) => (
-                  <li
-                    key={`${metric.label}-${index}`}
-                    className="rounded-md bg-[color:var(--color-cloud)] px-2.5 py-1.5"
-                  >
-                    <p className="text-base font-semibold leading-none text-[color:var(--color-forest)]">
-                      {formatNumber(metric.value)}
-                    </p>
-                    <p className="mt-1 text-[11px] leading-none text-[color:var(--color-steel)]">
-                      {metric.label} · {metric.sourceTable}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-
-            {chatStatus.caveats ? (
-              <p className="mt-2 text-xs italic text-[color:var(--color-steel)]">
-                {chatStatus.caveats}
-              </p>
-            ) : null}
-          </div>
-        ) : null}
-        {chatStatus.kind === "error" ? (
-          <p role="alert" className="text-xs text-[color:var(--color-risk-high)]">
-            {chatStatus.message}
-          </p>
-        ) : null}
+        <InsightsPanel insights={config.insights} tables={tables} />
       </section>
     </div>
   );
 };
+
+export const CombinedDashboardRenderer = ({
+  config,
+  datasetId,
+}: {
+  config: ResolvedDashboardConfigShape;
+  datasetId?: string;
+}) => {
+  const [tables, setTables] = useState<Record<string, TableState>>({});
+  const [aggregateData, setAggregateData] = useState<Record<string, TableState>>({});
+
+  const previewTableNames = useMemo(() => {
+    const names = new Set<string>();
+
+    for (const tab of config.tabs) {
+      for (const widget of tab.widgets) {
+        if (!needsFullTableAggregation(widget)) {
+          names.add(widget.sourceTable);
+        }
+      }
+    }
+
+    for (const insight of config.insights ?? []) {
+      for (const table of (insight as any).relatedTables ?? []) {
+        names.add(table);
+      }
+      for (const metric of (insight as any).metrics ?? []) {
+        if (metric.sourceTable) {
+          names.add(metric.sourceTable);
+        }
+      }
+    }
+
+    return Array.from(names);
+  }, [config]);
+
+  const aggregateTableNames = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          config.tabs
+            .flatMap((tab) => tab.widgets)
+            .filter((widget) => needsFullTableAggregation(widget))
+            .map((widget) => widget.sourceTable),
+        ),
+      ),
+    [config],
+  );
+
+  useEffect(() => {
+    if (!datasetId) return;
+    return loadTablesInto(datasetId, previewTableNames, ROW_LIMIT, setTables);
+  }, [datasetId, previewTableNames]);
+
+  useEffect(() => {
+    if (!datasetId) return;
+    return loadTablesInto(datasetId, aggregateTableNames, AGGREGATE_ROW_LIMIT, setAggregateData);
+  }, [datasetId, aggregateTableNames]);
+
+  const firstTab = config.tabs[0];
+
+  return (
+    <div className="space-y-6">
+      {firstTab && firstTab.widgets.length > 0 ? (
+        <Tabs defaultValue={firstTab.tabId}>
+          {config.tabs.length > 1 ? (
+            <TabsList>
+              {config.tabs.map((tab) => (
+                <TabsTrigger key={tab.tabId} value={tab.tabId}>
+                  {tab.tabName}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          ) : null}
+
+          {config.tabs.map((tab) => (
+            <TabsContent key={tab.tabId} value={tab.tabId} forceMount className="mt-4 data-[state=inactive]:hidden">
+              {tab.widgets.length === 0 ? null : (
+                <div
+                  className="grid grid-cols-1 gap-4 md:grid-cols-12"
+                  style={{ gridAutoRows: "minmax(5.25rem, auto)" }}
+                >
+                  {[...tab.widgets]
+                    .sort(
+                      (a, b) =>
+                        a.position.row - b.position.row ||
+                        a.position.col - b.position.col,
+                    )
+                    .map((widget) => {
+                      const source = needsFullTableAggregation(widget)
+                        ? aggregateData
+                        : tables;
+
+                      return (
+                        <WidgetRenderer
+                          key={widget.widgetId}
+                          widget={widget}
+                          state={
+                            source[widget.sourceTable] ?? { status: "loading" }
+                          }
+                        />
+                      );
+                    })}
+                </div>
+              )}
+            </TabsContent>
+          ))}
+        </Tabs>
+      ) : null}
+
+      {config.insights && config.insights.length > 0 ? (
+        <section className="space-y-3">
+          <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
+            Executive Insights & Strategy
+          </h2>
+          <InsightsPanel insights={config.insights} tables={tables} />
+        </section>
+      ) : null}
+    </div>
+  );
+};
+

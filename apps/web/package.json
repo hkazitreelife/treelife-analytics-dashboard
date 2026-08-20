@@ -12,6 +12,10 @@
     "generate:importmap": "payload generate:importmap",
     "generate:types": "payload generate:types",
     "seed:admin": "node --env-file=.env.local --import tsx scripts/seed-admin.ts",
+    "migrate": "payload migrate",
+    "migrate:create": "payload migrate:create",
+    "migrate:status": "payload migrate:status",
+    "migrate:down": "payload migrate:down",
     "acceptance:phase7": "tsx --tsconfig tsconfig.scripts.json --env-file=.env.local scripts/acceptance-phase7.ts"
   },
   "dependencies": {
@@ -19,14 +23,18 @@
     "@anthropic-ai/sdk": "^0.116.0",
     "@payloadcms/db-postgres": "3.87.1",
     "@payloadcms/next": "3.87.1",
+    "@payloadcms/storage-s3": "3.87.1",
     "@payloadcms/ui": "3.87.1",
+    "@radix-ui/react-collapsible": "^1.1.20",
     "@radix-ui/react-tabs": "^1.1.21",
     "bullmq": "^6.0.10",
     "clsx": "^2.1.1",
     "graphql": "^16.8.1",
     "ioredis": "^6.0.0",
+    "lucide-react": "^1.31.0",
     "next": "~15.4.11",
     "payload": "3.87.1",
+    "pptxgenjs": "^4.0.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "recharts": "^3.10.1",
@@ -42,6 +50,7 @@
     "postcss": "^8.5.26",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "xlsx": "0.18.5"
   }
 }

@@ -10,3 +10,7 @@ export * from "./schemas/documentSummary";
 export * from "./schemas/documentChatAnswer";
 export * from "./documentContract";
 export * from "./workerHealth";
+export * from "./schemas/sessionSynthesis";
+export * from "./sessionSynthesisContract";
+export * from "./schemas/sessionChat";
+export * from "./sessionChatContract";

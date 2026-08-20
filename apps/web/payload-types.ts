@@ -74,6 +74,10 @@ export interface Config {
     jobs: Job;
     documents: Document;
     summaries: Summary;
+    sessions: Session;
+    'conversation-turns': ConversationTurn;
+    geminiMetadataCache: GeminiMetadataCache;
+    claudeConfigCache: ClaudeConfigCache;
     'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
     'payload-preferences': PayloadPreference;
@@ -88,6 +92,10 @@ export interface Config {
     jobs: JobsSelect<false> | JobsSelect<true>;
     documents: DocumentsSelect<false> | DocumentsSelect<true>;
     summaries: SummariesSelect<false> | SummariesSelect<true>;
+    sessions: SessionsSelect<false> | SessionsSelect<true>;
+    'conversation-turns': ConversationTurnsSelect<false> | ConversationTurnsSelect<true>;
+    geminiMetadataCache: GeminiMetadataCacheSelect<false> | GeminiMetadataCacheSelect<true>;
+    claudeConfigCache: ClaudeConfigCacheSelect<false> | ClaudeConfigCacheSelect<true>;
     'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
     'payload-preferences': PayloadPreferencesSelect<false> | PayloadPreferencesSelect<true>;
@@ -133,7 +141,17 @@ export interface UserAuthOperations {
  */
 export interface User {
   id: number;
-  role: 'admin';
+  firstName?: string | null;
+  lastName?: string | null;
+  role: 'admin' | 'analyst' | 'viewer';
+  /**
+   * Deactivated users are barred from authenticating across all routes.
+   */
+  isActive: boolean;
+  /**
+   * Timestamp of last successful authentication.
+   */
+  lastLogin?: string | null;
   updatedAt: string;
   createdAt: string;
   email: string;
@@ -258,6 +276,7 @@ export interface Job {
   dataset?: (number | null) | Dataset;
   document?: (number | null) | Document;
   fileHash?: string | null;
+  intentPrompt?: string | null;
   status: 'queued' | 'processing' | 'validating' | 'generating_config' | 'completed' | 'failed' | 'duplicate_noop';
   retryCount: number;
   error?: string | null;
@@ -322,6 +341,102 @@ export interface Summary {
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "sessions".
+ */
+export interface Session {
+  id: number;
+  name: string;
+  datasets?: (number | Dataset)[] | null;
+  documents?: (number | Document)[] | null;
+  status: 'synthesizing' | 'ready' | 'failed';
+  /**
+   * { findings: ResolvedSessionFindingShape[] }. Written only after every finding resolves and verifies; an empty findings array is a valid, common result.
+   */
+  overview?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  /**
+   * The technical error from the most recent failed synthesis attempt.
+   */
+  lastError?: string | null;
+  createdBy?: (number | null) | User;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "conversation-turns".
+ */
+export interface ConversationTurn {
+  id: number;
+  session: number | Session;
+  kind: 'chat' | 'edit';
+  message: string;
+  targetSourceKind?: ('dataset' | 'document') | null;
+  targetSourceId?: string | null;
+  status: 'answered' | 'edit_applied' | 'needs_clarification' | 'error';
+  /**
+   * The full result shown to the user: directAnswer+metrics+citations for chat, configVersion/summaryVersion for an applied edit, the clarifying question for needs_clarification, or the error message.
+   */
+  response?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  createdBy?: (number | null) | User;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "geminiMetadataCache".
+ */
+export interface GeminiMetadataCache {
+  id: number;
+  hash: string;
+  metadata:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "claudeConfigCache".
+ */
+export interface ClaudeConfigCache {
+  id: number;
+  hash: string;
+  config:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "payload-kv".
  */
 export interface PayloadKv {
@@ -371,6 +486,22 @@ export interface PayloadLockedDocument {
     | ({
         relationTo: 'summaries';
         value: number | Summary;
+      } | null)
+    | ({
+        relationTo: 'sessions';
+        value: number | Session;
+      } | null)
+    | ({
+        relationTo: 'conversation-turns';
+        value: number | ConversationTurn;
+      } | null)
+    | ({
+        relationTo: 'geminiMetadataCache';
+        value: number | GeminiMetadataCache;
+      } | null)
+    | ({
+        relationTo: 'claudeConfigCache';
+        value: number | ClaudeConfigCache;
       } | null);
   globalSlug?: string | null;
   user: {
@@ -419,7 +550,11 @@ export interface PayloadMigration {
  * via the `definition` "users_select".
  */
 export interface UsersSelect<T extends boolean = true> {
+  firstName?: T;
+  lastName?: T;
   role?: T;
+  isActive?: T;
+  lastLogin?: T;
   updatedAt?: T;
   createdAt?: T;
   email?: T;
@@ -502,6 +637,7 @@ export interface JobsSelect<T extends boolean = true> {
   dataset?: T;
   document?: T;
   fileHash?: T;
+  intentPrompt?: T;
   status?: T;
   retryCount?: T;
   error?: T;
@@ -534,6 +670,57 @@ export interface SummariesSelect<T extends boolean = true> {
   keyPoints?: T;
   generatedBy?: T;
   expandedBy?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "sessions_select".
+ */
+export interface SessionsSelect<T extends boolean = true> {
+  name?: T;
+  datasets?: T;
+  documents?: T;
+  status?: T;
+  overview?: T;
+  lastError?: T;
+  createdBy?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "conversation-turns_select".
+ */
+export interface ConversationTurnsSelect<T extends boolean = true> {
+  session?: T;
+  kind?: T;
+  message?: T;
+  targetSourceKind?: T;
+  targetSourceId?: T;
+  status?: T;
+  response?: T;
+  createdBy?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "geminiMetadataCache_select".
+ */
+export interface GeminiMetadataCacheSelect<T extends boolean = true> {
+  hash?: T;
+  metadata?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "claudeConfigCache_select".
+ */
+export interface ClaudeConfigCacheSelect<T extends boolean = true> {
+  hash?: T;
+  config?: T;
   updatedAt?: T;
   createdAt?: T;
 }

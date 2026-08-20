@@ -1,4 +1,5 @@
 import { requireUser } from "@/lib/auth";
+import { getCache, setCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
 
@@ -24,6 +25,12 @@ export async function GET(
 
   const { payload } = auth;
   const { id } = await context.params;
+
+  const cacheKey = `document_summary_${id}`;
+  const cached = getCache<Record<string, unknown>>(cacheKey);
+  if (cached) {
+    return Response.json(cached);
+  }
 
   let document;
 
@@ -60,10 +67,14 @@ export async function GET(
     );
   }
 
-  return Response.json({
+  const body = {
     documentId: String(id),
     version: latest.version,
     keyPoints: latest.keyPoints ?? [],
     sections,
-  });
+  };
+
+  setCache(cacheKey, body, 60_000);
+
+  return Response.json(body);
 }

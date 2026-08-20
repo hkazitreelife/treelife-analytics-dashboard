@@ -1,3 +1,4 @@
+import { fileTypeFromFilename } from "@/lib/fileType";
 import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -17,7 +18,8 @@ export async function GET(request: Request): Promise<Response> {
     const result = await payload.find({
       collection: "datasets",
       limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 200) : 50,
-      depth: 0,
+      // depth: 1 so currentFile populates with its filename, for fileType.
+      depth: 1,
       sort: "-updatedAt",
     });
 
@@ -29,6 +31,12 @@ export async function GET(request: Request): Promise<Response> {
         status: dataset.status,
         totalRows: dataset.totalRows ?? 0,
         tableNames: (dataset.tableNames ?? []).map((entry) => entry.tableName),
+        // Prompt 12.0: the sidebar's type badge (xlsx/csv/...).
+        fileType: fileTypeFromFilename(
+          typeof dataset.currentFile === "object" && dataset.currentFile
+            ? dataset.currentFile.filename
+            : null,
+        ),
         createdAt: dataset.createdAt,
         updatedAt: dataset.updatedAt,
       })),

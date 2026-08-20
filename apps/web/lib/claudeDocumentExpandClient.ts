@@ -3,6 +3,7 @@ import {
   documentSummaryToolSchema,
   findUnverifiableKeyPoints,
   isClaudeBillingRejection,
+  resolveClaudeModel,
   type DocumentSectionShape,
   type DocumentSummaryShape,
   type KeyPointShape,
@@ -40,7 +41,7 @@ export class ClaudeExpandValidationError extends Error {
 }
 
 const DEFAULT_MODEL = "claude-sonnet-5";
-const DEFAULT_RETRY_MODEL = "claude-opus-5";
+const DEFAULT_RETRY_MODEL = "claude-haiku-5";
 
 const SYSTEM_INSTRUCTION = [
   "You are asked for MORE key points from a document you have already",
@@ -115,13 +116,18 @@ export const createClaudeDocumentExpandClient = (
     );
   }
 
-  const client = new Anthropic({ apiKey });
-  const effectiveRetryModel =
-    retryModel && retryModel.trim().length > 0 ? retryModel : model;
+  const client = new Anthropic({
+    apiKey,
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+  const resolvedModel = resolveClaudeModel(model);
+  const resolvedRetryModel = resolveClaudeModel(
+    retryModel && retryModel.trim().length > 0 ? retryModel : model
+  );
 
   return {
-    primaryModel: model,
-    retryModelName: effectiveRetryModel,
+    primaryModel: resolvedModel,
+    retryModelName: resolvedRetryModel,
     expandSummary: async (
       fullText,
       sections,
@@ -130,7 +136,7 @@ export const createClaudeDocumentExpandClient = (
       options,
     ) => {
       const isRetry = Boolean(options?.stricterInstruction);
-      const activeModel = isRetry ? effectiveRetryModel : model;
+      const activeModel = isRetry ? resolvedRetryModel : resolvedModel;
 
       if (isRetry) {
         logger.info(`Retrying document expand with model "${activeModel}".`);

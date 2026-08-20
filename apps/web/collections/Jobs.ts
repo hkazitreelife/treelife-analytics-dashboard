@@ -36,6 +36,15 @@ export const Jobs: CollectionConfig = {
       index: true,
     },
     {
+      // Prompt 15.0 Part 4: whatever the admin typed in /new alongside this
+      // upload, if anything. Read by the worker and passed into the initial
+      // config-generation (dataset) or summary-generation (document) call as
+      // extra framing, never as a replacement for the deterministic
+      // extraction/validation pipeline itself.
+      name: "intentPrompt",
+      type: "textarea",
+    },
+    {
       name: "status",
       type: "select",
       required: true,

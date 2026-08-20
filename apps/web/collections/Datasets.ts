@@ -11,6 +11,7 @@ export const Datasets: CollectionConfig = {
       name: "name",
       type: "text",
       required: true,
+      index: true,
     },
     {
       name: "currentFile",
@@ -27,6 +28,7 @@ export const Datasets: CollectionConfig = {
       type: "select",
       required: true,
       defaultValue: "processing",
+      index: true,
       options: [
         { label: "Processing", value: "processing" },
         { label: "Ready", value: "ready" },

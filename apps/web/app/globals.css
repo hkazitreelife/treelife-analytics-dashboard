@@ -1,0 +1,188 @@
+@import "tailwindcss";
+
+/*
+ * Shared by (site) and (dashboard) -- both need the same shell, sidebar and
+ * panel styling (Prompt 12.0), so this moved out of (dashboard) to a
+ * top-level app/globals.css both route groups can import.
+ */
+
+@theme {
+  --color-forest: #0d3b26;
+  --color-forest-mid: #1a5c3a;
+  --color-forest-bright: #2e8b57;
+  --color-forest-spark: #c8f04d;
+  --color-forest-surface: #f2f8f4;
+  --color-ink: #1c2b3a;
+  --color-ink-muted: #2d3f52;
+  --color-steel: #4a5d73;
+  --color-steel-light: #71849a;
+  --color-cloud: #e2e8f0;
+  --color-cloud-light: #f1f5f9;
+  --color-warm-white: #f8fafc;
+  --color-gold: #d4a843;
+  --color-gold-surface: #fef9ee;
+  --color-cobalt: #5b8db8;
+  --color-cobalt-surface: #f0f7fc;
+  --color-terracotta: #c05e3c;
+  --color-terracotta-surface: #fdf3ef;
+  --color-grape: #6b5ea8;
+  --color-grape-surface: #f5f3fa;
+  --color-risk-high: #c0392b;
+  --color-risk-high-surface: #fdf2f2;
+  --color-risk-med: #e67e22;
+  --color-risk-med-surface: #fef7ee;
+  --color-risk-low: #27ae60;
+  --color-risk-low-surface: #f0fdf4;
+
+  --color-risk-low-text: #1e7e42;
+  --color-risk-med-text: #9a3412;
+  --color-cobalt-text: #215a7d;
+  --color-terracotta-text: #993b1d;
+  --color-grape-text: #4e4082;
+}
+
+.dashboard-root,
+.app-shell-root {
+  background-color: #f8fafc;
+  color: var(--color-ink);
+  min-height: 100vh;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Print View Stylesheet */
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+
+  @page {
+    margin: 1cm;
+    size: A4 portrait;
+  }
+
+  body,
+  .dashboard-root,
+  .app-shell-root,
+  main {
+    background: #ffffff !important;
+    color: #111827 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  /* Hide interactive controls, sidebars, assistants during print */
+  aside,
+  nav,
+  button,
+  .no-print,
+  [role="tablist"],
+  .action-bar {
+    display: none !important;
+  }
+
+  /* Keep cards intact without breaking mid-card */
+  .group[data-widget-id],
+  [data-widget-id] {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    margin-bottom: 16px !important;
+    border: 1px solid #e2e8f0 !important;
+    box-shadow: none !important;
+    display: flex !important;
+    flex-direction: column !important;
+  }
+
+  /* Print-optimized cards and widgets */
+  .recharts-responsive-container {
+    min-height: 240px !important;
+    height: 240px !important;
+    width: 100% !important;
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  .recharts-wrapper {
+    max-width: 100% !important;
+    width: 100% !important;
+    height: 100% !important;
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  .recharts-surface {
+    width: 100% !important;
+    height: 100% !important;
+    overflow: visible !important;
+    visibility: visible !important;
+  }
+
+  svg {
+    max-width: 100% !important;
+    overflow: visible !important;
+    visibility: visible !important;
+  }
+
+  /* Force svg paths, rectangles, curves and text to be fully rendered */
+  .recharts-bar-rectangle path,
+  .recharts-bar-rectangles path,
+  .recharts-bar-rectangles rect,
+  .recharts-pie-sector path,
+  .recharts-line-curve path,
+  .recharts-curve path,
+  .recharts-cartesian-grid line {
+    opacity: 1 !important;
+    visibility: visible !important;
+  }
+
+  .print-page-break {
+    page-break-before: always;
+    break-before: page;
+  }
+
+  .print-avoid-break {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  /* Print Header & Timestamp */
+  .print-header {
+    display: block !important;
+    border-bottom: 2px solid #0d3b26;
+    padding-bottom: 12px;
+    margin-bottom: 20px;
+  }
+
+  .print-footer {
+    display: block !important;
+    border-top: 1px solid #e2e8f0;
+    padding-top: 8px;
+    margin-top: 24px;
+    font-size: 10px;
+    color: #64748b;
+    text-align: right;
+  }
+}
