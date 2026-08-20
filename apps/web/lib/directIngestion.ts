@@ -1,5 +1,4 @@
 import * as XLSX from "xlsx";
-import Anthropic from "@anthropic-ai/sdk";
 import type { Payload } from "payload";
 
 export interface ParsedTable {
@@ -60,20 +59,13 @@ export async function processIngestionDirectly(
 
     const totalRows = tables.reduce((acc, t) => acc + t.rowCount, 0);
 
-    // 3. Extract AI dashboard layout using Anthropic / OpenRouter
+    // 3. Extract AI dashboard layout using OpenRouter / Claude
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    const baseURL = process.env.ANTHROPIC_BASE_URL;
-    const model = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
 
     let dashboardConfig: any = null;
 
     if (apiKey) {
       try {
-        const client = new Anthropic({
-          apiKey,
-          ...(baseURL ? { baseURL } : {}),
-        });
-
         const tableSummary = tables.map((t) => ({
           sheet: t.name,
           columns: t.columns,
@@ -129,16 +121,31 @@ export async function processIngestionDirectly(
           "}",
         ].join("\n");
 
-        const msg = await client.messages.create({
-          model,
-          max_tokens: 4000,
-          messages: [{ role: "user", content: prompt }],
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+
+        const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "anthropic/claude-sonnet-5",
+            messages: [{ role: "user", content: prompt }],
+          }),
+          signal: controller.signal,
         });
 
-        const text = msg.content[0]?.type === "text" ? msg.content[0].text : "";
-        const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, text];
-        const clean = jsonMatch[1]?.trim() || text.trim();
-        dashboardConfig = JSON.parse(clean);
+        clearTimeout(timeout);
+
+        if (openRouterRes.ok) {
+          const aiData = await openRouterRes.json();
+          const rawText = aiData.choices?.[0]?.message?.content || "";
+          const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, rawText];
+          const clean = jsonMatch[1]?.trim() || rawText.trim();
+          dashboardConfig = JSON.parse(clean);
+        }
       } catch (aiErr: unknown) {
         console.warn("[DirectIngestion] AI generation fallback:", aiErr);
       }
