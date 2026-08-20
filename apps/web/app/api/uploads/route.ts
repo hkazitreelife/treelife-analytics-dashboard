@@ -1,6 +1,7 @@
 import { requireUser } from "@/lib/auth";
 import { enqueueDocumentIngestion } from "@/lib/documentQueue";
 import { enqueueIngestion } from "@/lib/queue";
+import { processIngestionDirectly } from "@/lib/directIngestion";
 import {
   baseNameWithoutExtension,
   isDocumentCandidateFileType,
@@ -340,12 +341,26 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
 
-    await enqueueIngestion({
-      jobId: String(job.id),
-      fileId: String(created.id),
-      datasetId: String(dataset.id),
-      fileHash: hash,
-    });
+    try {
+      await enqueueIngestion({
+        jobId: String(job.id),
+        fileId: String(created.id),
+        datasetId: String(dataset.id),
+        fileHash: hash,
+      });
+    } catch (queueErr) {
+      console.warn("[Uploads] BullMQ enqueue warning:", queueErr);
+    }
+
+    // Direct in-process ingestion using uploaded file buffer
+    processIngestionDirectly(
+      payload,
+      job.id,
+      dataset.id,
+      bytes,
+      uploaded.name,
+      intentPrompt,
+    ).catch((err) => console.error("[Uploads] Direct ingestion execution error:", err));
 
     return Response.json(
       {
