@@ -4,7 +4,10 @@ packages:
   - "worker"
 
 allowBuilds:
+  "@google/genai": false
   esbuild: true
+  msgpackr-extract: false
+  protobufjs: false
   sharp: true
 
 onlyBuiltDependencies:
