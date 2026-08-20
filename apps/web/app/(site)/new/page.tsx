@@ -332,7 +332,10 @@ export default function NewSessionPage() {
         // configured size limit on a 413, not a client-guessed number.
         setItemPhase(id, {
           kind: "upload-error",
-          message: body.error ?? `Upload failed (status ${response.status}).`,
+          message:
+            (body as any).detail ||
+            body.error ||
+            `Upload failed (status ${response.status}).`,
         });
         return;
       }

@@ -30,7 +30,14 @@ const globalForQueue = globalThis as typeof globalThis & {
 
 export const getIngestionQueue = (): Queue<IngestionJobData> => {
   if (!globalForQueue.ingestionQueue) {
-    const connection = new Redis(redisUrl(), redisConnectionOptions);
+    const url = redisUrl();
+    const isTls = url.startsWith("rediss://");
+    const connection = new Redis(url, {
+      ...redisConnectionOptions,
+      ...(isTls ? { tls: { rejectUnauthorized: false } } : {}),
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
+    });
 
     globalForQueue.ingestionQueue = new Queue<IngestionJobData>(
       INGESTION_QUEUE_NAME,
