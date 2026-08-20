@@ -71,6 +71,7 @@ export const Files: CollectionConfig = {
     {
       name: "dataBase64",
       type: "textarea",
+      validate: () => true,
       admin: {
         hidden: true,
       },
