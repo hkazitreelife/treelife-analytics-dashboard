@@ -233,18 +233,20 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
     const names = new Set<string>();
 
-    for (const tab of phase.config.tabs) {
-      for (const widget of tab.widgets) {
-        names.add(widget.sourceTable);
+    for (const tab of phase.config?.tabs ?? []) {
+      for (const widget of tab?.widgets ?? []) {
+        if (widget?.sourceTable) {
+          names.add(widget.sourceTable);
+        }
       }
     }
 
-    for (const insight of phase.config.insights ?? []) {
-      for (const table of (insight as any).relatedTables ?? []) {
+    for (const insight of phase.config?.insights ?? []) {
+      for (const table of (insight as any)?.relatedTables ?? []) {
         names.add(table);
       }
-      for (const metric of (insight as any).metrics ?? []) {
-        if (metric.sourceTable) {
+      for (const metric of (insight as any)?.metrics ?? []) {
+        if (metric?.sourceTable) {
           names.add(metric.sourceTable);
         }
       }
@@ -262,9 +264,9 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
     const names = new Set<string>();
 
-    for (const tab of phase.config.tabs) {
-      for (const widget of tab.widgets) {
-        if (needsFullTableAggregation(widget)) {
+    for (const tab of phase.config?.tabs ?? []) {
+      for (const widget of tab?.widgets ?? []) {
+        if (widget && needsFullTableAggregation(widget)) {
           names.add(widget.sourceTable);
         }
       }
@@ -422,7 +424,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
 
         {config.tabs.map((tab) => (
           <TabsContent key={tab.tabId} value={tab.tabId} forceMount className="mt-4 data-[state=inactive]:hidden">
-            {tab.widgets.length === 0 ? (
+            {(tab.widgets?.length ?? 0) === 0 ? (
               <ErrorState
                 title={`Tab "${tab.tabName}" has no widgets`}
                 detail="The configuration defines this tab but places nothing in it."
@@ -432,7 +434,7 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
                 className="grid grid-cols-1 gap-4 md:grid-cols-12"
                 style={{ gridAutoRows: "minmax(5.25rem, auto)" }}
               >
-                {[...tab.widgets]
+                {[...(tab.widgets ?? [])]
                   .sort(
                     (a, b) =>
                       a.position.row - b.position.row ||

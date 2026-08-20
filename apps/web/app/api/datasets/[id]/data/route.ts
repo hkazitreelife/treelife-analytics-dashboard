@@ -81,10 +81,24 @@ export async function GET(
       }
 
       const dataset = await datasetPromise;
-      const stored = dataset.data as { tables?: StoredTable[] } | null;
+      const stored = dataset.data as { tables?: any[] } | null;
+      const rawTables = stored?.tables ?? [];
+      const normalizedTables: StoredTable[] = rawTables.map((t: any) => {
+        const tableName = t.tableName || t.name || "Data";
+        const tableRole = t.tableRole || "dimension";
+        const rawCols = Array.isArray(t.columns) ? t.columns : [];
+        const columns = rawCols.map((c: any) =>
+          typeof c === "string"
+            ? { name: c, inferredType: "string" }
+            : { name: c?.name || "col", inferredType: c?.inferredType || "string" },
+        );
+        const rows = Array.isArray(t.rows) ? t.rows : [];
+        return { tableName, tableRole, columns, rows };
+      });
+
       cachedDataset = {
         status: dataset.status,
-        tables: stored?.tables ?? [],
+        tables: normalizedTables,
       };
       setCache(datasetCacheKey, cachedDataset, 120_000);
     }
@@ -107,7 +121,12 @@ export async function GET(
     }
 
     const table = requestedTable
-      ? tables.find((candidate) => candidate.tableName === requestedTable)
+      ? tables.find(
+          (candidate) =>
+            candidate.tableName.toLowerCase() === requestedTable.toLowerCase() ||
+            candidate.tableName.replace(/\s+/g, "_").toLowerCase() ===
+              requestedTable.replace(/\s+/g, "_").toLowerCase(),
+        ) || tables[0]
       : tables[0];
 
     if (!table) {

@@ -197,6 +197,14 @@ export async function processIngestionDirectly(
       };
     }
 
+    if (Array.isArray(dashboardConfig.insights)) {
+      dashboardConfig.insights = dashboardConfig.insights.map((ins: any) => ({
+        ...ins,
+        metrics: Array.isArray(ins.metrics) ? ins.metrics : [],
+        relatedTables: Array.isArray(ins.relatedTables) ? ins.relatedTables : [],
+      }));
+    }
+
     // 4. Save Config
     await payload.create({
       collection: "configs",
@@ -219,8 +227,9 @@ export async function processIngestionDirectly(
         tableNames: tables.map((t) => ({ tableName: t.name })),
         data: {
           tables: tables.map((t) => ({
-            name: t.name,
-            columns: t.columns,
+            tableName: t.name,
+            tableRole: "dimension",
+            columns: t.columns.map((c) => ({ name: c, inferredType: "string" })),
             rows: t.allRows,
           })),
         } as any,

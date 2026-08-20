@@ -141,7 +141,7 @@ export const InsightsPanel = ({
                     <span className="italic text-[10px]">
                       Legacy format · regenerate to update
                     </span>
-                    {insight.relatedTables.length > 0 ? (
+                    {Array.isArray(insight.relatedTables) && insight.relatedTables.length > 0 ? (
                       <span className="ml-auto text-[10px] text-[color:var(--color-steel-light)]">
                         {insight.relatedTables.join(", ")}
                       </span>
@@ -187,7 +187,7 @@ export const InsightsPanel = ({
                 </span>
               </div>
 
-              {insight.relatedTables.length > 0 ? (
+              {Array.isArray(insight.relatedTables) && insight.relatedTables.length > 0 ? (
                 <div className="flex flex-wrap gap-1">
                   {insight.relatedTables.map((tbl) => (
                     <span
@@ -209,7 +209,7 @@ export const InsightsPanel = ({
               </h4>
 
               {/* Metric Chips with Tabular Numerals */}
-              {insight.metrics.length > 0 ? (
+              {Array.isArray(insight.metrics) && insight.metrics.length > 0 ? (
                 <div className="flex flex-wrap gap-2 pt-0.5">
                   {insight.metrics.map((metric, metricIndex) => {
                     const resolvedVal = resolveMetricValue(metric, tables);

@@ -129,43 +129,47 @@ export const SessionShellPage = ({ sessionId }: { sessionId: string }) => {
 };
 
 const SessionReady = ({ session, refreshToken }: { session: SessionInfo; refreshToken: number }) => {
-  const totalSources = session.datasets.length + session.documents.length;
+  const datasets = session?.datasets ?? [];
+  const documents = session?.documents ?? [];
+  const totalSources = datasets.length + documents.length;
 
   if (totalSources === 1) {
-    if (session.datasets.length === 1) {
-      return <DashboardRenderer datasetId={session.datasets[0]!.id} />;
+    if (datasets.length === 1 && datasets[0]?.id) {
+      return <DashboardRenderer datasetId={datasets[0].id} />;
     }
 
-    return (
-      <DocumentSummaryRenderer documentId={session.documents[0]!.id} refreshToken={refreshToken} />
-    );
+    if (documents.length === 1 && documents[0]?.id) {
+      return (
+        <DocumentSummaryRenderer documentId={documents[0].id} refreshToken={refreshToken} />
+      );
+    }
   }
 
-  const findings = session.overview.findings ?? [];
+  const findings = session?.overview?.findings ?? [];
   const [overviewTables, setOverviewTables] = useState<Record<string, any>>({});
 
   useEffect(() => {
-    if (session.datasets.length === 0) return;
-    const datasetId = session.datasets[0]!.id;
+    if (datasets.length === 0 || !datasets[0]?.id) return;
+    const datasetId = datasets[0].id;
 
     const tableNames = new Set<string>();
     for (const f of findings) {
       if (f.metric?.sourceTable) tableNames.add(f.metric.sourceTable);
       for (const m of (f as any).metrics ?? []) {
-        if (m.sourceTable) tableNames.add(m.sourceTable);
+        if (m?.sourceTable) tableNames.add(m.sourceTable);
       }
     }
-    for (const tab of session.overview.config?.tabs ?? []) {
-      for (const widget of tab.widgets ?? []) {
-        if (widget.sourceTable) tableNames.add(widget.sourceTable);
+    for (const tab of session?.overview?.config?.tabs ?? []) {
+      for (const widget of tab?.widgets ?? []) {
+        if (widget?.sourceTable) tableNames.add(widget.sourceTable);
       }
     }
-    for (const insight of session.overview.config?.insights ?? []) {
-      for (const table of (insight as any).relatedTables ?? []) {
+    for (const insight of session?.overview?.config?.insights ?? []) {
+      for (const table of (insight as any)?.relatedTables ?? []) {
         tableNames.add(table);
       }
-      for (const metric of (insight as any).metrics ?? []) {
-        if (metric.sourceTable) tableNames.add(metric.sourceTable);
+      for (const metric of (insight as any)?.metrics ?? []) {
+        if (metric?.sourceTable) tableNames.add(metric.sourceTable);
       }
     }
 
