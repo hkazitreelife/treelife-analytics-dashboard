@@ -183,6 +183,7 @@ export interface File {
   sha256?: string | null;
   storagePath?: string | null;
   uploadedBy?: (number | null) | User;
+  dataBase64?: string | null;
   updatedAt: string;
   createdAt: string;
   url?: string | null;
@@ -580,6 +581,7 @@ export interface FilesSelect<T extends boolean = true> {
   sha256?: T;
   storagePath?: T;
   uploadedBy?: T;
+  dataBase64?: T;
   updatedAt?: T;
   createdAt?: T;
   url?: T;

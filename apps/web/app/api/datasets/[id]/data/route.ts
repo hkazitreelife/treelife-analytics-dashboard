@@ -86,13 +86,41 @@ export async function GET(
       const normalizedTables: StoredTable[] = rawTables.map((t: any) => {
         const tableName = t.tableName || t.name || "Data";
         const tableRole = t.tableRole || "dimension";
-        const rawCols = Array.isArray(t.columns) ? t.columns : [];
-        const columns = rawCols.map((c: any) =>
-          typeof c === "string"
-            ? { name: c, inferredType: "string" }
-            : { name: c?.name || "col", inferredType: c?.inferredType || "string" },
-        );
         const rows = Array.isArray(t.rows) ? t.rows : [];
+        const rawCols = Array.isArray(t.columns) ? t.columns : [];
+        const columns = rawCols.map((c: any) => {
+          const name = typeof c === "string" ? c : c?.name || "col";
+          let inferredType =
+            typeof c === "string" ? "string" : c?.inferredType || "string";
+
+          if (inferredType === "string" || inferredType === "text" || !inferredType) {
+            const sampleVals = rows
+              .slice(0, 30)
+              .map((r: any) => r[name])
+              .filter(
+                (v: any) =>
+                  v !== null && v !== undefined && String(v).trim() !== "",
+              );
+            if (sampleVals.length > 0) {
+              const numCount = sampleVals.filter((v: any) => {
+                if (typeof v === "number") return !isNaN(v);
+                if (typeof v === "string") {
+                  const clean = v
+                    .replace(/[$€£¥₹\s,%]/g, "")
+                    .replace(/\((.*)\)/, "-$1");
+                  return clean.length > 0 && !isNaN(Number(clean));
+                }
+                return false;
+              }).length;
+              if (numCount >= sampleVals.length * 0.5) {
+                inferredType = "numeric";
+              }
+            }
+          }
+
+          return { name, inferredType };
+        });
+
         return { tableName, tableRole, columns, rows };
       });
 

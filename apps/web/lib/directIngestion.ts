@@ -1,12 +1,75 @@
 import * as XLSX from "xlsx";
 import type { Payload } from "payload";
 
+export interface ParsedColumn {
+  name: string;
+  inferredType: "numeric" | "date" | "boolean" | "id" | "categorical" | "text";
+}
+
 export interface ParsedTable {
   name: string;
   columns: string[];
+  columnsWithTypes: ParsedColumn[];
   rowCount: number;
   sampleRows: any[];
   allRows: any[];
+}
+
+export function inferColumnType(
+  values: unknown[],
+): "numeric" | "date" | "boolean" | "id" | "categorical" | "text" {
+  const nonNull = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
+  if (nonNull.length === 0) return "text";
+
+  let numericCount = 0;
+  let dateCount = 0;
+  let boolCount = 0;
+
+  for (const val of nonNull) {
+    if (
+      typeof val === "boolean" ||
+      val === "true" ||
+      val === "false" ||
+      val === "TRUE" ||
+      val === "FALSE"
+    ) {
+      boolCount++;
+      continue;
+    }
+    if (typeof val === "number" && !isNaN(val)) {
+      numericCount++;
+      continue;
+    }
+    if (typeof val === "string") {
+      const clean = val.replace(/[$€£¥₹\s,%]/g, "").replace(/\((.*)\)/, "-$1");
+      const parsed = Number.parseFloat(clean);
+      if (!isNaN(parsed) && Number.isFinite(parsed)) {
+        numericCount++;
+        continue;
+      }
+      if (
+        !/^\d+$/.test(val) &&
+        !isNaN(Date.parse(val)) &&
+        val.length > 5 &&
+        (val.includes("-") || val.includes("/"))
+      ) {
+        dateCount++;
+        continue;
+      }
+    }
+  }
+
+  const threshold = nonNull.length * 0.5;
+  if (numericCount >= threshold) return "numeric";
+  if (boolCount >= threshold) return "boolean";
+  if (dateCount >= threshold) return "date";
+
+  const unique = new Set(nonNull.map((v) => String(v).trim()));
+  if (unique.size <= 25 || unique.size < nonNull.length * 0.4) {
+    return "categorical";
+  }
+
+  return "text";
 }
 
 export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
@@ -17,18 +80,76 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) continue;
 
-    const rawRows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: null });
-    if (rawRows.length === 0) continue;
+    const aoa = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, defval: "" });
+    if (aoa.length === 0) continue;
 
-    const columns = Object.keys(rawRows[0] || {});
-    if (columns.length === 0) continue;
+    // Detect header row index (row with the most non-empty string headers in the first 6 rows)
+    let headerRowIdx = 0;
+    let maxCols = 0;
+    for (let r = 0; r < Math.min(6, aoa.length); r++) {
+      const row = aoa[r];
+      if (!Array.isArray(row)) continue;
+      const validHeaders = row.filter(
+        (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
+      );
+      if (validHeaders.length > maxCols) {
+        maxCols = validHeaders.length;
+        headerRowIdx = r;
+      }
+    }
+
+    const headerRow = aoa[headerRowIdx] || [];
+    const headers: string[] = [];
+    for (let c = 0; c < headerRow.length; c++) {
+      const val = String(headerRow[c] || "").trim();
+      const colName = val.length > 0 ? val : `Column_${c + 1}`;
+      let uniqueName = colName;
+      let counter = 1;
+      while (headers.includes(uniqueName)) {
+        uniqueName = `${colName}_${counter++}`;
+      }
+      headers.push(uniqueName);
+    }
+
+    if (headers.length === 0) continue;
+
+    const rows: Record<string, any>[] = [];
+    for (let r = headerRowIdx + 1; r < aoa.length; r++) {
+      const row = aoa[r];
+      if (!Array.isArray(row)) continue;
+      const isBlank = row.every(
+        (cell) => cell === null || cell === undefined || String(cell).trim() === "",
+      );
+      if (isBlank) continue;
+
+      const rowObj: Record<string, any> = {};
+      let hasData = false;
+      for (let c = 0; c < headers.length; c++) {
+        const h = headers[c]!;
+        const cell = row[c];
+        rowObj[h] = cell !== undefined && cell !== "" ? cell : null;
+        if (rowObj[h] !== null) hasData = true;
+      }
+      if (hasData) {
+        rows.push(rowObj);
+      }
+    }
+
+    if (rows.length === 0) continue;
+
+    const columnsWithTypes: ParsedColumn[] = headers.map((colName) => {
+      const sampleVals = rows.slice(0, 100).map((r) => r[colName]);
+      const inferredType = inferColumnType(sampleVals);
+      return { name: colName, inferredType };
+    });
 
     tables.push({
       name: sheetName,
-      columns,
-      rowCount: rawRows.length,
-      sampleRows: rawRows.slice(0, 10),
-      allRows: rawRows,
+      columns: headers,
+      columnsWithTypes,
+      rowCount: rows.length,
+      sampleRows: rows.slice(0, 10),
+      allRows: rows,
     });
   }
 
@@ -229,7 +350,7 @@ export async function processIngestionDirectly(
           tables: tables.map((t) => ({
             tableName: t.name,
             tableRole: "dimension",
-            columns: t.columns.map((c) => ({ name: c, inferredType: "string" })),
+            columns: t.columnsWithTypes,
             rows: t.allRows,
           })),
         } as any,

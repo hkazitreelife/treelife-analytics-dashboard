@@ -98,6 +98,18 @@ const applyAggregation = (
     return sum / values.length;
   }
 
+  if ((aggregation as string) === "min") {
+    return Math.min(...values);
+  }
+
+  if ((aggregation as string) === "max") {
+    return Math.max(...values);
+  }
+
+  if ((aggregation as string) === "percentage") {
+    return sum / (values.length || 1);
+  }
+
   // "none" on a single-value widget behaves as a sum of what was found.
   return sum;
 };
@@ -113,9 +125,10 @@ export const resolveChartFields = (
   const typeByName = new Map(columns.map((c) => [c.name, c.inferredType]));
   const present = fields.filter((field) => typeByName.has(field));
 
-  const measureFields = present.filter(
-    (field) => typeByName.get(field) === "numeric",
-  );
+  const measureFields = present.filter((field) => {
+    const type = typeByName.get(field);
+    return type === "numeric" || type === "number" || type === "integer" || type === "float";
+  });
 
   const categoryField =
     present.find((field) => {
@@ -355,10 +368,30 @@ export const computeKpi = (
     };
   }
 
-  const field = measureFields[0] ?? null;
+  let field = measureFields[0] ?? null;
+
+  if (!field && fields.length > 0) {
+    for (const candidate of fields) {
+      const hasNumeric = targetRows.some((row) => toNumber(row[candidate]) !== null);
+      if (hasNumeric) {
+        field = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!field && fields.length > 0) {
+    const sampleVals = targetRows.map((r) => r[fields[0]!]).filter((v) => !isBlank(v));
+    if (sampleVals.length > 0) {
+      const numericVals = sampleVals.map(toNumber).filter((v): v is number => v !== null);
+      if (numericVals.length > 0) {
+        field = fields[0]!;
+      }
+    }
+  }
 
   if (!field) {
-    return { kind: "not-numeric", field: fields[0]! };
+    return { kind: "not-numeric", field: fields[0] || "value" };
   }
 
   const values = targetRows
