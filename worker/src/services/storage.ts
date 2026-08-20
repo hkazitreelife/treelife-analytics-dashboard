@@ -5,6 +5,7 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
+import type { Pool } from "pg";
 
 /**
  * Initializes S3 client with support for AWS S3, Cloudflare R2, and local S3 emulators.
@@ -30,10 +31,11 @@ export const getS3Client = (): S3Client | null => {
 };
 
 /**
- * Downloads a file buffer from S3/R2 storage, or falls back to local media directory.
+ * Downloads a file buffer from S3/R2 storage, or falls back to database / local media directory.
  */
 export const downloadFileBuffer = async (
   fileKeyOrFilename: string,
+  pgPool?: Pool,
 ): Promise<{ buffer: Buffer; contentType?: string; size: number }> => {
   const s3 = getS3Client();
   const bucket = process.env.S3_BUCKET;
@@ -73,7 +75,35 @@ export const downloadFileBuffer = async (
       };
     } catch (err: unknown) {
       console.warn(
-        `[Storage] S3 download failed for key "${s3Key}", checking local media fallback:`,
+        `[Storage] S3 download failed for key "${s3Key}", checking database / local media fallback:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  // Database fallback: read base64 file data stored directly in PostgreSQL
+  if (pgPool) {
+    try {
+      const dbRes = await pgPool.query(
+        `SELECT data_base64, filename, mime_type 
+         FROM files 
+         WHERE id::text = $1 OR filename = $1 OR storage_path = $1 OR sha256 = $1
+         LIMIT 1`,
+        [fileKeyOrFilename],
+      );
+
+      if (dbRes.rows.length > 0 && dbRes.rows[0].data_base64) {
+        const base64Str = dbRes.rows[0].data_base64;
+        const buffer = Buffer.from(base64Str, "base64");
+        return {
+          buffer,
+          contentType: dbRes.rows[0].mime_type || "application/octet-stream",
+          size: buffer.length,
+        };
+      }
+    } catch (err: unknown) {
+      console.warn(
+        `[Storage] Database fallback check failed:`,
         err instanceof Error ? err.message : String(err),
       );
     }
@@ -99,6 +129,6 @@ export const downloadFileBuffer = async (
   }
 
   throw new Error(
-    `File "${fileKeyOrFilename}" could not be found in S3 bucket or local media directories.`,
+    `File "${fileKeyOrFilename}" could not be found in S3 bucket, PostgreSQL database, or local media directories.`,
   );
 };

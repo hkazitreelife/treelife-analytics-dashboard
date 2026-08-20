@@ -99,7 +99,7 @@ const processDatasetIngestionJob = async (job: Job<DatasetIngestionJobData>): Pr
     // Step 2: Download file buffer from S3 / Cloudflare R2
     const targetKey = fileKey || fileName || fileId;
     console.log(`[Worker] 📥 Downloading file "${targetKey}" from storage...`);
-    const { buffer } = await downloadFileBuffer(targetKey);
+    const { buffer } = await downloadFileBuffer(targetKey, pgPool);
 
     // Step 3: Parse spreadsheet data
     console.log(`[Worker] 📊 Parsing spreadsheet workbook tables...`);

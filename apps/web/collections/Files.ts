@@ -1,3 +1,5 @@
+import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -7,7 +9,17 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const mediaDirectory = process.env.MEDIA_DIR
   ? path.resolve(process.env.MEDIA_DIR)
-  : path.resolve(dirname, "../media");
+  : process.env.VERCEL
+    ? path.join(os.tmpdir(), "media")
+    : path.resolve(dirname, "../media");
+
+try {
+  if (!fs.existsSync(mediaDirectory)) {
+    fs.mkdirSync(mediaDirectory, { recursive: true });
+  }
+} catch {
+  // Ignore in read-only environment
+}
 
 const ALLOWED_MIME_TYPES = [
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -36,6 +48,7 @@ export const Files: CollectionConfig = {
   upload: {
     staticDir: mediaDirectory,
     mimeTypes: ALLOWED_MIME_TYPES,
+    disableLocalStorage: Boolean(process.env.S3_BUCKET),
   },
   fields: [
     {
@@ -54,6 +67,13 @@ export const Files: CollectionConfig = {
       name: "uploadedBy",
       type: "relationship",
       relationTo: "users",
+    },
+    {
+      name: "dataBase64",
+      type: "textarea",
+      admin: {
+        hidden: true,
+      },
     },
   ],
 };

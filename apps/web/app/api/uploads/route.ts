@@ -134,6 +134,7 @@ export async function POST(request: Request): Promise<Response> {
         data: {
           sha256: hash,
           uploadedBy: user.id,
+          dataBase64: bytes.toString("base64"),
         },
         file: {
           data: bytes,
@@ -273,6 +274,7 @@ export async function POST(request: Request): Promise<Response> {
       data: {
         sha256: hash,
         uploadedBy: user.id,
+        dataBase64: bytes.toString("base64"),
       },
       file: {
         data: bytes,
