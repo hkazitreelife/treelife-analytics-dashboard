@@ -2,3 +2,14 @@ packages:
   - "apps/*"
   - "packages/*"
   - "worker"
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+
+onlyBuiltDependencies:
+  - "@google/genai"
+  - "esbuild"
+  - "msgpackr-extract"
+  - "protobufjs"
+  - "sharp"
