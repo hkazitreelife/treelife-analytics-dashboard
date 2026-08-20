@@ -13,6 +13,7 @@
     "worker": "pnpm --filter worker dev"
   },
   "devDependencies": {
+    "next": "~15.4.11",
     "typescript": "^7.0.2"
   }
 }
