@@ -341,36 +341,44 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
 
+    // Direct in-process ingestion using uploaded file buffer
+    let ingestionSuccessful = false;
     try {
-      await enqueueIngestion({
-        jobId: String(job.id),
-        fileId: String(created.id),
-        datasetId: String(dataset.id),
-        fileHash: hash,
-      });
-    } catch (queueErr) {
-      console.warn("[Uploads] BullMQ enqueue warning:", queueErr);
+      await processIngestionDirectly(
+        payload,
+        job.id,
+        dataset.id,
+        bytes,
+        uploaded.name,
+        intentPrompt,
+      );
+      ingestionSuccessful = true;
+    } catch (ingestErr) {
+      console.warn("[Uploads] Direct ingestion error, falling back to BullMQ:", ingestErr);
     }
 
-    // Direct in-process ingestion using uploaded file buffer
-    processIngestionDirectly(
-      payload,
-      job.id,
-      dataset.id,
-      bytes,
-      uploaded.name,
-      intentPrompt,
-    ).catch((err) => console.error("[Uploads] Direct ingestion execution error:", err));
+    if (!ingestionSuccessful) {
+      try {
+        await enqueueIngestion({
+          jobId: String(job.id),
+          fileId: String(created.id),
+          datasetId: String(dataset.id),
+          fileHash: hash,
+        });
+      } catch (queueErr) {
+        console.warn("[Uploads] BullMQ enqueue warning:", queueErr);
+      }
+    }
 
     return Response.json(
       {
         jobId: String(job.id),
         fileId: String(created.id),
         datasetId: String(dataset.id),
-        status: "queued",
+        status: ingestionSuccessful ? "completed" : "queued",
         requiresUserChoice: false,
       },
-      { status: 202 },
+      { status: ingestionSuccessful ? 200 : 202 },
     );
   } catch (error: unknown) {
     payload.logger.error({ err: error }, "Upload failed.");
