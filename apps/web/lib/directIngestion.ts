@@ -189,22 +189,28 @@ export async function processIngestionDirectly(
       try {
         const tableSummary = tables.map((t) => ({
           sheet: t.name,
-          columns: t.columns,
+          columns: t.columnsWithTypes.map((c) => `${c.name} (${c.inferredType})`),
           rowCount: t.rowCount,
-          sampleRows: t.sampleRows.slice(0, 3),
+          sampleRows: t.sampleRows.slice(0, 2),
         }));
 
         const prompt = [
           "You are an executive business intelligence analytics architect.",
-          "Design a rich dashboard configuration in JSON for the uploaded dataset.",
+          "Design a rich, multi-tab executive dashboard configuration in JSON for this uploaded dataset.",
           `Filename: ${filename}`,
-          `Tables & Columns: ${JSON.stringify(tableSummary, null, 2)}`,
+          `Clean Tables & Typed Columns: ${JSON.stringify(tableSummary, null, 2)}`,
           intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
+          "",
+          "CRITICAL RULES:",
+          "1. Use ONLY the exact column names listed above for each table. Never invent column names.",
+          "2. For numeric KPIs (avg, sum), select numeric columns.",
+          "3. For charts, select categorical/date columns for X-axis and numeric columns for measures.",
+          "4. For multi-table datasets, organize widgets across logical tabs (e.g. Overview, Detailed Breakdown, Trends).",
           "",
           "Return ONLY valid JSON matching this schema:",
           "{",
           '  "title": "Executive Dashboard Title",',
-          '  "description": "Executive summary of findings",',
+          '  "description": "Comprehensive executive summary",',
           '  "tabs": [',
           "    {",
           '      "tabId": "overview",',
@@ -213,20 +219,11 @@ export async function processIngestionDirectly(
           "        {",
           '          "widgetId": "w1",',
           '          "type": "kpi_card",',
-          '          "title": "Total Records",',
-          `          "sourceTable": "${tables[0]?.name || "Sheet1"}",`,
+          '          "title": "Total Volume",',
+          `          "sourceTable": "${tables[0]?.name || "Data"}",`,
           `          "fields": ["${tables[0]?.columns[0] || "id"}"],`,
           '          "aggregation": "count",',
           '          "position": { "col": 0, "row": 0, "w": 4, "h": 2 }',
-          "        },",
-          "        {",
-          '          "widgetId": "w2",',
-          '          "type": "bar_chart",',
-          '          "title": "Distribution",',
-          `          "sourceTable": "${tables[0]?.name || "Sheet1"}",`,
-          `          "fields": ["${tables[0]?.columns[0] || "category"}", "${tables[0]?.columns[1] || "value"}"],`,
-          '          "aggregation": "sum",',
-          '          "position": { "col": 4, "row": 0, "w": 8, "h": 4 }',
           "        }",
           "      ]",
           "    }",
@@ -236,14 +233,16 @@ export async function processIngestionDirectly(
           '      "insightId": "ins1",',
           `      "finding": "Dataset contains ${totalRows} records across ${tables.length} table(s).",`,
           '      "whyItMatters": "Core business baseline established.",',
-          '      "severity": "positive"',
+          '      "severity": "positive",',
+          '      "relatedTables": [],',
+          '      "metrics": []',
           "    }",
           "  ]",
           "}",
         ].join("\n");
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
+        const timeout = setTimeout(() => controller.abort(), 25000);
 
         const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
@@ -254,6 +253,7 @@ export async function processIngestionDirectly(
           body: JSON.stringify({
             model: "anthropic/claude-sonnet-5",
             messages: [{ role: "user", content: prompt }],
+            max_tokens: 3500,
           }),
           signal: controller.signal,
         });
