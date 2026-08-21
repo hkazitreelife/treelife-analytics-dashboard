@@ -213,7 +213,15 @@ export const createClaudeConfigEditClient = (
           const llmRes = await callLlmCompletion({
             apiKey,
             model: activeModel,
-            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching the complete edited dashboard configuration: {"title": string, "description": string, "tabs": Array<{ "tabId": string, "tabName": string, "widgets": Array<{"widgetId": string, "type": "kpi_card"|"bar"|"horizontal_bar"|"line"|"pie", "title": string, "sourceTable": string, "fields": string[], "aggregation": "sum"|"count"|"avg"|"distinct"|"none", "position": {"col": number, "row": number, "w": number, "h": number}}> }>, "insights": Array<{"insightId": string, "finding": string, "whyItMatters": string, "recommendedAction": string, "severity": "positive"|"warning"|"negative"|"info", "presentation": {"shape": "tracker-item", "status": string, "owner": string}, "relatedTables": string[], "metrics": Array<any>}>}.`,
+            // Same rule as claudeChatClient.ts's OpenRouter branch: this must
+            // stay byte-for-byte in sync with dashboardConfigSchema. The
+            // previous hand-copied description typed insights.metrics as
+            // Array<any>, which doesn't actively mislead the model the way
+            // the chat clients' copies did, but also gives it no guidance on
+            // the required kind:"aggregate"|"row" discriminator -- the same
+            // latent failure mode, just not yet triggered. Serializing the
+            // real tool schema removes the second copy that could drift.
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema for the complete edited dashboard configuration: ${JSON.stringify(dashboardConfigToolSchema)}`,
             userPrompt: [
               "Current dashboard config:",
               JSON.stringify(currentConfig),

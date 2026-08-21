@@ -164,7 +164,14 @@ export const createSessionChatClient = (
           const llmRes = await callLlmCompletion({
             apiKey,
             model: activeModel,
-            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching this schema: {"directAnswer": string, "datasetSources": Array<{"datasetId": string, "tableName": string, "metrics": Array<{"label": string, "sourceTable": string, "sourceField": string, "aggregation": "sum"|"avg"|"count"|"min"|"max"}>}>, "documentSources": Array<{"documentId": string, "sectionHeading": string, "quotedExcerpt": string}>, "synthesisFinding": string}.`,
+            // Same rule as claudeChatClient.ts: this must stay byte-for-byte
+            // in sync with sessionChatAnswerSchema. The previous hand-copied
+            // description here named entirely different fields
+            // (datasetSources/documentSources/synthesisFinding) than the
+            // real schema (metrics/citations/caveats), so every OpenRouter
+            // session-chat answer failed validation. Serializing the actual
+            // tool schema removes the second copy that could drift.
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(sessionChatAnswerToolSchema)}`,
             userPrompt: [
               "Datasets in this session (metadata + parsed table rows, capped at first 500 rows per table):",
               JSON.stringify(
@@ -209,9 +216,9 @@ export const createSessionChatClient = (
 
           parsedInput = llmRes.jsonContent || {
             directAnswer: llmRes.rawContent || "Analysis complete.",
-            datasetSources: [],
-            documentSources: [],
-            synthesisFinding: null,
+            metrics: [],
+            citations: [],
+            caveats: undefined,
           };
         } catch (error: unknown) {
           const detail = error instanceof Error ? error.message : String(error);

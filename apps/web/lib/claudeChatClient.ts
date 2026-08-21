@@ -162,7 +162,14 @@ export const createChatClient = (
           const llmRes = await callLlmCompletion({
             apiKey,
             model: activeModel,
-            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching this schema: {"directAnswer": string, "metrics": Array<{"label": string, "sourceTable": string, "sourceField": string, "aggregation": "sum"|"avg"|"count"|"min"|"max"}>, "caveats": string[]}.`,
+            // The prompt's shape must stay byte-for-byte in sync with
+            // chatAnswerSchema (chatAnswer.ts) -- a hand-copied description
+            // drifted out of sync here (caveats as string[] instead of
+            // string, metrics missing the kind discriminator entirely) and
+            // caused every OpenRouter chat answer to fail validation twice.
+            // Serializing the real tool schema instead of hand-writing a
+            // second copy makes that class of drift impossible.
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(chatAnswerToolSchema)}`,
             userPrompt: [
               "Dataset context (structural metadata, aggregates, and parsed table rows up to 500 rows per table):",
               JSON.stringify({
@@ -194,7 +201,7 @@ export const createChatClient = (
           parsedInput = llmRes.jsonContent || {
             directAnswer: llmRes.rawContent || "Analysis complete.",
             metrics: [],
-            caveats: [],
+            caveats: undefined,
           };
         } catch (error: unknown) {
           const detail = error instanceof Error ? error.message : String(error);
