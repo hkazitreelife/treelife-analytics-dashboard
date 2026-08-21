@@ -348,6 +348,40 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
     }
   }
 
+  // Insight coverage: every sheet needs its own substantive insight, not
+  // just a shared tab -- the actual complaint this closes is "each
+  // sheet's insight isn't strong," and a model asked nicely for this
+  // (prompt rule 4) but never checked will regress to a thin dashboard
+  // the moment it's convenient. relatedTables naming exactly one sheet is
+  // what apps/web/components/dashboard/DashboardRenderer.tsx's
+  // insightsForTab uses to scope a per-sheet tab's own insights -- if no
+  // insight is tagged to a sheet this way, that sheet's tab renders with
+  // nothing, which is exactly what was reported. Also requires a floor on
+  // total insight count so the overview page (which shows every insight,
+  // unfiltered) is never left thin.
+  const singleSheetInsightTables = new Set(
+    (config.insights ?? [])
+      .filter((insight: any) => Array.isArray(insight.relatedTables) && insight.relatedTables.length === 1)
+      .map((insight: any) => insight.relatedTables[0]),
+  );
+
+  for (const table of tables) {
+    if (!singleSheetInsightTables.has(table.name)) {
+      problems.push(
+        `sheet "${table.name}" has no insight of its own (an insight with relatedTables naming exactly that one sheet) -- every sheet needs at least one substantive, sheet-specific finding`,
+      );
+    }
+  }
+
+  const minInsights = Math.max(6, tables.length + 1);
+  const insightCount = Array.isArray(config.insights) ? config.insights.length : 0;
+
+  if (insightCount < minInsights) {
+    problems.push(
+      `only ${insightCount} insight(s) total, need at least ${minInsights} (one substantive finding per sheet plus real cross-sheet insights)`,
+    );
+  }
+
   return problems;
 }
 
@@ -573,7 +607,21 @@ export async function processIngestionDirectly(
             " session (datasets plus uploaded documents) stays separated per source with one combined",
             " view on top; the same rule applies within a single workbook's sheets now.",
           ].join(""),
-          "4. QUANTIFIED INSIGHTS: Provide 4-6 high-impact executive insights citing real numbers, implications, recommended actions, and department owners with presentation shape: 'tracker-item'.",
+          [
+            "4. QUANTIFIED INSIGHTS, ONE PER SHEET MINIMUM PLUS A REAL CROSS-SHEET VIEW: You must provide at least",
+            ` one substantive insight for EVERY sheet listed above (${tables.map((t) => t.name).join(", ")}) --`,
+            " each one specific to that sheet's own data (relatedTables naming exactly that one sheet), citing a",
+            " real figure via metrics per rule 5 below, with a concrete implication and a concrete recommended",
+            " action naming who owns it. A thin, generic finding ('captures N records') is not acceptable --",
+            " every per-sheet insight must say something an executive could act on: a concentration, an outlier,",
+            " a risk, a trend, or a specific named driver, not merely a record count. In addition, provide at",
+            " least 1-2 genuine cross-sheet insights that synthesize across multiple sheets (relatedTables naming",
+            " 2 or more sheets) -- these are the strategic, executive-level findings, and must be real",
+            " connections between sheets, never a restatement of one sheet's own finding.",
+            ` Total insights must be at least ${Math.max(6, tables.length + 1)}: one substantive finding per sheet`,
+            " (each tagged to that one sheet) plus the cross-sheet ones. Every insight needs implications,",
+            " recommended actions, and department owners with presentation shape: 'tracker-item'.",
+          ].join(""),
           [
             "5. GROUNDED METRICS, NOT INVENTED NUMBERS: You have never seen a data row, only the column",
             " types and 2 sample rows per sheet above -- do not write a number directly into finding,",
@@ -1005,6 +1053,37 @@ export async function processIngestionDirectly(
         });
 
         generatedInsights.push(buildTableInsight(table, `ins_${tIdx + 1}`));
+      });
+
+      // A genuine cross-sheet insight, not just the per-table ones above --
+      // without this, even a successful fallback left the overview page
+      // (which shows every insight unfiltered, per DashboardRenderer.tsx's
+      // insightsForTab) with nothing cross-cutting to show, the same
+      // "overview is thin" gap being fixed for the AI path's own prompt
+      // rule 4. Built from real totals, not invented: which sheet holds
+      // the largest share of records, computed the same way, so it's
+      // meaningful for any dataset shape, not just this one.
+      const largestTable = [...tables].sort((a, b) => b.rowCount - a.rowCount)[0];
+      const largestShare = largestTable ? largestTable.rowCount / Math.max(totalRows, 1) : 0;
+
+      generatedInsights.unshift({
+        insightId: "ins_overview",
+        finding: `Across ${tables.length} functional area${tables.length === 1 ? "" : "s"}, ${totalRows} total records were processed. ${largestTable ? `${largestTable.name} accounts for the largest share, with ${largestTable.rowCount} records (${Math.round(largestShare * 100)}% of the total).` : ""}`,
+        whyItMatters: `The distribution of records across these ${tables.length} sheets shows where operational volume and review effort is actually concentrated, which is where a triage decision should start.`,
+        recommendedAction: `Review ${largestTable?.name ?? "the largest sheet"} first given its share of total volume, then work through the remaining sheets by size.`,
+        severity: "info",
+        presentation: {
+          shape: "tracker-item",
+          status: "Tracked",
+          owner: "Operations Lead",
+        },
+        relatedTables: tables.map((t) => t.name),
+        metrics: [
+          { label: "Total Records", value: String(totalRows) },
+          ...(largestTable
+            ? [{ label: `${largestTable.name} Records`, value: String(largestTable.rowCount) }]
+            : []),
+        ],
       });
 
       dashboardConfig = {
