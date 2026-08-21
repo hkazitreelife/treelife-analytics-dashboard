@@ -1,5 +1,13 @@
 import * as XLSX from "xlsx";
 import type { Payload } from "payload";
+import Anthropic from "@anthropic-ai/sdk";
+import {
+  buildDatasetMetadata,
+  dashboardConfigToolSchema,
+  normalizeDashboardConfigInput,
+  resolveClaudeModel,
+  type NormalizedTableShape,
+} from "@analytics/shared";
 
 export interface ParsedColumn {
   name: string;
@@ -186,144 +194,362 @@ export async function processIngestionDirectly(
     let dashboardConfig: any = null;
 
     if (apiKey) {
+      // 1. Primary path: Official Claude tool calling via @anthropic-ai/sdk (identical to worker)
       try {
-        const tableSummary = tables.map((t) => ({
-          sheet: t.name,
-          columns: t.columnsWithTypes.map((c) => `${c.name} (${c.inferredType})`),
-          rowCount: t.rowCount,
-          sampleRows: t.sampleRows.slice(0, 2),
-        }));
-
-        const prompt = [
-          "You are a Principal Executive Business Intelligence & Analytics Architect.",
-          "Transform this raw dataset into an elite, C-suite executive intelligence dashboard.",
-          `Filename: ${filename}`,
-          `Total Clean Records: ${totalRows}`,
-          `Clean Structured Tables & Columns: ${JSON.stringify(tableSummary, null, 2)}`,
-          intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
-          "",
-          "CRITICAL DESIGN ARCHITECTURE:",
-          "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
-          "2. MULTI-TAB EXECUTIVE STRUCTURE: Organize multi-table data into 3 to 4 distinct tabs (e.g. Executive Overview, Core Metrics, Trends & Dynamics, Operational Deep-dive).",
-          "3. SMART MEASURE MAPPING: Map categorical/date columns to category axis, and numeric columns to measures with proper aggregations ('sum', 'avg', 'count', 'distinct').",
-          "4. ACTIONABLE INSIGHTS WITH LIVE NUMBERS & CHECKLIST TRACKER: Provide 4-6 high-impact executive insights. Every insight MUST include:",
-          "   - `finding`: Sharp analytical finding with specific numbers/rates.",
-          "   - `whyItMatters`: The strategic business implication or risk.",
-          "   - `recommendedAction`: Concrete executive action step.",
-          "   - `severity`: 'positive' | 'warning' | 'negative' | 'info'.",
-          "   - `presentation`: { shape: 'tracker-item', status: 'Action Required' | 'In Progress' | 'Open', owner: 'Leadership' }.",
-          "   - `metrics`: [{ label: string, sourceTable: string, sourceField: string, aggregation: 'avg'|'sum'|'count' }].",
-          "",
-          "Return ONLY valid JSON matching this schema:",
-          "{",
-          '  "title": "Executive Intelligence Dashboard Title",',
-          '  "description": "High-level strategic briefing on metrics and performance",',
-          '  "tabs": [',
-          "    {",
-          '      "tabId": "executive_overview",',
-          '      "tabName": "Executive Overview",',
-          '      "widgets": [',
-          "        {",
-          '          "widgetId": "w1",',
-          '          "type": "kpi_card",',
-          '          "title": "Total Volume",',
-          `          "sourceTable": "${tables[0]?.name || "Data"}",`,
-          `          "fields": ["${tables[0]?.columns[0] || "id"}"],`,
-          '          "aggregation": "count",',
-          '          "position": { "col": 0, "row": 0, "w": 3, "h": 2 }',
-          "        }",
-          "      ]",
-          "    }",
-          "  ],",
-          '  "insights": [',
-          "    {",
-          '      "insightId": "ins1",',
-          `      "finding": "Dataset encompasses ${totalRows} active records across ${tables.length} functional areas.",`,
-          '      "whyItMatters": "Establishes baseline operational benchmarks for executive resource allocation.",',
-          '      "recommendedAction": "Align quarterly departmental targets with current baseline volumes.",',
-          '      "severity": "positive",',
-          '      "presentation": { "shape": "tracker-item", "status": "Action Required", "owner": "Executive Team" },',
-          '      "relatedTables": [],',
-          '      "metrics": []',
-          "    }",
-          "  ]",
-          "}",
-        ].join("\n");
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-
-        const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "anthropic/claude-sonnet-5",
-            messages: [{ role: "user", content: prompt }],
-            max_tokens: 3500,
-          }),
-          signal: controller.signal,
+        const client = new Anthropic({
+          apiKey,
+          baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
         });
 
-        clearTimeout(timeout);
+        const normalizedTables: NormalizedTableShape[] = tables.map((t) => ({
+          tableName: t.name,
+          tableRole: "data" as const,
+          headerRowIndex: 0,
+          columns: t.columnsWithTypes.map((c) => ({
+            name: c.name,
+            inferredType: c.inferredType,
+            nullable: true,
+            sampleValues: (t.sampleRows || []).slice(0, 5).map((r) => String(r[c.name] ?? "")),
+          })),
+          rows: t.allRows || t.sampleRows || [],
+          rowHash: `hash_${t.name}`,
+        }));
 
-        if (openRouterRes.ok) {
-          const aiData = await openRouterRes.json();
-          const rawText = aiData.choices?.[0]?.message?.content || "";
-          const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, rawText];
-          const clean = jsonMatch[1]?.trim() || rawText.trim();
-          dashboardConfig = JSON.parse(clean);
+        const metadata = buildDatasetMetadata(
+          String(datasetId),
+          filename,
+          normalizedTables,
+          [],
+        );
+
+        const modelName = resolveClaudeModel(
+          process.env.ANTHROPIC_CONFIG_MODEL || "claude-sonnet-5",
+        );
+
+        const response = await client.messages.create({
+          model: modelName,
+          max_tokens: 16000,
+          system: [
+            "You are a Principal Executive Business Intelligence & Analytics Architect.",
+            "Design a comprehensive multi-tab executive dashboard configuration and strategic insights for this dataset.",
+            "STRICT RULES:",
+            "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
+            "2. MULTI-TAB ARCHITECTURE: If the dataset has multiple distinct domain sheets (e.g. Reconciliation Summary, Missing in 2B, In 2B Not in Books, Matched, Credit & Debit Notes), generate a dedicated tab for each domain in addition to an Executive Overview tab.",
+            "3. ACTIONABLE INSIGHTS WITH LIVE METRICS & CHECKLISTS: Produce 4 to 6 quantified insights citing real metrics, business implications, recommended action steps, and assigned owners with presentation shape: 'tracker-item'.",
+            "4. You must call the emit_dashboard_config tool exactly once.",
+          ].join("\n"),
+          tools: [
+            {
+              name: "emit_dashboard_config",
+              description: "Emit the dashboard configuration and insights for this dataset.",
+              input_schema: dashboardConfigToolSchema,
+            },
+          ],
+          tool_choice: { type: "tool", name: "emit_dashboard_config" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
+                `Dataset Metadata:\n${JSON.stringify(metadata, null, 2)}`,
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+            },
+          ],
+        });
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+        );
+
+        if (toolUse && toolUse.input) {
+          const normalized = normalizeDashboardConfigInput(toolUse.input);
+          dashboardConfig = normalized;
+          console.log("[DirectIngestion] Dashboard generated successfully via Anthropic tool calling");
         }
-      } catch (aiErr: unknown) {
-        console.warn("[DirectIngestion] AI generation fallback:", aiErr);
+      } catch (anthropicErr) {
+        console.warn("[DirectIngestion] Anthropic SDK call failed, attempting fallback:", anthropicErr);
+      }
+
+      // 2. Secondary path: Multi-model OpenRouter completions
+      if (!dashboardConfig || !Array.isArray(dashboardConfig.tabs) || dashboardConfig.tabs.length === 0) {
+        try {
+          const tableSummary = tables.map((t) => ({
+            sheet: t.name,
+            columns: t.columnsWithTypes.map((c) => `${c.name} (${c.inferredType})`),
+            rowCount: t.rowCount,
+            sampleRows: t.sampleRows.slice(0, 2),
+          }));
+
+          const prompt = [
+            "You are a Principal Executive Business Intelligence & Analytics Architect.",
+            "Transform this raw dataset into an elite, C-suite executive intelligence dashboard.",
+            `Filename: ${filename}`,
+            `Total Clean Records: ${totalRows}`,
+            `Clean Structured Tables & Columns: ${JSON.stringify(tableSummary, null, 2)}`,
+            intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
+            "",
+            "CRITICAL DESIGN ARCHITECTURE:",
+            "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
+            "2. MULTI-TAB EXECUTIVE STRUCTURE: Organize multi-table data into distinct tabs for every sheet domain.",
+            "3. SMART MEASURE MAPPING: Map categorical/date columns to category axis, and numeric columns to measures.",
+            "4. ACTIONABLE INSIGHTS WITH LIVE NUMBERS & CHECKLIST TRACKER: Provide 4-6 high-impact executive insights with specific numbers and action items.",
+            "",
+            "Return ONLY valid JSON matching schema with { title, description, tabs, insights }.",
+          ].join("\n");
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 35000);
+
+          const modelsToTry = [
+            "anthropic/claude-sonnet-5",
+            "google/gemini-2.5-flash",
+            "openai/gpt-4o",
+          ];
+
+          for (const modelId of modelsToTry) {
+            try {
+              const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  model: modelId,
+                  messages: [{ role: "user", content: prompt }],
+                  max_tokens: 4000,
+                }),
+                signal: controller.signal,
+              });
+
+              if (openRouterRes.ok) {
+                const aiData = await openRouterRes.json();
+                const rawText = aiData.choices?.[0]?.message?.content || "";
+                const jsonMatch =
+                  rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, rawText];
+                const clean = jsonMatch[1]?.trim() || rawText.trim();
+                const parsed = JSON.parse(clean);
+                if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
+                  dashboardConfig = normalizeDashboardConfigInput(parsed);
+                  console.log(`[DirectIngestion] Dashboard generated successfully using ${modelId}`);
+                  break;
+                }
+              }
+            } catch (modelErr) {
+              console.warn(`[DirectIngestion] Model ${modelId} failed:`, modelErr);
+            }
+          }
+
+          clearTimeout(timeout);
+        } catch (aiErr: unknown) {
+          console.warn("[DirectIngestion] OpenRouter fallback error:", aiErr);
+        }
       }
     }
 
-    // Default structured layout if AI is unavailable or fails
-    if (!dashboardConfig || !dashboardConfig.tabs) {
-      const firstTable = tables[0];
-      const col1 = firstTable?.columns[0] || "Category";
-      const col2 = firstTable?.columns[1] || "Value";
+    // Intelligent Multi-Sheet Synthesis if AI was unavailable
+    if (!dashboardConfig || !Array.isArray(dashboardConfig.tabs) || dashboardConfig.tabs.length === 0) {
+      console.log("[DirectIngestion] Building multi-sheet synthesized executive dashboard");
+
+      const generatedTabs: any[] = [];
+      const generatedInsights: any[] = [];
+
+      // 1. Executive Overview Tab
+      const overviewWidgets: any[] = [];
+      tables.slice(0, 4).forEach((table, idx) => {
+        const numCol = table.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
+        const catCol = table.columnsWithTypes.find(
+          (c) => c.inferredType === "categorical" || c.inferredType === "text" || c.inferredType === "id",
+        )?.name || table.columns[0];
+
+        overviewWidgets.push({
+          widgetId: `ov_kpi_${idx + 1}`,
+          type: "kpi_card",
+          title: numCol ? `Total ${numCol} (${table.name})` : `${table.name} Count`,
+          sourceTable: table.name,
+          fields: [numCol || catCol || "id"],
+          aggregation: numCol ? "sum" : "count",
+          position: { col: idx * 3, row: 0, w: 3, h: 2 },
+        });
+      });
+
+      if (tables[0]) {
+        const t0 = tables[0];
+        const catCol = t0.columnsWithTypes.find((c) => c.inferredType === "categorical")?.name || t0.columns[0];
+        const numCol = t0.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
+
+        overviewWidgets.push({
+          widgetId: "ov_chart_1",
+          type: "bar",
+          title: `${t0.name} Breakdown by ${catCol || "Category"}`,
+          sourceTable: t0.name,
+          fields: numCol && catCol ? [catCol, numCol] : [catCol || "Category"],
+          aggregation: numCol ? "sum" : "count",
+          position: { col: 0, row: 2, w: 6, h: 4 },
+        });
+      }
+
+      if (tables[1] || tables[0]) {
+        const t1 = tables[1] || tables[0];
+        const dateCol = t1.columnsWithTypes.find((c) => c.inferredType === "date")?.name;
+        const catCol = t1.columnsWithTypes.find((c) => c.inferredType === "categorical")?.name || t1.columns[1] || t1.columns[0];
+        const numCol = t1.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
+
+        overviewWidgets.push({
+          widgetId: "ov_chart_2",
+          type: dateCol ? "line" : "horizontal_bar",
+          title: `${t1.name} ${dateCol ? "Trend" : "Distribution"}`,
+          sourceTable: t1.name,
+          fields: dateCol && numCol ? [dateCol, numCol] : catCol && numCol ? [catCol, numCol] : [catCol || "Category"],
+          aggregation: numCol ? "sum" : "count",
+          position: { col: 6, row: 2, w: 6, h: 4 },
+        });
+      }
+
+      generatedTabs.push({
+        tabId: "executive_overview",
+        tabName: "Executive Overview",
+        widgets: overviewWidgets,
+      });
+
+      // 2. Specialized Tab for each Sheet
+      tables.forEach((table, tIdx) => {
+        const widgets: any[] = [];
+        const numCols = table.columnsWithTypes.filter((c) => c.inferredType === "numeric");
+        const catCols = table.columnsWithTypes.filter(
+          (c) => c.inferredType === "categorical" || c.inferredType === "text" || c.inferredType === "id",
+        );
+        const dateCols = table.columnsWithTypes.filter((c) => c.inferredType === "date");
+
+        // KPI 1: Record Count
+        widgets.push({
+          widgetId: `t_${tIdx + 1}_kpi_1`,
+          type: "kpi_card",
+          title: `${table.name} Volume`,
+          sourceTable: table.name,
+          fields: [table.columns[0] || "id"],
+          aggregation: "count",
+          position: { col: 0, row: 0, w: 4, h: 2 },
+        });
+
+        // KPI 2: Sum / Avg Metric
+        if (numCols[0]) {
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_kpi_2`,
+            type: "kpi_card",
+            title: `Total ${numCols[0].name}`,
+            sourceTable: table.name,
+            fields: [numCols[0].name],
+            aggregation: "sum",
+            position: { col: 4, row: 0, w: 4, h: 2 },
+          });
+        }
+
+        // KPI 3: Avg Metric or Distinct
+        if (numCols[1] || numCols[0]) {
+          const colToUse = numCols[1] || numCols[0];
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_kpi_3`,
+            type: "kpi_card",
+            title: `Average ${colToUse.name}`,
+            sourceTable: table.name,
+            fields: [colToUse.name],
+            aggregation: "avg",
+            position: { col: 8, row: 0, w: 4, h: 2 },
+          });
+        } else if (catCols[0]) {
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_kpi_3`,
+            type: "kpi_card",
+            title: `Distinct ${catCols[0].name}`,
+            sourceTable: table.name,
+            fields: [catCols[0].name],
+            aggregation: "distinct",
+            position: { col: 8, row: 0, w: 4, h: 2 },
+          });
+        }
+
+        // Chart 1: Categorical Bar / Distribution
+        const xCol = catCols[0]?.name || table.columns[0];
+        const yCol = numCols[0]?.name;
+        widgets.push({
+          widgetId: `t_${tIdx + 1}_chart_1`,
+          type: "bar",
+          title: `${table.name} by ${xCol || "Category"}`,
+          sourceTable: table.name,
+          fields: yCol && xCol ? [xCol, yCol] : [xCol || "Category"],
+          aggregation: yCol ? "sum" : "count",
+          position: { col: 0, row: 2, w: 6, h: 4 },
+        });
+
+        // Chart 2: Trend Line or Horizontal Bar
+        if (dateCols[0] && numCols[0]) {
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_chart_2`,
+            type: "line",
+            title: `${numCols[0].name} Trend over ${dateCols[0].name}`,
+            sourceTable: table.name,
+            fields: [dateCols[0].name, numCols[0].name],
+            aggregation: "sum",
+            position: { col: 6, row: 2, w: 6, h: 4 },
+          });
+        } else if (catCols[1] || numCols[1]) {
+          const secondX = catCols[1]?.name || catCols[0]?.name || table.columns[1] || table.columns[0];
+          const secondY = numCols[1]?.name || numCols[0]?.name;
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_chart_2`,
+            type: "horizontal_bar",
+            title: `${table.name} Analysis (${secondX})`,
+            sourceTable: table.name,
+            fields: secondY && secondX ? [secondX, secondY] : [secondX || "Category"],
+            aggregation: secondY ? "avg" : "count",
+            position: { col: 6, row: 2, w: 6, h: 4 },
+          });
+        } else {
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_chart_2`,
+            type: "pie",
+            title: `${table.name} Share Distribution`,
+            sourceTable: table.name,
+            fields: [xCol || "Category"],
+            aggregation: "count",
+            position: { col: 6, row: 2, w: 6, h: 4 },
+          });
+        }
+
+        generatedTabs.push({
+          tabId: `tab_${tIdx + 1}`,
+          tabName: table.name,
+          widgets,
+        });
+
+        // Generate dynamic insight for this sheet
+        generatedInsights.push({
+          insightId: `ins_${tIdx + 1}`,
+          finding: `${table.name} captures ${table.rowCount} records with ${numCols.length} key metric measures.`,
+          whyItMatters: `Provides granular operational visibility into ${table.name.toLowerCase()} trends and performance.`,
+          recommendedAction: `Review ${table.name.toLowerCase()} variance during executive operations review.`,
+          severity: tIdx % 2 === 0 ? "positive" : "warning",
+          presentation: {
+            shape: "tracker-item",
+            status: tIdx === 0 ? "Tracked" : "Action Required",
+            owner: "Operations Lead",
+          },
+          relatedTables: [table.name],
+          metrics: [
+            { label: `${table.name} Rows`, value: String(table.rowCount) },
+            ...(numCols[0] ? [{ label: `Measure: ${numCols[0].name}`, value: "Active" }] : []),
+          ],
+        });
+      });
 
       dashboardConfig = {
-        title: `${filename.replace(/\.[^/.]+$/, "")} Analytics`,
-        description: `Automated executive analytics for ${totalRows} records.`,
-        tabs: [
-          {
-            tabId: "overview",
-            tabName: "Executive Overview",
-            widgets: [
-              {
-                widgetId: "kpi_total",
-                type: "kpi_card",
-                title: "Total Volume",
-                sourceTable: firstTable?.name || "Data",
-                fields: [col1],
-                aggregation: "count",
-                position: { col: 0, row: 0, w: 4, h: 2 },
-              },
-              {
-                widgetId: "chart_overview",
-                type: "bar_chart",
-                title: `${col1} Distribution`,
-                sourceTable: firstTable?.name || "Data",
-                fields: [col1, col2],
-                aggregation: "count",
-                position: { col: 4, row: 0, w: 8, h: 4 },
-              },
-            ],
-          },
-        ],
-        insights: [
-          {
-            insightId: "ins_1",
-            finding: `Successfully ingested ${totalRows} rows across ${tables.length} table(s).`,
-            whyItMatters: "Dataset is verified and ready for deep executive analytics.",
-            severity: "positive",
-          },
-        ],
+        title: `${filename.replace(/\.[^/.]+$/, "").replace(/[_-]/g, " ")} Executive Dashboard`,
+        description: `Executive intelligence synthesized across ${totalRows} records in ${tables.length} functional areas.`,
+        tabs: generatedTabs,
+        insights: generatedInsights,
       };
     }
 
