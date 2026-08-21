@@ -16,7 +16,8 @@
     "migrate:create": "payload migrate:create",
     "migrate:status": "payload migrate:status",
     "migrate:down": "payload migrate:down",
-    "acceptance:phase7": "tsx --tsconfig tsconfig.scripts.json --env-file=.env.local scripts/acceptance-phase7.ts"
+    "acceptance:phase7": "tsx --tsconfig tsconfig.scripts.json --env-file=.env.local scripts/acceptance-phase7.ts",
+    "acceptance:ingestion-smoke": "tsx --tsconfig tsconfig.scripts.json --env-file=.env.local scripts/acceptance-ingestion-smoke.ts"
   },
   "dependencies": {
     "@analytics/shared": "workspace:*",
