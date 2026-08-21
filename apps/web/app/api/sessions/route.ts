@@ -147,6 +147,10 @@ export async function GET(request: Request): Promise<Response> {
         status: session.status,
         datasetCount,
         documentCount,
+        // Only meaningful, and only sent, for the single-source case the
+        // reprocess action targets -- a combined session has no one
+        // dataset to reprocess.
+        singleDatasetId: datasetCount === 1 && documentCount === 0 ? datasetIds[0] : null,
         singleSource,
         findingsCount: Array.isArray(
           (session.overview as { findings?: unknown[] } | null)?.findings,

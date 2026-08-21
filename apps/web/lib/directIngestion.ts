@@ -746,12 +746,27 @@ export async function processIngestionDirectly(
       }));
     }
 
-    // 4. Save Config
+    // 4. Save Config -- version was previously hardcoded to 1 always, which
+    // is correct for a dataset's first-ever ingestion but creates a second,
+    // ambiguous "version 1" row on any re-ingestion (a corrected re-upload,
+    // or the reprocess endpoint added to repair datasets ingested before
+    // this file wrote dataset.data). Mirrors worker/src/processors/
+    // ingestion.ts's own fix for the same bug: query the current max
+    // version for this dataset and write one past it.
+    const existingConfigs = await payload.find({
+      collection: "configs",
+      where: { dataset: { equals: Number(datasetId) } },
+      sort: "-version",
+      limit: 1,
+      depth: 0,
+    });
+    const nextVersion = (existingConfigs.docs[0]?.version ?? 0) + 1;
+
     await payload.create({
       collection: "configs",
       data: {
         dataset: Number(datasetId),
-        version: 1,
+        version: nextVersion,
         config: dashboardConfig,
         insights: dashboardConfig.insights || [],
         generatedBy: "initial_auto_generation",

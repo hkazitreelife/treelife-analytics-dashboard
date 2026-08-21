@@ -86,6 +86,7 @@ type RecentSession = {
   updatedAt: string;
   datasetCount: number;
   documentCount: number;
+  singleDatasetId?: string | null;
   singleSource?: {
     kind: "dataset" | "document";
     fileType: string | null;
@@ -637,6 +638,35 @@ export default function NewSessionPage() {
     }
   };
 
+  // Repairs a dataset ingested before directIngestion.ts wrote
+  // dataset.data/totalRows/its wrapping session (commits 9242311, a458536):
+  // re-runs ingestion against the original file bytes already stored on
+  // its File row, no re-upload needed. See
+  // apps/web/app/api/datasets/[id]/reprocess/route.ts for the full story.
+  const reprocessDataset = async (sessionId: string, datasetId: string): Promise<void> => {
+    setOpenMenuId(null);
+    setDeletingId(sessionId);
+
+    try {
+      const response = await fetch(`/api/datasets/${datasetId}/reprocess`, {
+        method: "POST",
+        credentials: "include",
+      });
+
+      const body = (await response.json().catch(() => ({}))) as { error?: string; detail?: string };
+
+      if (response.ok) {
+        window.alert("Reprocessed. Reopen the session to see the corrected dashboard.");
+      } else {
+        window.alert(body.detail ?? body.error ?? `Reprocessing failed (status ${response.status}).`);
+      }
+    } catch (error: unknown) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     async function loadSessions() {
@@ -946,9 +976,23 @@ export default function NewSessionPage() {
 
                     {openMenuId === s.id ? (
                       <div
-                        className="absolute right-3 top-9 z-20 w-40 overflow-hidden rounded-lg border border-[color:var(--color-cloud)] bg-white py-1 shadow-md"
+                        className="absolute right-3 top-9 z-20 w-48 overflow-hidden rounded-lg border border-[color:var(--color-cloud)] bg-white py-1 shadow-md"
                         onClick={(event) => event.stopPropagation()}
                       >
+                        {isSingleDataset && s.singleDatasetId ? (
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void reprocessDataset(s.id, s.singleDatasetId!);
+                            }}
+                            className="block w-full px-3 py-1.5 text-left text-xs font-medium text-[color:var(--color-ink)] hover:bg-[color:var(--color-cloud-light)]"
+                            title="Re-runs ingestion from the original uploaded file -- fixes a dataset stuck showing 0 rows or 'Could not load data' without needing to re-upload."
+                          >
+                            Repair dashboard data
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           onClick={(event) => {
