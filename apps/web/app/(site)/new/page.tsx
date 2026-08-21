@@ -593,6 +593,49 @@ export default function NewSessionPage() {
   const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [recentSessions, setRecentSessions] = useState<RecentSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Closes the session card's "..." menu on any click elsewhere. The
+  // menu's own toggle button and its items call stopPropagation, so this
+  // never fires for the click that opened the menu or a click on an item.
+  useEffect(() => {
+    if (!openMenuId) {
+      return;
+    }
+
+    const closeMenu = () => setOpenMenuId(null);
+    document.addEventListener("click", closeMenu);
+    return () => document.removeEventListener("click", closeMenu);
+  }, [openMenuId]);
+
+  const deleteSession = async (sessionId: string): Promise<void> => {
+    setOpenMenuId(null);
+
+    if (!window.confirm("Delete this session? This also removes the dashboard/summary it wraps and cannot be undone.")) {
+      return;
+    }
+
+    setDeletingId(sessionId);
+
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+
+      if (response.ok) {
+        setRecentSessions((current) => current.filter((s) => s.id !== sessionId));
+      } else {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        window.alert(body.error ?? `Could not delete this session (status ${response.status}).`);
+      }
+    } catch (error: unknown) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -841,13 +884,16 @@ export default function NewSessionPage() {
                 const isSingleDataset = s.datasetCount === 1 && s.documentCount === 0;
                 const isSingleDoc = s.documentCount === 1 && s.datasetCount === 0;
 
+                const isDeleting = deletingId === s.id;
+
                 return (
-                  <Link
+                  <div
                     key={s.id}
-                    href={`/sessions/${s.id}`}
-                    className="group relative flex flex-col justify-between rounded-2xl border border-[color:var(--color-cloud)] bg-white p-4 shadow-2xs transition-all duration-200 hover:-translate-y-0.5 hover:border-[color:var(--color-forest-bright)] hover:shadow-xs"
+                    className={`group relative flex flex-col justify-between rounded-2xl border border-[color:var(--color-cloud)] bg-white p-4 shadow-2xs transition-all duration-200 hover:-translate-y-0.5 hover:border-[color:var(--color-forest-bright)] hover:shadow-xs ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
                   >
-                    <div>
+                    <Link href={`/sessions/${s.id}`} className="absolute inset-0" aria-label={`Open session ${s.name}`} />
+
+                    <div className="relative pointer-events-none">
                       <div className="flex items-center justify-between gap-2 pb-2">
                         <span className="inline-flex items-center gap-1 rounded-md bg-[color:var(--color-cloud-light)] px-2 py-0.5 text-[10px] font-bold text-[color:var(--color-forest)]">
                           <span>{isSingleDataset ? "📊" : isSingleDoc ? "📑" : "⚡"}</span>
@@ -859,9 +905,25 @@ export default function NewSessionPage() {
                               : "Cross-Source Synthesis"}
                           </span>
                         </span>
-                        <span className="text-[10px] text-[color:var(--color-steel)] font-medium">
-                          {formatRelativeTime(s.updatedAt || s.createdAt)}
-                        </span>
+
+                        <div className="flex items-center gap-1 pointer-events-auto">
+                          <span className="text-[10px] text-[color:var(--color-steel)] font-medium">
+                            {formatRelativeTime(s.updatedAt || s.createdAt)}
+                          </span>
+
+                          <button
+                            type="button"
+                            aria-label="Session options"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              setOpenMenuId((current) => (current === s.id ? null : s.id));
+                            }}
+                            className="relative z-10 rounded-md px-1.5 py-0.5 text-xs font-bold leading-none text-[color:var(--color-steel)] hover:bg-[color:var(--color-cloud-light)] hover:text-[color:var(--color-ink)]"
+                          >
+                            ⋯
+                          </button>
+                        </div>
                       </div>
 
                       <h3 className="text-xs font-bold text-[color:var(--color-ink)] group-hover:text-[color:var(--color-forest)] transition-colors line-clamp-1">
@@ -877,11 +939,30 @@ export default function NewSessionPage() {
                       </p>
                     </div>
 
-                    <div className="mt-3 flex items-center justify-between border-t border-[color:var(--color-cloud)]/50 pt-2 text-[11px] font-semibold text-[color:var(--color-forest)]">
-                      <span>Open Session</span>
+                    <div className="pointer-events-none relative mt-3 flex items-center justify-between border-t border-[color:var(--color-cloud)]/50 pt-2 text-[11px] font-semibold text-[color:var(--color-forest)]">
+                      <span>{isDeleting ? "Deleting…" : "Open Session"}</span>
                       <span className="transition-transform duration-150 group-hover:translate-x-1">→</span>
                     </div>
-                  </Link>
+
+                    {openMenuId === s.id ? (
+                      <div
+                        className="absolute right-3 top-9 z-20 w-40 overflow-hidden rounded-lg border border-[color:var(--color-cloud)] bg-white py-1 shadow-md"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void deleteSession(s.id);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs font-medium text-[color:var(--color-risk-high)] hover:bg-[color:var(--color-risk-high-surface)]"
+                        >
+                          Delete session
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
                 );
               })}
             </div>
