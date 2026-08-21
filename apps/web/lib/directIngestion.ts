@@ -185,6 +185,73 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
   return tables;
 }
 
+/**
+ * Rejects an AI-generated dashboard config that references a table/column
+ * absent from the parsed sheets, or sums/averages a non-numeric column.
+ * This path (the OpenRouter branch below) has no Zod validation of its own,
+ * unlike worker/src/services/claudeConfig.ts's findUnknownReferences /
+ * findUnresolvableMetrics for the sanctioned Gemini+Claude pipeline -- so a
+ * hallucinated field, or a wrong aggregation (e.g. summing a "Level" or
+ * "Date of joining" column because nothing stopped it), would otherwise be
+ * stored exactly as returned. This is the minimum equivalent check for this
+ * path: any problem found rejects the whole attempt so it falls through to
+ * the next model or the deterministic per-sheet synthesis below, rather
+ * than storing a partially valid config (CLAUDE.md: "never store partially
+ * valid output").
+ */
+function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
+  const problems: string[] = [];
+  const tableByName = new Map(tables.map((t) => [t.name, t]));
+
+  for (const tab of config.tabs ?? []) {
+    for (const widget of tab.widgets ?? []) {
+      const table = tableByName.get(widget.sourceTable);
+
+      if (!table) {
+        problems.push(
+          `widget "${widget.widgetId}" references unknown table "${widget.sourceTable}"`,
+        );
+        continue;
+      }
+
+      const columnType = new Map(
+        table.columnsWithTypes.map((c) => [c.name, c.inferredType]),
+      );
+      const fields: string[] = Array.isArray(widget.fields) ? widget.fields : [];
+
+      for (const field of fields) {
+        if (!columnType.has(field)) {
+          problems.push(
+            `widget "${widget.widgetId}" references unknown column "${field}" in table "${widget.sourceTable}"`,
+          );
+        }
+      }
+
+      if (widget.aggregation === "sum" || widget.aggregation === "avg") {
+        const numericFields = fields.filter((f) => columnType.get(f) === "numeric");
+
+        if (numericFields.length === 0) {
+          problems.push(
+            `widget "${widget.widgetId}" uses aggregation "${widget.aggregation}" but none of its fields (${fields.join(", ")}) in table "${widget.sourceTable}" are numeric`,
+          );
+        }
+      }
+    }
+  }
+
+  for (const insight of config.insights ?? []) {
+    for (const tableName of insight.relatedTables ?? []) {
+      if (!tableByName.has(tableName)) {
+        problems.push(
+          `insight "${insight.insightId}" references unknown table "${tableName}"`,
+        );
+      }
+    }
+  }
+
+  return problems;
+}
+
 export async function processIngestionDirectly(
   payload: Payload,
   jobId: number | string,
@@ -319,7 +386,17 @@ export async function processIngestionDirectly(
               }
               const parsed = JSON.parse(clean);
               if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
-                dashboardConfig = normalizeDashboardConfigInput(parsed);
+                const candidate = normalizeDashboardConfigInput(parsed);
+                const problems = findAiConfigProblems(candidate, tables);
+
+                if (problems.length > 0) {
+                  console.warn(
+                    `[DirectIngestion] Model ${modelId} produced an invalid config, rejecting: ${problems.join("; ")}`,
+                  );
+                  continue;
+                }
+
+                dashboardConfig = candidate;
                 console.log(`[DirectIngestion] Dashboard generated dynamically via AI using ${modelId}`);
                 break;
               }
