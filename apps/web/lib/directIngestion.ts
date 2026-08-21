@@ -3,6 +3,7 @@ import { createHash } from "crypto";
 import type { Payload } from "payload";
 import {
   normalizeDashboardConfigInput,
+  findUnresolvableMetrics,
 } from "@analytics/shared";
 import { ensureSingleSourceSession } from "./sessionWrapper";
 
@@ -250,6 +251,26 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
       }
     }
   }
+
+  // Insight metrics accuracy: this path previously let an insight state any
+  // number in plain prose with no check against real data at all -- the
+  // model could cite a total it never actually computed correctly. Rule 5
+  // in the prompt above now requires every insight number to be a
+  // structured {kind, sourceTable, sourceField/labelColumn+labelValue+
+  // valueColumn} reference instead of bare text, exactly like a widget
+  // references real columns rather than inventing one. This reuses the
+  // same resolution check the proper worker pipeline
+  // (worker/src/services/claudeConfig.ts) already applies to its own
+  // insights, so a metric that doesn't actually resolve against this
+  // table's real rows and columns (wrong table/column name, a
+  // non-numeric field asked to sum/avg, a labelValue that isn't in the
+  // named table) rejects the whole candidate the same way an unknown
+  // widget reference does, rather than storing an unverified number.
+  const unresolvableInsightMetrics = findUnresolvableMetrics(
+    config.insights ?? [],
+    buildNormalizedTables(tables) as any,
+  );
+  problems.push(...unresolvableInsightMetrics);
 
   // Sheet-tab purity: every tab except the one designated cross-sheet
   // overview must source every widget from a single table. Without this, a
@@ -504,6 +525,23 @@ export async function processIngestionDirectly(
             " view on top; the same rule applies within a single workbook's sheets now.",
           ].join(""),
           "4. QUANTIFIED INSIGHTS: Provide 4-6 high-impact executive insights citing real numbers, implications, recommended actions, and department owners with presentation shape: 'tracker-item'.",
+          [
+            "5. GROUNDED METRICS, NOT INVENTED NUMBERS: You have never seen a data row, only the column",
+            " types and 2 sample rows per sheet above -- do not write a number directly into finding,",
+            " whyItMatters, or recommendedAction. Instead, every number an insight depends on goes into",
+            " that insight's metrics array as a reference the server resolves against the real stored",
+            " rows, exactly like a widget references sourceTable/fields rather than a number.",
+            ' Use {"kind":"aggregate","label":"...","sourceTable":"<real sheet name>","sourceField":"<real',
+            ' numeric column>","aggregation":"sum"|"avg"|"count"|"min"|"max"} for a column of peer rows.',
+            ' Use {"kind":"row","label":"...","sourceTable":"<real sheet name>","labelColumn":"<real',
+            ' column>","labelValue":"<the exact value in that column for the row you mean>",',
+            ' "valueColumn":"<real column holding that row\'s figure>"} to cite one specific row\'s value by',
+            " its label instead of aggregating (e.g. a named category total in a summary table). Every",
+            " sourceTable/sourceField/labelColumn/valueColumn must be a real name from the sheets above,",
+            " verbatim -- never invented. An insight with no number to cite may have an empty metrics",
+            " array; an insight that does cite a figure must reference it this way, not state it as bare",
+            " prose text.",
+          ].join(""),
           "",
           "Return ONLY valid JSON matching this schema:",
           "{",
@@ -529,13 +567,21 @@ export async function processIngestionDirectly(
           '  "insights": [',
           "    {",
           '      "insightId": "ins1",',
-          '      "finding": "Analytical finding with specific figures.",',
+          '      "finding": "Analytical finding referencing the figure named in metrics below, not a number typed directly here.",',
           '      "whyItMatters": "Strategic business implication.",',
           '      "recommendedAction": "Concrete executive next step.",',
           '      "severity": "positive",',
           '      "presentation": { "shape": "tracker-item", "status": "Action Required", "owner": "Leadership" },',
-          '      "relatedTables": [],',
-          '      "metrics": []',
+          `      "relatedTables": ["${tables[0]?.name || "Data"}"],`,
+          '      "metrics": [',
+          "        {",
+          '          "kind": "aggregate",',
+          '          "label": "Example Total",',
+          `          "sourceTable": "${tables[0]?.name || "Data"}",`,
+          `          "sourceField": "<a real numeric column from ${tables[0]?.name || "Data"}>",`,
+          '          "aggregation": "sum"',
+          "        }",
+          "      ]",
           "    }",
           "  ]",
           "}",
