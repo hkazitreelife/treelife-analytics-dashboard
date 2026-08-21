@@ -205,70 +205,97 @@ export const createClaudeConfigEditClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
-      let response;
+      let rawInput: unknown = null;
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 16_000,
-          // No temperature: it is deprecated on current Claude models and
-          // sending it is rejected with a 400.
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_dashboard_config",
-              description:
-                "Emit the complete edited dashboard configuration for this dataset.",
-              input_schema: dashboardConfigToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_dashboard_config" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Current dashboard config:",
-                JSON.stringify(currentConfig),
-                "",
-                "Dataset metadata:",
-                JSON.stringify(metadata),
-                "",
-                "Admin's editing instruction:",
-                prompt,
-              ].join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching the complete edited dashboard configuration: {"title": string, "description": string, "tabs": Array<{ "tabId": string, "tabName": string, "widgets": Array<{"widgetId": string, "type": "kpi_card"|"bar"|"horizontal_bar"|"line"|"pie", "title": string, "sourceTable": string, "fields": string[], "aggregation": "sum"|"count"|"avg"|"distinct"|"none", "position": {"col": number, "row": number, "w": number, "h": number}}> }>, "insights": Array<{"insightId": string, "finding": string, "whyItMatters": string, "recommendedAction": string, "severity": "positive"|"warning"|"negative"|"info", "presentation": {"shape": "tracker-item", "status": string, "owner": string}, "relatedTables": string[], "metrics": Array<any>}>}.`,
+            userPrompt: [
+              "Current dashboard config:",
+              JSON.stringify(currentConfig),
+              "",
+              "Dataset metadata:",
+              JSON.stringify(metadata),
+              "",
+              "Admin's editing instruction:",
+              prompt,
+            ].join("\n"),
+            maxTokens: 16000,
+          });
 
-        // The key must never reach a log or an error message.
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new ClaudeEditBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". This is a payment or throughput problem, not bad model output. Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new ClaudeEditError(`Claude edit request failed on model "${activeModel}": ${detail}`);
+        }
+      } else {
+        let response;
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 16_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_dashboard_config",
+                description:
+                  "Emit the complete edited dashboard configuration for this dataset.",
+                input_schema: dashboardConfigToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_dashboard_config" },
+            messages: [
+              {
+                role: "user",
+                content: [
+                  "Current dashboard config:",
+                  JSON.stringify(currentConfig),
+                  "",
+                  "Dataset metadata:",
+                  JSON.stringify(metadata),
+                  "",
+                  "Admin's editing instruction:",
+                  prompt,
+                ].join("\n"),
+              },
+            ],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new ClaudeEditBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new ClaudeEditError(
+            `Claude edit request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new ClaudeEditError(
-          `Claude edit request failed on model "${activeModel}": ${detail}`,
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new ClaudeEditValidationError(
+            `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new ClaudeEditValidationError(
-          `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const normalizedInput = normalizeDashboardConfigInput(toolUse.input) as any;
+      const normalizedInput = normalizeDashboardConfigInput(rawInput) as any;
       if (normalizedInput && typeof normalizedInput === "object") {
         normalizedInput.datasetId = metadata.datasetId;
       }

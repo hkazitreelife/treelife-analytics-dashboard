@@ -156,93 +156,157 @@ export const createSessionChatClient = (
         return cached;
       }
 
-      let response;
+      let parsedInput: unknown = null;
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 4_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_session_chat_answer",
-              description: "Emit the answer to the admin's question about this session.",
-              input_schema: sessionChatAnswerToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_session_chat_answer" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Datasets in this session (metadata + parsed table rows, capped at first 500 rows per table):",
-                JSON.stringify(
-                  datasets.map((d) => ({
-                    datasetId: d.datasetId,
-                    datasetName: d.datasetName,
-                    metadata: d.metadata,
-                    tables: d.tables.map((t) => ({
-                      tableName: t.tableName,
-                      columns: t.columns.map((c) => c.name),
-                      totalRowCount: t.rows.length,
-                      providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
-                      isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
-                      rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching this schema: {"directAnswer": string, "datasetSources": Array<{"datasetId": string, "tableName": string, "metrics": Array<{"label": string, "sourceTable": string, "sourceField": string, "aggregation": "sum"|"avg"|"count"|"min"|"max"}>}>, "documentSources": Array<{"documentId": string, "sectionHeading": string, "quotedExcerpt": string}>, "synthesisFinding": string}.`,
+            userPrompt: [
+              "Datasets in this session (metadata + parsed table rows, capped at first 500 rows per table):",
+              JSON.stringify(
+                datasets.map((d) => ({
+                  datasetId: d.datasetId,
+                  datasetName: d.datasetName,
+                  metadata: d.metadata,
+                  tables: d.tables.map((t) => ({
+                    tableName: t.tableName,
+                    columns: t.columns.map((c) => c.name),
+                    totalRowCount: t.rows.length,
+                    providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
+                    isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
+                    rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
+                  })),
+                })),
+              ),
+              "",
+              "Documents in this session:",
+              JSON.stringify(
+                documents.map((doc) => ({
+                  documentId: doc.documentId,
+                  documentName: doc.documentName,
+                  fullText: doc.fullText,
+                  sections: doc.sections,
+                })),
+              ),
+              "",
+              "Admin's question:",
+              message,
+            ].join("\n"),
+            maxTokens: 4000,
+          });
+
+          logTokenUsage({
+            action: "session_chat",
+            model: activeModel,
+            inputTokens: llmRes.inputTokens,
+            outputTokens: llmRes.outputTokens,
+            cached: false,
+          });
+
+          parsedInput = llmRes.jsonContent || {
+            directAnswer: llmRes.rawContent || "Analysis complete.",
+            datasetSources: [],
+            documentSources: [],
+            synthesisFinding: null,
+          };
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new SessionChatError(`Session chat request failed on model "${activeModel}": ${detail}`);
+        }
+      } else {
+        let response;
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 4_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_session_chat_answer",
+                description: "Emit the answer to the admin's question about this session.",
+                input_schema: sessionChatAnswerToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_session_chat_answer" },
+            messages: [
+              {
+                role: "user",
+                content: [
+                  "Datasets in this session (metadata + parsed table rows, capped at first 500 rows per table):",
+                  JSON.stringify(
+                    datasets.map((d) => ({
+                      datasetId: d.datasetId,
+                      datasetName: d.datasetName,
+                      metadata: d.metadata,
+                      tables: d.tables.map((t) => ({
+                        tableName: t.tableName,
+                        columns: t.columns.map((c) => c.name),
+                        totalRowCount: t.rows.length,
+                        providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
+                        isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
+                        rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
+                      })),
                     })),
-                  })),
-                ),
-                "",
-                "Documents in this session:",
-                JSON.stringify(
-                  documents.map((doc) => ({
-                    documentId: doc.documentId,
-                    documentName: doc.documentName,
-                    fullText: doc.fullText,
-                    sections: doc.sections,
-                  })),
-                ),
-                "",
-                "Admin's question:",
-                message,
-              ].join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+                  ),
+                  "",
+                  "Documents in this session:",
+                  JSON.stringify(
+                    documents.map((doc) => ({
+                      documentId: doc.documentId,
+                      documentName: doc.documentName,
+                      fullText: doc.fullText,
+                      sections: doc.sections,
+                    })),
+                  ),
+                  "",
+                  "Admin's question:",
+                  message,
+                ].join("\n"),
+              },
+            ],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new SessionChatBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Provider detail: ${detail}`,
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new SessionChatBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Provider detail: ${detail}`,
+            );
+          }
+
+          throw new SessionChatError(`Session chat request failed on model "${activeModel}": ${detail}`);
+        }
+
+        logTokenUsage({
+          action: "session_chat",
+          model: activeModel,
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+          cached: false,
+        });
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+        );
+
+        if (!toolUse) {
+          throw new SessionChatValidationError(
+            `Model "${activeModel}" did not call emit_session_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
           );
         }
 
-        throw new SessionChatError(`Session chat request failed on model "${activeModel}": ${detail}`);
+        parsedInput = toolUse.input;
       }
 
-      logTokenUsage({
-        action: "session_chat",
-        model: activeModel,
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-        cached: false,
-      });
-
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new SessionChatValidationError(
-          `Model "${activeModel}" did not call emit_session_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = sessionChatAnswerSchema.safeParse(toolUse.input);
+      const result = sessionChatAnswerSchema.safeParse(parsedInput);
 
       if (!result.success) {
         throw new SessionChatValidationError(

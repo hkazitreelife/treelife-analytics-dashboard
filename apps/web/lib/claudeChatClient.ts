@@ -154,79 +154,128 @@ export const createChatClient = (
         return cached;
       }
 
-      let response;
+      let parsedInput: unknown = null;
 
-      try {
-        response = await client.messages.create({
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON matching this schema: {"directAnswer": string, "metrics": Array<{"label": string, "sourceTable": string, "sourceField": string, "aggregation": "sum"|"avg"|"count"|"min"|"max"}>, "caveats": string[]}.`,
+            userPrompt: [
+              "Dataset context (structural metadata, aggregates, and parsed table rows up to 500 rows per table):",
+              JSON.stringify({
+                ...context,
+                tables: tables.map((t) => ({
+                  tableName: t.tableName,
+                  columns: t.columns.map((c) => c.name),
+                  totalRowCount: t.rows.length,
+                  providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
+                  isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
+                  rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
+                })),
+              }),
+              "",
+              "Admin's question:",
+              message,
+            ].join("\n"),
+            maxTokens: 4000,
+          });
+
+          logTokenUsage({
+            action: "dataset_chat",
+            model: activeModel,
+            inputTokens: llmRes.inputTokens,
+            outputTokens: llmRes.outputTokens,
+            cached: false,
+          });
+
+          parsedInput = llmRes.jsonContent || {
+            directAnswer: llmRes.rawContent || "Analysis complete.",
+            metrics: [],
+            caveats: [],
+          };
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new ChatError(`Chat request failed on model "${activeModel}": ${detail}`);
+        }
+      } else {
+        let response;
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 4_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_chat_answer",
+                description: "Emit the answer to the admin's question.",
+                input_schema: chatAnswerToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_chat_answer" },
+            messages: [
+              {
+                role: "user",
+                content: [
+                  "Dataset context (structural metadata, aggregates, and parsed table rows up to 500 rows per table):",
+                  JSON.stringify({
+                    ...context,
+                    tables: tables.map((t) => ({
+                      tableName: t.tableName,
+                      columns: t.columns.map((c) => c.name),
+                      totalRowCount: t.rows.length,
+                      providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
+                      isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
+                      rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
+                    })),
+                  }),
+                  "",
+                  "Admin's question:",
+                  message,
+                ].join("\n"),
+              },
+            ],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new ChatBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new ChatError(`Chat request failed on model "${activeModel}": ${detail}`);
+        }
+
+        logTokenUsage({
+          action: "dataset_chat",
           model: activeModel,
-          max_tokens: 4_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_chat_answer",
-              description: "Emit the answer to the admin's question.",
-              input_schema: chatAnswerToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_chat_answer" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Dataset context (structural metadata, aggregates, and parsed table rows up to 500 rows per table):",
-                JSON.stringify({
-                  ...context,
-                  tables: tables.map((t) => ({
-                    tableName: t.tableName,
-                    columns: t.columns.map((c) => c.name),
-                    totalRowCount: t.rows.length,
-                    providedRowCount: Math.min(t.rows.length, MAX_ROWS_PER_TABLE),
-                    isCapped: t.rows.length > MAX_ROWS_PER_TABLE,
-                    rows: t.rows.slice(0, MAX_ROWS_PER_TABLE),
-                  })),
-                }),
-                "",
-                "Admin's question:",
-                message,
-              ].join("\n"),
-            },
-          ],
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+          cached: false,
         });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new ChatBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+        );
+
+        if (!toolUse) {
+          throw new ChatValidationError(
+            `Model "${activeModel}" did not call emit_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
           );
         }
 
-        throw new ChatError(`Chat request failed on model "${activeModel}": ${detail}`);
+        parsedInput = toolUse.input;
       }
 
-      logTokenUsage({
-        action: "dataset_chat",
-        model: activeModel,
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-        cached: false,
-      });
-
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new ChatValidationError(
-          `Model "${activeModel}" did not call emit_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = chatAnswerSchema.safeParse(toolUse.input);
+      const result = chatAnswerSchema.safeParse(parsedInput);
 
       if (!result.success) {
         throw new ChatValidationError(

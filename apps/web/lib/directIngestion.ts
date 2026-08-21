@@ -40,6 +40,15 @@ export function inferColumnType(
     return "date";
   }
 
+  // Strict semantic identification for Hierarchy/Category numbers (Level 1..6, Grade 1..5)
+  if (
+    /^(level|grade|tier|band|step|stage|rank|quarter|status|priority)$/i.test(lowerName) ||
+    lowerName.endsWith("_level") ||
+    lowerName.endsWith(" level")
+  ) {
+    return "categorical";
+  }
+
   const nonNull = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
   if (nonNull.length === 0) return "text";
 
