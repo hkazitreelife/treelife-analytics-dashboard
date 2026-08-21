@@ -5,7 +5,7 @@ import { invalidateCache } from "@/lib/cache";
 export const runtime = "nodejs";
 // Same reasoning as apps/web/app/api/uploads/route.ts's maxDuration: this
 // calls the same synchronous, potentially multi-model-attempt ingestion.
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 /**
  * Repairs a dataset that was ingested before directIngestion.ts wrote

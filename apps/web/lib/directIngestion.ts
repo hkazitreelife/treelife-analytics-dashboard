@@ -555,7 +555,11 @@ export async function processIngestionDirectly(
           // silently forcing every upload straight to the generic fallback
           // regardless of which model might otherwise have succeeded.
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 45000);
+          // Raised alongside max_tokens: a 16000-token completion can
+          // legitimately take longer than 45s on some providers, and an
+          // abort here causes the exact same silent fallback as a
+          // too-small token cap did.
+          const timeout = setTimeout(() => controller.abort(), 90000);
 
           try {
             const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -567,15 +571,23 @@ export async function processIngestionDirectly(
               body: JSON.stringify({
                 model: modelId,
                 messages: [{ role: "user", content: prompt }],
-                // Was 4000 -- too small once the prompt started requiring a
-                // dedicated tab per sheet (see "ONE TAB PER SHEET" rule
-                // above): a 5+ sheet workbook's full tabs+widgets+insights
-                // JSON regularly exceeds 4000 tokens, gets cut off
-                // mid-object, fails JSON.parse, and silently falls through
-                // to the generic per-table template below -- which is
+                // Was 4000, then 8000 -- both still small enough to
+                // truncate a large multi-sheet dashboard's JSON mid-object
+                // (see "ONE TAB PER SHEET" rule above) and silently fall
+                // through to the generic per-table template, which is
                 // exactly the "every tab's insight looks the same, no real
-                // intelligence" symptom this was causing.
-                max_tokens: 8000,
+                // intelligence" symptom this was causing. Raised to 16000,
+                // matching the ceiling already trusted for this identical
+                // kind of call everywhere else in this codebase
+                // (worker/src/services/claudeConfig.ts,
+                // claudeConfigEditClient.ts, claudeCombinedDashboardClient.ts
+                // all use max_tokens: 16_000). There is no "unlimited"
+                // option any of these providers actually offer -- each
+                // enforces its own hard ceiling regardless of what's
+                // requested -- so this is the highest value already proven
+                // safe for a config-generation response in this app, not an
+                // arbitrary increase.
+                max_tokens: 16000,
               }),
               signal: controller.signal,
             });
