@@ -86,6 +86,42 @@ const CHART_WIDGET_TYPES = new Set<DashboardWidgetShape["type"]>([
 const needsFullTableAggregation = (widget: DashboardWidgetShape): boolean =>
   CHART_WIDGET_TYPES.has(widget.type) && widget.aggregation !== "none";
 
+const isOverviewTab = (tab: { tabId: string; tabName: string }): boolean =>
+  tab.tabId === "executive_overview" || /overview/i.test(tab.tabName ?? "");
+
+/**
+ * Scopes a config's insights to one tab, by intersecting each insight's
+ * relatedTables with the set of sourceTable(s) that tab's own widgets
+ * actually use. Without this, every tab showed the exact same full
+ * insights list regardless of which sheet's tab was open -- there was no
+ * per-tab filtering at all, insights were rendered once, globally, below
+ * every tab. An insight with an empty relatedTables (a genuinely
+ * cross-sheet finding, not tied to one table) is treated as
+ * overview-level and shown only on the tab identified as the cross-sheet
+ * overview, per the same "ONE TAB PER SHEET, plus one overview" rule the
+ * config-generation prompt now enforces (apps/web/lib/directIngestion.ts).
+ */
+const insightsForTab = (
+  insights: ResolvedDashboardConfigShape["insights"] | undefined,
+  tab: { tabId: string; tabName: string; widgets: DashboardWidgetShape[] },
+): ResolvedDashboardConfigShape["insights"] => {
+  if (!Array.isArray(insights) || insights.length === 0) {
+    return [];
+  }
+
+  const tabTables = new Set(tab.widgets.map((widget) => widget.sourceTable));
+
+  return insights.filter((insight) => {
+    const related = (insight as any).relatedTables as string[] | undefined;
+
+    if (!Array.isArray(related) || related.length === 0) {
+      return isOverviewTab(tab);
+    }
+
+    return related.some((tableName) => tabTables.has(tableName));
+  });
+};
+
 type SetTableState = (
   updater: (current: Record<string, TableState>) => Record<string, TableState>,
 ) => void;
@@ -457,16 +493,30 @@ export const DashboardRenderer = ({ datasetId }: { datasetId: string }) => {
                   })}
               </div>
             )}
+
+            {/* Insights scoped to this tab's own table(s) -- this used to
+                be one global section below the tabs, rendering every
+                insight from every sheet identically regardless of which
+                tab was open. insightsForTab filters to insights whose
+                relatedTables intersects this tab's own widgets'
+                sourceTable(s); an insight with no relatedTables at all is
+                treated as overview-level and shown only on the tab
+                identified as the cross-sheet overview. */}
+            {(() => {
+              const tabInsights = insightsForTab(config.insights ?? [], tab);
+
+              return tabInsights.length > 0 ? (
+                <section className="mt-6 space-y-3">
+                  <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
+                    Insights
+                  </h2>
+                  <InsightsPanel insights={tabInsights} tables={tables} />
+                </section>
+              ) : null;
+            })()}
           </TabsContent>
         ))}
       </Tabs>
-
-      <section className="space-y-3">
-        <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
-          Insights
-        </h2>
-        <InsightsPanel insights={config.insights} tables={tables} />
-      </section>
     </div>
   );
 };
@@ -575,18 +625,27 @@ export const CombinedDashboardRenderer = ({
                     })}
                 </div>
               )}
+
+              {/* Scoped to this tab's own table(s), same fix and same
+                  reasoning as DashboardRenderer above -- this was one
+                  global insights section below every tab before, showing
+                  every insight identically regardless of which tab was
+                  open. */}
+              {(() => {
+                const tabInsights = insightsForTab(config.insights, tab);
+
+                return tabInsights.length > 0 ? (
+                  <section className="mt-6 space-y-3">
+                    <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
+                      Executive Insights & Strategy
+                    </h2>
+                    <InsightsPanel insights={tabInsights} tables={tables} />
+                  </section>
+                ) : null;
+              })()}
             </TabsContent>
           ))}
         </Tabs>
-      ) : null}
-
-      {config.insights && config.insights.length > 0 ? (
-        <section className="space-y-3">
-          <h2 className="text-base font-semibold text-[color:var(--color-forest)]">
-            Executive Insights & Strategy
-          </h2>
-          <InsightsPanel insights={config.insights} tables={tables} />
-        </section>
       ) : null}
     </div>
   );
