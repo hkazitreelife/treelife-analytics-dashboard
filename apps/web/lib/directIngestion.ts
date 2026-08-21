@@ -6,6 +6,11 @@ import {
   findUnresolvableMetrics,
 } from "@analytics/shared";
 import { ensureSingleSourceSession } from "./sessionWrapper";
+import {
+  acquireDatasetLock,
+  releaseDatasetLock,
+  DatasetIngestionLockedError,
+} from "./datasetLock";
 
 export interface ParsedColumn {
   name: string;
@@ -469,6 +474,21 @@ export async function processIngestionDirectly(
   intentPrompt?: string | null,
 ): Promise<void> {
   console.log(`[DirectIngestion] Starting ingestion for dataset ${datasetId} (${filename})...`);
+
+  // Per-dataset lock: without this, two overlapping ingestion runs against
+  // the same dataset (a double-clicked "Repair dashboard data", or the
+  // same reprocess request fired from two tabs) could race -- e.g. both
+  // reading the same "current max config version" before either writes,
+  // producing two rows claiming the same version. This mirrors
+  // worker/src/services/datasetLock.ts's guard for the exact same reason,
+  // but fails open (see datasetLock.ts's doc comment) rather than block
+  // ingestion if Redis is unavailable, since this guard did not exist
+  // before today and must never become a new way for uploads to fail.
+  const lock = await acquireDatasetLock(datasetId);
+
+  if (!lock.acquired) {
+    throw new DatasetIngestionLockedError(datasetId);
+  }
 
   try {
     // 1. Mark Job Processing
@@ -998,5 +1018,7 @@ export async function processIngestionDirectly(
     });
 
     throw err;
+  } finally {
+    await releaseDatasetLock(lock.handle);
   }
 }

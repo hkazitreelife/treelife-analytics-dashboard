@@ -1,5 +1,6 @@
 import { requireUser } from "@/lib/auth";
 import { processIngestionDirectly } from "@/lib/directIngestion";
+import { DatasetIngestionLockedError } from "@/lib/datasetLock";
 import { invalidateCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
@@ -84,6 +85,22 @@ export async function POST(
   try {
     await processIngestionDirectly(payload, job.id, Number(id), buffer, filename, undefined);
   } catch (error: unknown) {
+    if (error instanceof DatasetIngestionLockedError) {
+      // Thrown before processIngestionDirectly's own try/catch, so it
+      // never touched this Job/the Dataset's status -- mark the job we
+      // just created here so it doesn't sit at "queued" forever.
+      await payload.update({
+        collection: "jobs",
+        id: job.id,
+        data: { status: "failed", error: error.message },
+      });
+
+      return Response.json(
+        { error: "This dataset is already being processed by another request. Try again shortly." },
+        { status: 409 },
+      );
+    }
+
     payload.logger.error({ err: error }, `Reprocessing failed for dataset ${id}.`);
 
     return Response.json(
