@@ -95,61 +95,93 @@ export const createSessionEditTargetClient = (
     primaryModel: resolvedModel,
     retryModelName: resolvedRetryModel,
     resolveTarget: async (sources, prompt) => {
-      let response;
+      const userContent = [
+        "Sources in this session:",
+        JSON.stringify(sources),
+        "",
+        "Admin's edit request:",
+        prompt,
+      ].join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: resolvedModel,
-          max_tokens: 1_000,
-          system: SYSTEM_INSTRUCTION,
-          tools: [
-            {
-              name: "emit_edit_target",
-              description: "Decide which one source this edit request targets, or ask for clarification.",
-              input_schema: sessionEditTargetToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_edit_target" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Sources in this session:",
-                JSON.stringify(sources),
-                "",
-                "Admin's edit request:",
-                prompt,
-              ].join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new SessionEditTargetBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${model}". Provider detail: ${detail}`,
+      // Same reasoning as claudeChatClient.ts: this client had no
+      // OpenRouter branch at all until now, so with an OpenRouter-format
+      // key, every edit-target resolution call was failing outright by
+      // calling Anthropic's native SDK straight at ANTHROPIC_BASE_URL. The
+      // prompt schema is serialized from sessionEditTargetToolSchema
+      // (already imported), not hand-copied, so it can't drift from the
+      // real validator.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: resolvedModel,
+            system: `${SYSTEM_INSTRUCTION}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(sessionEditTargetToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 1000,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new SessionEditTargetError(`Edit-target request failed on model "${model}": ${detail}`);
+        }
+
+        if (!rawInput) {
+          throw new SessionEditTargetError(
+            `Model "${model}" did not return parseable JSON for the edit target.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: resolvedModel,
+            max_tokens: 1_000,
+            system: SYSTEM_INSTRUCTION,
+            tools: [
+              {
+                name: "emit_edit_target",
+                description: "Decide which one source this edit request targets, or ask for clarification.",
+                input_schema: sessionEditTargetToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_edit_target" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new SessionEditTargetBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${model}". Provider detail: ${detail}`,
+            );
+          }
+
+          throw new SessionEditTargetError(`Edit-target request failed on model "${model}": ${detail}`);
+        }
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
+        );
+
+        if (!toolUse) {
+          throw new SessionEditTargetError(
+            `Model "${model}" did not call emit_edit_target. Stop reason: ${response.stop_reason ?? "unknown"}.`,
           );
         }
 
-        throw new SessionEditTargetError(`Edit-target request failed on model "${model}": ${detail}`);
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new SessionEditTargetError(
-          `Model "${model}" did not call emit_edit_target. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = sessionEditTargetSchema.safeParse(toolUse.input);
+      const result = sessionEditTargetSchema.safeParse(rawInput);
 
       if (!result.success) {
         throw new SessionEditTargetError(

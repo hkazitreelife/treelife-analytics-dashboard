@@ -146,70 +146,101 @@ export const createClaudeDocumentExpandClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
-      let response;
+      const userContent = [
+        "Document sections (structure only):",
+        JSON.stringify(sections),
+        "",
+        "Existing key points already surfaced (do not repeat these):",
+        JSON.stringify(existingKeyPoints),
+        "",
+        focusSectionId
+          ? `Focus on section: ${focusSectionId}`
+          : "No specific section focus -- consider the whole document.",
+        "",
+        "Document fullText:",
+        fullText,
+      ].join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 8_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_document_summary",
-              description: "Emit the additional key points for this document.",
-              input_schema: documentSummaryToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_document_summary" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Document sections (structure only):",
-                JSON.stringify(sections),
-                "",
-                "Existing key points already surfaced (do not repeat these):",
-                JSON.stringify(existingKeyPoints),
-                "",
-                focusSectionId
-                  ? `Focus on section: ${focusSectionId}`
-                  : "No specific section focus -- consider the whole document.",
-                "",
-                "Document fullText:",
-                fullText,
-              ].join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new ClaudeExpandBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+      // Same reasoning as claudeChatClient.ts: this client had no
+      // OpenRouter branch at all until now, so with an OpenRouter-format
+      // key, every expand call was failing outright by calling Anthropic's
+      // native SDK straight at ANTHROPIC_BASE_URL. The prompt schema is
+      // serialized from documentSummaryToolSchema (already imported), not
+      // hand-copied, so it can't drift from the real validator.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(documentSummaryToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 8000,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new ClaudeExpandError(`Claude expand request failed on model "${activeModel}": ${detail}`);
+        }
+
+        if (!rawInput) {
+          throw new ClaudeExpandValidationError(
+            `Model "${activeModel}" did not return parseable JSON for the expanded summary.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 8_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_document_summary",
+                description: "Emit the additional key points for this document.",
+                input_schema: documentSummaryToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_document_summary" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new ClaudeExpandBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new ClaudeExpandError(
+            `Claude expand request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new ClaudeExpandError(
-          `Claude expand request failed on model "${activeModel}": ${detail}`,
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new ClaudeExpandValidationError(
+            `Model "${activeModel}" did not call emit_document_summary. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new ClaudeExpandValidationError(
-          `Model "${activeModel}" did not call emit_document_summary. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = documentSummarySchema.safeParse(toolUse.input);
+      const result = documentSummarySchema.safeParse(rawInput);
 
       if (!result.success) {
         throw new ClaudeExpandValidationError(

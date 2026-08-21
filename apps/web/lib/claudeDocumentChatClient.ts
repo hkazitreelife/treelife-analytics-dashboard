@@ -168,77 +168,117 @@ export const createDocumentChatClient = (
         return cached;
       }
 
-      let response;
+      const userContent = [
+        "Document sections (structure only):",
+        JSON.stringify(sections),
+        "",
+        "Existing key-points summary:",
+        JSON.stringify(existingKeyPoints),
+        "",
+        "Admin's question:",
+        message,
+        "",
+        "Document fullText:",
+        fullText,
+      ].join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 4_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_document_chat_answer",
-              description: "Emit the answer to the admin's question about this document.",
-              input_schema: documentChatAnswerToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_document_chat_answer" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                "Document sections (structure only):",
-                JSON.stringify(sections),
-                "",
-                "Existing key-points summary:",
-                JSON.stringify(existingKeyPoints),
-                "",
-                "Admin's question:",
-                message,
-                "",
-                "Document fullText:",
-                fullText,
-              ].join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new DocumentChatBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+      // Same reasoning as claudeChatClient.ts: this client had no
+      // OpenRouter branch at all until now, so with an OpenRouter-format
+      // key, every document chat call was failing outright by calling
+      // Anthropic's native SDK straight at ANTHROPIC_BASE_URL. The prompt
+      // schema is serialized from documentChatAnswerToolSchema (already
+      // imported), not hand-copied, so it can't drift from the real
+      // validator.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(documentChatAnswerToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 4000,
+          });
+
+          logTokenUsage({
+            action: "document_chat",
+            model: activeModel,
+            inputTokens: llmRes.inputTokens,
+            outputTokens: llmRes.outputTokens,
+            cached: false,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new DocumentChatError(`Document chat request failed on model "${activeModel}": ${detail}`);
+        }
+
+        if (!rawInput) {
+          throw new DocumentChatValidationError(
+            `Model "${activeModel}" did not return parseable JSON for the document chat answer.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 4_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_document_chat_answer",
+                description: "Emit the answer to the admin's question about this document.",
+                input_schema: documentChatAnswerToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_document_chat_answer" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new DocumentChatBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new DocumentChatError(
+            `Document chat request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new DocumentChatError(
-          `Document chat request failed on model "${activeModel}": ${detail}`,
+        logTokenUsage({
+          action: "document_chat",
+          model: activeModel,
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+          cached: false,
+        });
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new DocumentChatValidationError(
+            `Model "${activeModel}" did not call emit_document_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      logTokenUsage({
-        action: "document_chat",
-        model: activeModel,
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-        cached: false,
-      });
-
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new DocumentChatValidationError(
-          `Model "${activeModel}" did not call emit_document_chat_answer. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = documentChatAnswerSchema.safeParse(toolUse.input);
+      const result = documentChatAnswerSchema.safeParse(rawInput);
 
       if (!result.success) {
         throw new DocumentChatValidationError(

@@ -159,82 +159,119 @@ export const createClaudeCombinedDashboardClient = (
       const allTables = datasets.flatMap((d) => d.tables);
       const rawSheetTableName = primaryDataset?.metadata?.rawSheetTableName ?? null;
 
-      let response;
+      const userContent = [
+        options?.adminIntent
+          ? `Admin's requested focus/framing for this combined dashboard: "${options.adminIntent}".\n`
+          : "",
+        "Datasets in this combined session (metadata and schema):",
+        JSON.stringify(
+          datasets.map((d) => ({
+            datasetId: d.datasetId,
+            datasetName: d.datasetName,
+            metadata: d.metadata,
+          })),
+        ),
+        "",
+        "Documents in this combined session (fullText and sections):",
+        JSON.stringify(
+          documents.map((doc) => ({
+            documentId: doc.documentId,
+            documentName: doc.documentName,
+            fullText: doc.fullText,
+            sections: doc.sections,
+            keyPoints: doc.keyPoints,
+          })),
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 16_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_dashboard_config",
-              description: "Emit the unified dashboard configuration and cross-source insights.",
-              input_schema: dashboardConfigToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_dashboard_config" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                options?.adminIntent
-                  ? `Admin's requested focus/framing for this combined dashboard: "${options.adminIntent}".\n`
-                  : "",
-                "Datasets in this combined session (metadata and schema):",
-                JSON.stringify(
-                  datasets.map((d) => ({
-                    datasetId: d.datasetId,
-                    datasetName: d.datasetName,
-                    metadata: d.metadata,
-                  })),
-                ),
-                "",
-                "Documents in this combined session (fullText and sections):",
-                JSON.stringify(
-                  documents.map((doc) => ({
-                    documentId: doc.documentId,
-                    documentName: doc.documentName,
-                    fullText: doc.fullText,
-                    sections: doc.sections,
-                    keyPoints: doc.keyPoints,
-                  })),
-                ),
-              ]
-                .filter(Boolean)
-                .join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new CombinedDashboardBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Provider detail: ${detail}`,
+      // Same reasoning as claudeChatClient.ts: with an OpenRouter-format
+      // key, calling Anthropic's native SDK straight at
+      // ANTHROPIC_BASE_URL fails, because OpenRouter's Anthropic-shaped
+      // endpoint is not the same one the SDK's client.messages.create
+      // targets -- this client had no OpenRouter branch at all until now,
+      // so every combined-dashboard generation call was failing outright
+      // whenever the deployed key is an OpenRouter key. The prompt's
+      // schema is serialized from dashboardConfigToolSchema (already
+      // imported), not hand-copied, so it can't drift from the real
+      // validator the way the earlier chat-client bug did.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(dashboardConfigToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 16000,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new CombinedDashboardError(
+            `Combined dashboard request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new CombinedDashboardError(
-          `Combined dashboard request failed on model "${activeModel}": ${detail}`,
+        if (!rawInput) {
+          throw new CombinedDashboardValidationError(
+            `Model "${activeModel}" did not return parseable JSON for the combined dashboard config.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 16_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_dashboard_config",
+                description: "Emit the unified dashboard configuration and cross-source insights.",
+                input_schema: dashboardConfigToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_dashboard_config" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new CombinedDashboardBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Provider detail: ${detail}`,
+            );
+          }
+
+          throw new CombinedDashboardError(
+            `Combined dashboard request failed on model "${activeModel}": ${detail}`,
+          );
+        }
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new CombinedDashboardValidationError(
+            `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new CombinedDashboardValidationError(
-          `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const normalizedInput = normalizeDashboardConfigInput(toolUse.input);
+      const normalizedInput = normalizeDashboardConfigInput(rawInput);
       const result = dashboardConfigSchema.safeParse(normalizedInput);
 
       if (!result.success) {
