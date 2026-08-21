@@ -1,12 +1,7 @@
 import * as XLSX from "xlsx";
 import type { Payload } from "payload";
-import Anthropic from "@anthropic-ai/sdk";
 import {
-  buildDatasetMetadata,
-  dashboardConfigToolSchema,
   normalizeDashboardConfigInput,
-  resolveClaudeModel,
-  type NormalizedTableShape,
 } from "@analytics/shared";
 
 export interface ParsedColumn {
@@ -24,8 +19,27 @@ export interface ParsedTable {
 }
 
 export function inferColumnType(
+  name: string,
   values: unknown[],
 ): "numeric" | "date" | "boolean" | "id" | "categorical" | "text" {
+  const lowerName = String(name || "").toLowerCase().trim();
+
+  // Strict semantic identification for ID columns
+  if (
+    /^(sr\.?\s*no|s\.?\s*no|serial|id|emp_?id|employee_?id|code|#|index|no|serial_?number)$/i.test(lowerName) ||
+    lowerName.endsWith("_id") ||
+    lowerName.endsWith(" id")
+  ) {
+    return "id";
+  }
+
+  // Strict semantic identification for Date and Time columns
+  if (
+    /(date|joining|exit|dob|month|year|timestamp|day|time|lwd|last_working_day)/i.test(lowerName)
+  ) {
+    return "date";
+  }
+
   const nonNull = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
   if (nonNull.length === 0) return "text";
 
@@ -91,16 +105,16 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
     const aoa = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, defval: "" });
     if (aoa.length === 0) continue;
 
-    // Detect header row index (row with the most non-empty string headers in the first 6 rows)
+    // Scan top 10 rows to locate the true multi-column header row
     let headerRowIdx = 0;
     let maxCols = 0;
-    for (let r = 0; r < Math.min(6, aoa.length); r++) {
+    for (let r = 0; r < Math.min(10, aoa.length); r++) {
       const row = aoa[r];
       if (!Array.isArray(row)) continue;
       const validHeaders = row.filter(
         (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
       );
-      if (validHeaders.length > maxCols) {
+      if (validHeaders.length > maxCols && validHeaders.length >= 2) {
         maxCols = validHeaders.length;
         headerRowIdx = r;
       }
@@ -121,7 +135,7 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
 
     if (headers.length === 0) continue;
 
-    const rows: Record<string, any>[] = [];
+    const rows: Record<string, unknown>[] = [];
     for (let r = headerRowIdx + 1; r < aoa.length; r++) {
       const row = aoa[r];
       if (!Array.isArray(row)) continue;
@@ -130,24 +144,22 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
       );
       if (isBlank) continue;
 
-      const rowObj: Record<string, any> = {};
+      const rowObj: Record<string, unknown> = {};
       let hasData = false;
       for (let c = 0; c < headers.length; c++) {
-        const h = headers[c]!;
+        const h = headers[c];
         const cell = row[c];
         rowObj[h] = cell !== undefined && cell !== "" ? cell : null;
         if (rowObj[h] !== null) hasData = true;
       }
-      if (hasData) {
-        rows.push(rowObj);
-      }
+      if (hasData) rows.push(rowObj);
     }
 
     if (rows.length === 0) continue;
 
-    const columnsWithTypes: ParsedColumn[] = headers.map((colName) => {
+    const columnsWithTypes = headers.map((colName) => {
       const sampleVals = rows.slice(0, 100).map((r) => r[colName]);
-      const inferredType = inferColumnType(sampleVals);
+      const inferredType = inferColumnType(colName, sampleVals);
       return { name: colName, inferredType };
     });
 
@@ -166,14 +178,16 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
 
 export async function processIngestionDirectly(
   payload: Payload,
-  jobId: string | number,
-  datasetId: string | number,
+  jobId: number | string,
+  datasetId: number | string,
   buffer: Buffer,
   filename: string,
   intentPrompt?: string | null,
 ): Promise<void> {
+  console.log(`[DirectIngestion] Starting ingestion for dataset ${datasetId} (${filename})...`);
+
   try {
-    // 1. Update job to processing
+    // 1. Mark Job Processing
     await payload.update({
       collection: "jobs",
       id: Number(jobId),
@@ -188,164 +202,127 @@ export async function processIngestionDirectly(
 
     const totalRows = tables.reduce((acc, t) => acc + t.rowCount, 0);
 
-    // 3. Extract AI dashboard layout using OpenRouter / Claude
+    // 3. Extract AI dashboard layout using OpenRouter directly
     const apiKey = process.env.ANTHROPIC_API_KEY;
 
     let dashboardConfig: any = null;
 
     if (apiKey) {
-      // 1. Primary path: Official Claude tool calling via @anthropic-ai/sdk (identical to worker)
       try {
-        const client = new Anthropic({
-          apiKey,
-          baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
-        });
-
-        const normalizedTables: NormalizedTableShape[] = tables.map((t) => ({
-          tableName: t.name,
-          tableRole: "data" as const,
-          headerRowIndex: 0,
-          columns: t.columnsWithTypes.map((c) => ({
-            name: c.name,
-            inferredType: c.inferredType,
-            nullable: true,
-            sampleValues: (t.sampleRows || []).slice(0, 5).map((r) => String(r[c.name] ?? "")),
-          })),
-          rows: t.allRows || t.sampleRows || [],
-          rowHash: `hash_${t.name}`,
+        const tableSummary = tables.map((t) => ({
+          sheet: t.name,
+          columns: t.columnsWithTypes.map((c) => `${c.name} (${c.inferredType})`),
+          rowCount: t.rowCount,
+          sampleRows: t.sampleRows.slice(0, 2),
         }));
 
-        const metadata = buildDatasetMetadata(
-          String(datasetId),
-          filename,
-          normalizedTables,
-          [],
-        );
+        const prompt = [
+          "You are a Principal Executive Business Intelligence & Analytics Architect.",
+          "Transform this dataset into a world-class, C-suite executive dashboard with multiple tabs and actionable insights.",
+          `Filename: ${filename}`,
+          `Total Clean Records: ${totalRows}`,
+          `Structured Sheets & Column Types: ${JSON.stringify(tableSummary, null, 2)}`,
+          intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
+          "",
+          "EXECUTIVE DESIGN RULES:",
+          "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
+          "2. NO ID OR DATE SUMS: Never sum or average ID columns (Sr No, Emp ID, Index, Serial) or date columns (Date of Joining, LWD).",
+          "3. MULTI-TAB ARCHITECTURE: Generate 3 to 4 distinct tabs for key domains (e.g. Executive Overview, Department Breakdown, Reason & Tenure Dynamics, Action Priorities).",
+          "4. QUANTIFIED INSIGHTS: Provide 4-6 high-impact executive insights citing real numbers, implications, recommended actions, and department owners with presentation shape: 'tracker-item'.",
+          "",
+          "Return ONLY valid JSON matching this schema:",
+          "{",
+          '  "title": "Executive Intelligence Dashboard Title",',
+          '  "description": "High-level strategic briefing on metrics and performance",',
+          '  "tabs": [',
+          "    {",
+          '      "tabId": "executive_overview",',
+          '      "tabName": "Executive Overview",',
+          '      "widgets": [',
+          "        {",
+          '          "widgetId": "w1",',
+          '          "type": "kpi_card",',
+          '          "title": "Total Volume",',
+          `          "sourceTable": "${tables[0]?.name || "Data"}",`,
+          `          "fields": ["${tables[0]?.columns[0] || "id"}"],`,
+          '          "aggregation": "count",',
+          '          "position": { "col": 0, "row": 0, "w": 3, "h": 2 }',
+          "        }",
+          "      ]",
+          "    }",
+          "  ],",
+          '  "insights": [',
+          "    {",
+          '      "insightId": "ins1",',
+          '      "finding": "Analytical finding with specific figures.",',
+          '      "whyItMatters": "Strategic business implication.",',
+          '      "recommendedAction": "Concrete executive next step.",',
+          '      "severity": "positive",',
+          '      "presentation": { "shape": "tracker-item", "status": "Action Required", "owner": "Leadership" },',
+          '      "relatedTables": [],',
+          '      "metrics": []',
+          "    }",
+          "  ]",
+          "}",
+        ].join("\n");
 
-        const modelName = resolveClaudeModel(
-          process.env.ANTHROPIC_CONFIG_MODEL || "claude-sonnet-5",
-        );
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 25000);
 
-        const response = await client.messages.create({
-          model: modelName,
-          max_tokens: 16000,
-          system: [
-            "You are a Principal Executive Business Intelligence & Analytics Architect.",
-            "Design a comprehensive multi-tab executive dashboard configuration and strategic insights for this dataset.",
-            "STRICT RULES:",
-            "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
-            "2. MULTI-TAB ARCHITECTURE: If the dataset has multiple distinct domain sheets (e.g. Reconciliation Summary, Missing in 2B, In 2B Not in Books, Matched, Credit & Debit Notes), generate a dedicated tab for each domain in addition to an Executive Overview tab.",
-            "3. ACTIONABLE INSIGHTS WITH LIVE METRICS & CHECKLISTS: Produce 4 to 6 quantified insights citing real metrics, business implications, recommended action steps, and assigned owners with presentation shape: 'tracker-item'.",
-            "4. You must call the emit_dashboard_config tool exactly once.",
-          ].join("\n"),
-          tools: [
-            {
-              name: "emit_dashboard_config",
-              description: "Emit the dashboard configuration and insights for this dataset.",
-              input_schema: dashboardConfigToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_dashboard_config" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
-                `Dataset Metadata:\n${JSON.stringify(metadata, null, 2)}`,
-              ]
-                .filter(Boolean)
-                .join("\n\n"),
-            },
-          ],
-        });
+        const modelsToTry = [
+          "anthropic/claude-sonnet-5",
+          "google/gemini-2.5-flash",
+          "openai/gpt-4o",
+        ];
 
-        const toolUse = response.content.find(
-          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-        );
+        for (const modelId of modelsToTry) {
+          try {
+            const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model: modelId,
+                messages: [{ role: "user", content: prompt }],
+                max_tokens: 4000,
+              }),
+              signal: controller.signal,
+            });
 
-        if (toolUse && toolUse.input) {
-          const normalized = normalizeDashboardConfigInput(toolUse.input);
-          dashboardConfig = normalized;
-          console.log("[DirectIngestion] Dashboard generated successfully via Anthropic tool calling");
-        }
-      } catch (anthropicErr) {
-        console.warn("[DirectIngestion] Anthropic SDK call failed, attempting fallback:", anthropicErr);
-      }
-
-      // 2. Secondary path: Multi-model OpenRouter completions
-      if (!dashboardConfig || !Array.isArray(dashboardConfig.tabs) || dashboardConfig.tabs.length === 0) {
-        try {
-          const tableSummary = tables.map((t) => ({
-            sheet: t.name,
-            columns: t.columnsWithTypes.map((c) => `${c.name} (${c.inferredType})`),
-            rowCount: t.rowCount,
-            sampleRows: t.sampleRows.slice(0, 2),
-          }));
-
-          const prompt = [
-            "You are a Principal Executive Business Intelligence & Analytics Architect.",
-            "Transform this raw dataset into an elite, C-suite executive intelligence dashboard.",
-            `Filename: ${filename}`,
-            `Total Clean Records: ${totalRows}`,
-            `Clean Structured Tables & Columns: ${JSON.stringify(tableSummary, null, 2)}`,
-            intentPrompt ? `User Strategic Intent: "${intentPrompt}"` : "",
-            "",
-            "CRITICAL DESIGN ARCHITECTURE:",
-            "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
-            "2. MULTI-TAB EXECUTIVE STRUCTURE: Organize multi-table data into distinct tabs for every sheet domain.",
-            "3. SMART MEASURE MAPPING: Map categorical/date columns to category axis, and numeric columns to measures.",
-            "4. ACTIONABLE INSIGHTS WITH LIVE NUMBERS & CHECKLIST TRACKER: Provide 4-6 high-impact executive insights with specific numbers and action items.",
-            "",
-            "Return ONLY valid JSON matching schema with { title, description, tabs, insights }.",
-          ].join("\n");
-
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 35000);
-
-          const modelsToTry = [
-            "anthropic/claude-sonnet-5",
-            "google/gemini-2.5-flash",
-            "openai/gpt-4o",
-          ];
-
-          for (const modelId of modelsToTry) {
-            try {
-              const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${apiKey}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  model: modelId,
-                  messages: [{ role: "user", content: prompt }],
-                  max_tokens: 4000,
-                }),
-                signal: controller.signal,
-              });
-
-              if (openRouterRes.ok) {
-                const aiData = await openRouterRes.json();
-                const rawText = aiData.choices?.[0]?.message?.content || "";
-                const jsonMatch =
-                  rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, rawText];
-                const clean = jsonMatch[1]?.trim() || rawText.trim();
-                const parsed = JSON.parse(clean);
-                if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
-                  dashboardConfig = normalizeDashboardConfigInput(parsed);
-                  console.log(`[DirectIngestion] Dashboard generated successfully using ${modelId}`);
-                  break;
+            if (openRouterRes.ok) {
+              const aiData = await openRouterRes.json();
+              const rawText = aiData.choices?.[0]?.message?.content || "";
+              let clean = rawText.trim();
+              if (clean.includes("```")) {
+                const match = clean.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+                if (match && match[1]) {
+                  clean = match[1].trim();
+                } else {
+                  clean = clean.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
                 }
               }
-            } catch (modelErr) {
-              console.warn(`[DirectIngestion] Model ${modelId} failed:`, modelErr);
+              const firstBrace = clean.indexOf("{");
+              const lastBrace = clean.lastIndexOf("}");
+              if (firstBrace !== -1 && lastBrace !== -1) {
+                clean = clean.slice(firstBrace, lastBrace + 1);
+              }
+              const parsed = JSON.parse(clean);
+              if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
+                dashboardConfig = normalizeDashboardConfigInput(parsed);
+                console.log(`[DirectIngestion] Dashboard generated dynamically via AI using ${modelId}`);
+                break;
+              }
             }
+          } catch (modelErr) {
+            console.warn(`[DirectIngestion] Model ${modelId} failed:`, modelErr);
           }
-
-          clearTimeout(timeout);
-        } catch (aiErr: unknown) {
-          console.warn("[DirectIngestion] OpenRouter fallback error:", aiErr);
         }
+
+        clearTimeout(timeout);
+      } catch (aiErr: unknown) {
+        console.warn("[DirectIngestion] AI generation error:", aiErr);
       }
     }
 
@@ -356,54 +333,86 @@ export async function processIngestionDirectly(
       const generatedTabs: any[] = [];
       const generatedInsights: any[] = [];
 
+      const realNumCols = (t: ParsedTable) =>
+        t.columnsWithTypes.filter((c) => c.inferredType === "numeric");
+      const realCatCols = (t: ParsedTable) =>
+        t.columnsWithTypes.filter(
+          (c) => c.inferredType === "categorical" || c.inferredType === "text",
+        );
+
       // 1. Executive Overview Tab
       const overviewWidgets: any[] = [];
-      tables.slice(0, 4).forEach((table, idx) => {
-        const numCol = table.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
-        const catCol = table.columnsWithTypes.find(
-          (c) => c.inferredType === "categorical" || c.inferredType === "text" || c.inferredType === "id",
-        )?.name || table.columns[0];
 
-        overviewWidgets.push({
-          widgetId: `ov_kpi_${idx + 1}`,
-          type: "kpi_card",
-          title: numCol ? `Total ${numCol} (${table.name})` : `${table.name} Count`,
-          sourceTable: table.name,
-          fields: [numCol || catCol || "id"],
-          aggregation: numCol ? "sum" : "count",
-          position: { col: idx * 3, row: 0, w: 3, h: 2 },
-        });
+      overviewWidgets.push({
+        widgetId: "ov_kpi_1",
+        type: "kpi_card",
+        title: "Total Volume",
+        sourceTable: tables[0]?.name || "Data",
+        fields: [tables[0]?.columns[0] || "id"],
+        aggregation: "count",
+        position: { col: 0, row: 0, w: 3, h: 2 },
+      });
+
+      tables.slice(0, 3).forEach((table, idx) => {
+        const nums = realNumCols(table);
+        if (nums[0]) {
+          overviewWidgets.push({
+            widgetId: `ov_kpi_${idx + 2}`,
+            type: "kpi_card",
+            title: `Total ${nums[0].name}`,
+            sourceTable: table.name,
+            fields: [nums[0].name],
+            aggregation: "sum",
+            position: { col: (idx + 1) * 3, row: 0, w: 3, h: 2 },
+          });
+        } else {
+          const cats = realCatCols(table);
+          if (cats[0]) {
+            overviewWidgets.push({
+              widgetId: `ov_kpi_${idx + 2}`,
+              type: "kpi_card",
+              title: `Distinct ${cats[0].name}`,
+              sourceTable: table.name,
+              fields: [cats[0].name],
+              aggregation: "distinct",
+              position: { col: (idx + 1) * 3, row: 0, w: 3, h: 2 },
+            });
+          }
+        }
       });
 
       if (tables[0]) {
         const t0 = tables[0];
-        const catCol = t0.columnsWithTypes.find((c) => c.inferredType === "categorical")?.name || t0.columns[0];
-        const numCol = t0.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
+        const cats = realCatCols(t0);
+        const nums = realNumCols(t0);
+        const catCol = cats[0]?.name || t0.columns[1] || t0.columns[0];
+        const numCol = nums[0]?.name;
 
         overviewWidgets.push({
           widgetId: "ov_chart_1",
           type: "bar",
-          title: `${t0.name} Breakdown by ${catCol || "Category"}`,
+          title: `${t0.name} by ${catCol}`,
           sourceTable: t0.name,
-          fields: numCol && catCol ? [catCol, numCol] : [catCol || "Category"],
+          fields: numCol ? [catCol, numCol] : [catCol],
           aggregation: numCol ? "sum" : "count",
           position: { col: 0, row: 2, w: 6, h: 4 },
         });
       }
 
-      if (tables[1] || tables[0]) {
-        const t1 = tables[1] || tables[0];
-        const dateCol = t1.columnsWithTypes.find((c) => c.inferredType === "date")?.name;
-        const catCol = t1.columnsWithTypes.find((c) => c.inferredType === "categorical")?.name || t1.columns[1] || t1.columns[0];
-        const numCol = t1.columnsWithTypes.find((c) => c.inferredType === "numeric")?.name;
+      const t1 = tables[1] || tables[0];
+      if (t1) {
+        const cats = realCatCols(t1);
+        const nums = realNumCols(t1);
+        const catCol = cats[0]?.name || t1.columns[0];
+        const numCol = nums[0]?.name;
 
         overviewWidgets.push({
           widgetId: "ov_chart_2",
-          type: dateCol ? "line" : "horizontal_bar",
-          title: `${t1.name} ${dateCol ? "Trend" : "Distribution"}`,
+          type: "pie",
+          title: `${t1.name} Distribution`,
           sourceTable: t1.name,
-          fields: dateCol && numCol ? [dateCol, numCol] : catCol && numCol ? [catCol, numCol] : [catCol || "Category"],
-          aggregation: numCol ? "sum" : "count",
+          fields: [catCol],
+          aggregation: "count",
           position: { col: 6, row: 2, w: 6, h: 4 },
         });
       }
@@ -417,24 +426,20 @@ export async function processIngestionDirectly(
       // 2. Specialized Tab for each Sheet
       tables.forEach((table, tIdx) => {
         const widgets: any[] = [];
-        const numCols = table.columnsWithTypes.filter((c) => c.inferredType === "numeric");
-        const catCols = table.columnsWithTypes.filter(
-          (c) => c.inferredType === "categorical" || c.inferredType === "text" || c.inferredType === "id",
-        );
+        const numCols = realNumCols(table);
+        const catCols = realCatCols(table);
         const dateCols = table.columnsWithTypes.filter((c) => c.inferredType === "date");
 
-        // KPI 1: Record Count
         widgets.push({
           widgetId: `t_${tIdx + 1}_kpi_1`,
           type: "kpi_card",
-          title: `${table.name} Volume`,
+          title: `${table.name} Records`,
           sourceTable: table.name,
           fields: [table.columns[0] || "id"],
           aggregation: "count",
           position: { col: 0, row: 0, w: 4, h: 2 },
         });
 
-        // KPI 2: Sum / Avg Metric
         if (numCols[0]) {
           widgets.push({
             widgetId: `t_${tIdx + 1}_kpi_2`,
@@ -447,7 +452,6 @@ export async function processIngestionDirectly(
           });
         }
 
-        // KPI 3: Avg Metric or Distinct
         if (numCols[1] || numCols[0]) {
           const colToUse = numCols[1] || numCols[0];
           widgets.push({
@@ -471,20 +475,18 @@ export async function processIngestionDirectly(
           });
         }
 
-        // Chart 1: Categorical Bar / Distribution
         const xCol = catCols[0]?.name || table.columns[0];
         const yCol = numCols[0]?.name;
         widgets.push({
           widgetId: `t_${tIdx + 1}_chart_1`,
           type: "bar",
-          title: `${table.name} by ${xCol || "Category"}`,
+          title: `${table.name} Breakdown by ${xCol}`,
           sourceTable: table.name,
           fields: yCol && xCol ? [xCol, yCol] : [xCol || "Category"],
           aggregation: yCol ? "sum" : "count",
           position: { col: 0, row: 2, w: 6, h: 4 },
         });
 
-        // Chart 2: Trend Line or Horizontal Bar
         if (dateCols[0] && numCols[0]) {
           widgets.push({
             widgetId: `t_${tIdx + 1}_chart_2`,
@@ -525,12 +527,11 @@ export async function processIngestionDirectly(
           widgets,
         });
 
-        // Generate dynamic insight for this sheet
         generatedInsights.push({
           insightId: `ins_${tIdx + 1}`,
-          finding: `${table.name} captures ${table.rowCount} records with ${numCols.length} key metric measures.`,
-          whyItMatters: `Provides granular operational visibility into ${table.name.toLowerCase()} trends and performance.`,
-          recommendedAction: `Review ${table.name.toLowerCase()} variance during executive operations review.`,
+          finding: `${table.name} captures ${table.rowCount} records across key operational segments.`,
+          whyItMatters: `Provides granular visibility into ${table.name.toLowerCase()} trends and performance drivers.`,
+          recommendedAction: `Review ${table.name.toLowerCase()} variances during quarterly executive leadership review.`,
           severity: tIdx % 2 === 0 ? "positive" : "warning",
           presentation: {
             shape: "tracker-item",
@@ -539,8 +540,7 @@ export async function processIngestionDirectly(
           },
           relatedTables: [table.name],
           metrics: [
-            { label: `${table.name} Rows`, value: String(table.rowCount) },
-            ...(numCols[0] ? [{ label: `Measure: ${numCols[0].name}`, value: "Active" }] : []),
+            { label: `${table.name} Volume`, value: String(table.rowCount) },
           ],
         });
       });
@@ -579,57 +579,21 @@ export async function processIngestionDirectly(
       id: Number(datasetId),
       data: {
         status: "ready",
-        totalRows,
-        tableNames: tables.map((t) => ({ tableName: t.name })),
-        data: {
-          tables: tables.map((t) => ({
-            tableName: t.name,
-            tableRole: "dimension",
-            columns: t.columnsWithTypes,
-            rows: t.allRows,
-          })),
-        } as any,
-      },
+      } as any,
     });
 
-    // 6. Ensure single-source session exists
-    const existingSessions = await payload.find({
-      collection: "sessions",
-      where: {
-        datasets: {
-          contains: Number(datasetId),
-        },
-      },
-      limit: 1,
-    });
-
-    if (existingSessions.docs.length === 0) {
-      await payload.create({
-        collection: "sessions",
-        data: {
-          name: filename.replace(/\.[^/.]+$/, ""),
-          datasets: [Number(datasetId)],
-          status: "ready",
-          overview: {
-            findings: dashboardConfig.insights || [],
-          },
-        },
-      });
-    }
-
-    // 7. Update Job record to completed
+    // 6. Mark Job Completed
     await payload.update({
       collection: "jobs",
       id: Number(jobId),
-      data: {
-        status: "completed",
-      },
+      data: { status: "completed" },
     });
 
-    console.log(`[DirectIngestion] ✅ Ingestion complete for Job ${jobId}, Dataset ${datasetId}`);
+    console.log(`[DirectIngestion] Ingestion completed successfully for dataset ${datasetId}.`);
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    console.error(`[DirectIngestion] ❌ Failed job ${jobId}:`, errorMsg);
+    console.error(`[DirectIngestion] Ingestion failed for dataset ${datasetId}:`, err);
+
     await payload.update({
       collection: "jobs",
       id: Number(jobId),
@@ -638,5 +602,15 @@ export async function processIngestionDirectly(
         error: errorMsg,
       },
     });
+
+    await payload.update({
+      collection: "datasets",
+      id: Number(datasetId),
+      data: {
+        status: "failed",
+      } as any,
+    });
+
+    throw err;
   }
 }
