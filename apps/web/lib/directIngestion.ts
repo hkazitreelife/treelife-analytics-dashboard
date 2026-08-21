@@ -249,6 +249,48 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
     }
   }
 
+  // Sheet-tab purity: every tab except the one designated cross-sheet
+  // overview must source every widget from a single table. Without this, a
+  // model free to invent "domain" tabs (e.g. "Reason & Tenure Dynamics")
+  // can blend fields from different sheets into one tab, which is what
+  // looks like sheets being combined/mixed to an admin even when each
+  // individual field reference is technically valid.
+  const isOverviewTab = (tab: any): boolean =>
+    tab.tabId === "executive_overview" || /overview/i.test(String(tab.tabName ?? ""));
+
+  const tabsSeenPerTable = new Set<string>();
+
+  for (const tab of config.tabs ?? []) {
+    if (isOverviewTab(tab)) {
+      continue;
+    }
+
+    const sourceTables = new Set(
+      (tab.widgets ?? []).map((widget: any) => widget.sourceTable).filter(Boolean),
+    );
+
+    if (sourceTables.size > 1) {
+      problems.push(
+        `tab "${tab.tabName}" mixes widgets from multiple sheets (${Array.from(sourceTables).join(", ")}) -- every non-overview tab must stay scoped to one sheet`,
+      );
+    }
+
+    for (const t of sourceTables) {
+      tabsSeenPerTable.add(t as string);
+    }
+  }
+
+  // Coverage: every parsed sheet must get its own tab somewhere, not just a
+  // mention inside the combined overview -- CLAUDE.md's "never silently
+  // drop a table" rule, applied to tabs the same way it applies to rows.
+  for (const table of tables) {
+    if (!tabsSeenPerTable.has(table.name)) {
+      problems.push(
+        `sheet "${table.name}" has no dedicated tab of its own (only appears, if at all, in the combined overview)`,
+      );
+    }
+  }
+
   return problems;
 }
 
@@ -303,7 +345,19 @@ export async function processIngestionDirectly(
           "EXECUTIVE DESIGN RULES:",
           "1. ZERO RAW TABLES: Never emit 'table' widget type. Dashboards must be 100% VISUAL: use 'kpi_card', 'bar', 'horizontal_bar', 'line', 'pie'.",
           "2. NO ID OR DATE SUMS: Never sum or average ID columns (Sr No, Emp ID, Index, Serial) or date columns (Date of Joining, LWD).",
-          "3. MULTI-TAB ARCHITECTURE: Generate 3 to 4 distinct tabs for key domains (e.g. Executive Overview, Department Breakdown, Reason & Tenure Dynamics, Action Priorities).",
+          [
+            "3. ONE TAB PER SHEET, NEVER MIXED: Every sheet listed above (",
+            tables.map((t) => t.name).join(", "),
+            ") gets exactly one dedicated tab, tabName matching that sheet's name verbatim.",
+            " Every widget inside a sheet's tab must set sourceTable to that same sheet and use only",
+            " that sheet's own columns -- never blend fields from a different sheet into a",
+            " sheet-specific tab, even if two sheets seem related. In addition to those per-sheet tabs,",
+            " add exactly one more tab named Executive Overview (tabId executive_overview) that may pull",
+            " KPIs from multiple sheets for a cross-sheet summary -- that tab is the only place widgets",
+            " from different sourceTables may appear together. This mirrors how a later multi-source",
+            " session (datasets plus uploaded documents) stays separated per source with one combined",
+            " view on top; the same rule applies within a single workbook's sheets now.",
+          ].join(""),
           "4. QUANTIFIED INSIGHTS: Provide 4-6 high-impact executive insights citing real numbers, implications, recommended actions, and department owners with presentation shape: 'tracker-item'.",
           "",
           "Return ONLY valid JSON matching this schema:",
