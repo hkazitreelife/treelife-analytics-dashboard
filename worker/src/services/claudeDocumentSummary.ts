@@ -161,68 +161,101 @@ export const createClaudeDocumentSummaryClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
-      let response;
+      const userContent = [
+        options?.adminIntent
+          ? `The admin who uploaded this file said, about what they want from this summary: "${options.adminIntent}". Follow this framing where it doesn't conflict with the rules above -- e.g. weight importance toward the angle it names -- but every quote must still be a real, verbatim excerpt of fullText.\n`
+          : "",
+        "Document sections (structure only):",
+        JSON.stringify(sections),
+        "",
+        "Document fullText:",
+        fullText,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 8_000,
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_document_summary",
-              description: "Emit the prioritized key-points summary for this document.",
-              input_schema: documentSummaryToolSchema,
-            },
-          ],
-          tool_choice: { type: "tool", name: "emit_document_summary" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                options?.adminIntent
-                  ? `The admin who uploaded this file said, about what they want from this summary: "${options.adminIntent}". Follow this framing where it doesn't conflict with the rules above -- e.g. weight importance toward the angle it names -- but every quote must still be a real, verbatim excerpt of fullText.\n`
-                  : "",
-                "Document sections (structure only):",
-                JSON.stringify(sections),
-                "",
-                "Document fullText:",
-                fullText,
-              ]
-                .filter(Boolean)
-                .join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new ClaudeSummaryBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_SUMMARY_MODEL to a model the key can use. Provider detail: ${detail}`,
+      // This entire package had no OpenRouter branch anywhere before this:
+      // with an OpenRouter-format ANTHROPIC_API_KEY, every call to Claude's
+      // native SDK straight at ANTHROPIC_BASE_URL fails outright, the same
+      // finding already fixed for apps/web's clients. The prompt schema is
+      // serialized from documentSummaryToolSchema (already imported), not
+      // hand-copied, so it can't drift from the real validator.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(documentSummaryToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 8000,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new ClaudeSummaryError(
+            `Claude document-summary request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new ClaudeSummaryError(
-          `Claude document-summary request failed on model "${activeModel}": ${detail}`,
+        if (!rawInput) {
+          throw new ClaudeSummaryValidationError(
+            `Model "${activeModel}" did not return parseable JSON for the document summary.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 8_000,
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_document_summary",
+                description: "Emit the prioritized key-points summary for this document.",
+                input_schema: documentSummaryToolSchema,
+              },
+            ],
+            tool_choice: { type: "tool", name: "emit_document_summary" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new ClaudeSummaryBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_SUMMARY_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new ClaudeSummaryError(
+            `Claude document-summary request failed on model "${activeModel}": ${detail}`,
+          );
+        }
+
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new ClaudeSummaryValidationError(
+            `Model "${activeModel}" did not call emit_document_summary. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new ClaudeSummaryValidationError(
-          `Model "${activeModel}" did not call emit_document_summary. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const result = documentSummarySchema.safeParse(toolUse.input);
+      const result = documentSummarySchema.safeParse(rawInput);
 
       if (!result.success) {
         throw new ClaudeSummaryValidationError(

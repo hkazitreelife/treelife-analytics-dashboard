@@ -176,80 +176,111 @@ export const createClaudeConfigClient = (
         ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
         : SYSTEM_INSTRUCTION;
 
-      let response;
+      const userContent = [
+        options?.adminIntent
+          ? [
+            "The admin who uploaded this file said, about what they want",
+            `from this dashboard: "${options.adminIntent}". Follow this`,
+            "framing where it doesn't conflict with the rules above --",
+            "e.g. lead the Overview with the tables/fields it points at,",
+            "or emphasize the requested angle in insights -- but you must",
+            "still only build widgets on rawSheetTableName, never invent",
+            "a table/column, and every metric still resolves against real",
+            "data exactly as required above.",
+            "",
+          ].join(" ")
+          : "",
+        `Dataset metadata:\n${JSON.stringify(metadata)}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      try {
-        response = await client.messages.create({
-          model: activeModel,
-          max_tokens: 16_000,
-          // No temperature: it is deprecated on current Claude models and
-          // sending it is rejected with a 400.
-          system: systemInstruction,
-          tools: [
-            {
-              name: "emit_dashboard_config",
-              description:
-                "Emit the dashboard configuration and insights for this dataset.",
-              input_schema: dashboardConfigToolSchema,
-            },
-          ],
-          // Forces the structured shape at the API level rather than asking for
-          // it in prose.
-          tool_choice: { type: "tool", name: "emit_dashboard_config" },
-          messages: [
-            {
-              role: "user",
-              content: [
-                options?.adminIntent
-                  ? [
-                    "The admin who uploaded this file said, about what they want",
-                    `from this dashboard: "${options.adminIntent}". Follow this`,
-                    "framing where it doesn't conflict with the rules above --",
-                    "e.g. lead the Overview with the tables/fields it points at,",
-                    "or emphasize the requested angle in insights -- but you must",
-                    "still only build widgets on rawSheetTableName, never invent",
-                    "a table/column, and every metric still resolves against real",
-                    "data exactly as required above.",
-                    "",
-                  ].join(" ")
-                  : "",
-                `Dataset metadata:\n${JSON.stringify(metadata)}`,
-              ]
-                .filter(Boolean)
-                .join("\n"),
-            },
-          ],
-        });
-      } catch (error: unknown) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const status =
-          typeof error === "object" && error !== null && "status" in error
-            ? Number((error as { status: unknown }).status)
-            : undefined;
+      let rawInput: unknown = null;
 
-        // The key must never reach a log or an error message.
-        if (isClaudeBillingRejection(detail, status)) {
-          throw new ClaudeBillingError(
-            `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". This is a payment or throughput problem, not bad model output. Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+      // This entire package had no OpenRouter branch anywhere before this:
+      // with an OpenRouter-format ANTHROPIC_API_KEY, every call to Claude's
+      // native SDK straight at ANTHROPIC_BASE_URL fails outright, the same
+      // finding already fixed for apps/web's clients. The prompt schema is
+      // serialized from dashboardConfigToolSchema (already imported), not
+      // hand-copied, so it can't drift from the real validator.
+      if (apiKey.startsWith("sk-or-") || process.env.ANTHROPIC_BASE_URL?.includes("openrouter")) {
+        try {
+          const { callLlmCompletion } = await import("./openRouterClient");
+          const llmRes = await callLlmCompletion({
+            apiKey,
+            model: activeModel,
+            system: `${systemInstruction}\n\nYou must return ONLY valid JSON (no markdown fences, no extra keys) matching this exact JSON Schema: ${JSON.stringify(dashboardConfigToolSchema)}`,
+            userPrompt: userContent,
+            maxTokens: 16000,
+          });
+
+          rawInput = llmRes.jsonContent;
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new ClaudeError(`Claude request failed on model "${activeModel}": ${detail}`);
+        }
+
+        if (!rawInput) {
+          throw new ClaudeValidationError(
+            `Model "${activeModel}" did not return parseable JSON for the dashboard config.`,
+          );
+        }
+      } else {
+        let response;
+
+        try {
+          response = await client.messages.create({
+            model: activeModel,
+            max_tokens: 16_000,
+            // No temperature: it is deprecated on current Claude models and
+            // sending it is rejected with a 400.
+            system: systemInstruction,
+            tools: [
+              {
+                name: "emit_dashboard_config",
+                description:
+                  "Emit the dashboard configuration and insights for this dataset.",
+                input_schema: dashboardConfigToolSchema,
+              },
+            ],
+            // Forces the structured shape at the API level rather than asking for
+            // it in prose.
+            tool_choice: { type: "tool", name: "emit_dashboard_config" },
+            messages: [{ role: "user", content: userContent }],
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const status =
+            typeof error === "object" && error !== null && "status" in error
+              ? Number((error as { status: unknown }).status)
+              : undefined;
+
+          // The key must never reach a log or an error message.
+          if (isClaudeBillingRejection(detail, status)) {
+            throw new ClaudeBillingError(
+              `BILLING, QUOTA OR RATE-LIMIT REJECTION from model "${activeModel}". This is a payment or throughput problem, not bad model output. Check the Anthropic account's credit balance and rate limits, or set ANTHROPIC_MODEL to a model the key can use. Provider detail: ${detail}`,
+            );
+          }
+
+          throw new ClaudeError(
+            `Claude request failed on model "${activeModel}": ${detail}`,
           );
         }
 
-        throw new ClaudeError(
-          `Claude request failed on model "${activeModel}": ${detail}`,
+        const toolUse = response.content.find(
+          (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
         );
+
+        if (!toolUse) {
+          throw new ClaudeValidationError(
+            `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
+          );
+        }
+
+        rawInput = toolUse.input;
       }
 
-      const toolUse = response.content.find(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-      );
-
-      if (!toolUse) {
-        throw new ClaudeValidationError(
-          `Model "${activeModel}" did not call emit_dashboard_config. Stop reason: ${response.stop_reason ?? "unknown"}.`,
-        );
-      }
-
-      const normalizedInput = normalizeDashboardConfigInput(toolUse.input);
+      const normalizedInput = normalizeDashboardConfigInput(rawInput);
       const result = dashboardConfigSchema.safeParse(normalizedInput);
 
       if (!result.success) {

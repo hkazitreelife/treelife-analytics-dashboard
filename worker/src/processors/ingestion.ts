@@ -108,15 +108,31 @@ export type IngestionDeps = {
  */
 const LOCK_RETRY_DELAY_MS = 20_000;
 
+/**
+ * A file uploaded through the web process (Vercel, ephemeral disk) has no
+ * bytes on this worker's local disk at all -- there is no shared
+ * filesystem between the two. Files.dataBase64 (kept specifically because
+ * local disk storage doesn't persist across serverless invocations) is
+ * the one channel guaranteed to reach both processes, since it lives in
+ * the shared Postgres database. Disk is tried first because it's free
+ * when it works (e.g. this worker having written the file itself, or a
+ * shared volume in a self-hosted docker-compose deployment); the base64
+ * fallback covers every other case.
+ */
 const loadFileBytes = async (
   mediaDir: string,
   filename: string,
+  dataBase64?: string | null,
 ): Promise<Buffer> => {
   try {
     return await readFile(path.join(mediaDir, filename));
-  } catch (error: unknown) {
+  } catch (diskError: unknown) {
+    if (dataBase64) {
+      return Buffer.from(dataBase64, "base64");
+    }
+
     throw new IngestionError(
-      `Stored file "${filename}" could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      `Stored file "${filename}" could not be read from disk and has no dataBase64 fallback stored: ${diskError instanceof Error ? diskError.message : String(diskError)}`,
     );
   }
 };
@@ -410,7 +426,7 @@ export const processIngestionJob = async (
 
   // Refuses unsupported formats before reading or parsing anything.
   const fileType = resolveDeterministicType(fileRecord.mimeType);
-  const bytes = await loadFileBytes(mediaDir, fileRecord.filename);
+  const bytes = await loadFileBytes(mediaDir, fileRecord.filename, (fileRecord as any).dataBase64);
 
   await payload.update({
     collection: "jobs",

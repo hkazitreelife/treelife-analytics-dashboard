@@ -61,15 +61,27 @@ export type DocumentIngestionDeps = {
   mediaDir?: string;
 };
 
+/**
+ * Same reasoning as processors/ingestion.ts's loadFileBytes: a file
+ * uploaded through the web process (Vercel, ephemeral disk) has no bytes
+ * on this worker's local disk. Files.dataBase64 lives in the shared
+ * Postgres database, so it's the one channel guaranteed to reach both
+ * processes; disk is tried first since it's free when it works.
+ */
 const loadFileBytes = async (
   mediaDir: string,
   filename: string,
+  dataBase64?: string | null,
 ): Promise<Buffer> => {
   try {
     return await readFile(path.join(mediaDir, filename));
-  } catch (error: unknown) {
+  } catch (diskError: unknown) {
+    if (dataBase64) {
+      return Buffer.from(dataBase64, "base64");
+    }
+
     throw new DocumentIngestionError(
-      `Stored file "${filename}" could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      `Stored file "${filename}" could not be read from disk and has no dataBase64 fallback stored: ${diskError instanceof Error ? diskError.message : String(diskError)}`,
     );
   }
 };
@@ -129,7 +141,7 @@ export const processDocumentIngestionJob = async (
   }
 
   const mimeType = fileRecord.mimeType;
-  const bytes = await loadFileBytes(mediaDir, fileRecord.filename);
+  const bytes = await loadFileBytes(mediaDir, fileRecord.filename, (fileRecord as any).dataBase64);
 
   await payload.update({
     collection: "jobs",
