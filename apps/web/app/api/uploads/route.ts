@@ -12,6 +12,15 @@ import {
 } from "@/lib/uploads";
 
 export const runtime = "nodejs";
+// processIngestionDirectly runs synchronously inside this request (parse +
+// up to 3 sequential AI model attempts at 45s each) with no separate worker
+// process to fall back to on Vercel. Without this, the route is capped at
+// the platform default (10-15s), which would kill AI generation before its
+// own per-attempt timeout ever gets a chance to fire, forcing every upload
+// into the deterministic fallback regardless of the fixes above. Vercel
+// clamps this to whatever the project's actual plan allows, so it's a safe
+// upper bound to ask for, not a guarantee.
+export const maxDuration = 120;
 
 export async function POST(request: Request): Promise<Response> {
   const auth = await requireUser(request);

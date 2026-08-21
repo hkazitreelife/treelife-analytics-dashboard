@@ -339,6 +339,106 @@ function buildNormalizedTables(tables: ParsedTable[]) {
   }));
 }
 
+const toNumericValue = (value: unknown): number | null => {
+  if (typeof value === "number" && !Number.isNaN(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const clean = value.replace(/[$€£¥₹\s,%]/g, "").replace(/\((.*)\)/, "-$1");
+    const parsed = Number.parseFloat(clean);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
+/**
+ * Every table's fallback insight was previously the exact same three
+ * sentences with only the table name substituted ("X captures N records
+ * across key operational segments... Provides granular visibility into x
+ * trends..."), which reads identically on every tab and says nothing
+ * dataset-specific -- exactly the "no intelligence layer" complaint. This
+ * computes an actual finding from that table's own real column values
+ * (dominant category and its share, numeric totals) instead, so two
+ * different sheets produce two genuinely different findings. Still a
+ * template sentence structure, but every number and name in it is read
+ * from this table's real rows, never invented or shared across tables.
+ */
+function buildTableInsight(table: ParsedTable, insightId: string) {
+  const numCols = table.columnsWithTypes.filter((c) => c.inferredType === "numeric");
+  const catCols = table.columnsWithTypes.filter(
+    (c) => c.inferredType === "categorical" || c.inferredType === "text",
+  );
+
+  const metrics: { label: string; value: string }[] = [
+    { label: `${table.name} Records`, value: String(table.rowCount) },
+  ];
+
+  let dominantShare = 0;
+  const findingParts: string[] = [`${table.name} holds ${table.rowCount} record${table.rowCount === 1 ? "" : "s"}.`];
+
+  if (catCols[0]) {
+    const counts = new Map<string, number>();
+    for (const row of table.allRows) {
+      const raw = row[catCols[0].name];
+      if (raw === null || raw === undefined || String(raw).trim() === "") continue;
+      const key = String(raw).trim();
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+
+    let top: [string, number] | null = null;
+    for (const entry of counts) {
+      if (!top || entry[1] > top[1]) top = entry;
+    }
+
+    if (top) {
+      const [topValue, topCount] = top;
+      dominantShare = topCount / table.rowCount;
+      const pct = Math.round(dominantShare * 100);
+      findingParts.push(
+        `By ${catCols[0].name}, "${topValue}" leads with ${topCount} of ${table.rowCount} records (${pct}%), across ${counts.size} distinct value${counts.size === 1 ? "" : "s"} in that column.`,
+      );
+      metrics.push({ label: `Top ${catCols[0].name}`, value: `${topValue} (${pct}%)` });
+    }
+  }
+
+  if (numCols[0]) {
+    const values = table.allRows.map((row) => toNumericValue(row[numCols[0].name])).filter((v): v is number => v !== null);
+
+    if (values.length > 0) {
+      const sum = values.reduce((total, value) => total + value, 0);
+      const avg = sum / values.length;
+      findingParts.push(
+        `${numCols[0].name} totals ${sum.toLocaleString("en-IN", { maximumFractionDigits: 2 })} across those records, averaging ${avg.toLocaleString("en-IN", { maximumFractionDigits: 2 })} per record.`,
+      );
+      metrics.push({ label: `${numCols[0].name} Total`, value: sum.toLocaleString("en-IN", { maximumFractionDigits: 2 }) });
+    }
+  }
+
+  // Signal, not index parity: a category concentrated above 60% in one
+  // value is worth flagging as a concentration risk; otherwise this table
+  // reads as routine and gets marked informational.
+  const isConcentrated = dominantShare >= 0.6 && catCols.length > 0;
+
+  return {
+    insightId,
+    finding: findingParts.join(" "),
+    whyItMatters: isConcentrated
+      ? `A single ${catCols[0]!.name} value accounts for the majority of ${table.name}'s records, which concentrates risk or dependency in one segment rather than spreading it across the table.`
+      : `${table.name}'s records are spread across its tracked ${catCols[0]?.name ?? "fields"} without one dominant concentration, which is the pattern to watch for if that changes going forward.`,
+    recommendedAction: isConcentrated
+      ? `Review why ${table.name} is concentrated in this one ${catCols[0]!.name} value and whether that dependency is acceptable.`
+      : `Monitor ${table.name} for a shift toward concentration in future periods.`,
+    severity: isConcentrated ? "warning" : "info",
+    presentation: {
+      shape: "tracker-item",
+      status: isConcentrated ? "Action Required" : "Tracked",
+      owner: "Operations Lead",
+    },
+    relatedTables: [table.name],
+    metrics,
+  };
+}
+
 export async function processIngestionDirectly(
   payload: Payload,
   jobId: number | string,
@@ -441,9 +541,6 @@ export async function processIngestionDirectly(
           "}",
         ].join("\n");
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 25000);
-
         const modelsToTry = [
           "anthropic/claude-sonnet-5",
           "google/gemini-2.5-flash",
@@ -451,6 +548,15 @@ export async function processIngestionDirectly(
         ];
 
         for (const modelId of modelsToTry) {
+          // A fresh controller per attempt -- these were previously shared
+          // across the whole loop, so once the first model's timeout fired
+          // and aborted it, every later model in this same loop was already
+          // dead on arrival (the same AbortSignal stays aborted forever),
+          // silently forcing every upload straight to the generic fallback
+          // regardless of which model might otherwise have succeeded.
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 45000);
+
           try {
             const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
               method: "POST",
@@ -461,7 +567,15 @@ export async function processIngestionDirectly(
               body: JSON.stringify({
                 model: modelId,
                 messages: [{ role: "user", content: prompt }],
-                max_tokens: 4000,
+                // Was 4000 -- too small once the prompt started requiring a
+                // dedicated tab per sheet (see "ONE TAB PER SHEET" rule
+                // above): a 5+ sheet workbook's full tabs+widgets+insights
+                // JSON regularly exceeds 4000 tokens, gets cut off
+                // mid-object, fails JSON.parse, and silently falls through
+                // to the generic per-table template below -- which is
+                // exactly the "every tab's insight looks the same, no real
+                // intelligence" symptom this was causing.
+                max_tokens: 8000,
               }),
               signal: controller.signal,
             });
@@ -502,10 +616,10 @@ export async function processIngestionDirectly(
             }
           } catch (modelErr) {
             console.warn(`[DirectIngestion] Model ${modelId} failed:`, modelErr);
+          } finally {
+            clearTimeout(timeout);
           }
         }
-
-        clearTimeout(timeout);
       } catch (aiErr: unknown) {
         console.warn("[DirectIngestion] AI generation error:", aiErr);
       }
@@ -712,22 +826,7 @@ export async function processIngestionDirectly(
           widgets,
         });
 
-        generatedInsights.push({
-          insightId: `ins_${tIdx + 1}`,
-          finding: `${table.name} captures ${table.rowCount} records across key operational segments.`,
-          whyItMatters: `Provides granular visibility into ${table.name.toLowerCase()} trends and performance drivers.`,
-          recommendedAction: `Review ${table.name.toLowerCase()} variances during quarterly executive leadership review.`,
-          severity: tIdx % 2 === 0 ? "positive" : "warning",
-          presentation: {
-            shape: "tracker-item",
-            status: tIdx === 0 ? "Tracked" : "Action Required",
-            owner: "Operations Lead",
-          },
-          relatedTables: [table.name],
-          metrics: [
-            { label: `${table.name} Volume`, value: String(table.rowCount) },
-          ],
-        });
+        generatedInsights.push(buildTableInsight(table, `ins_${tIdx + 1}`));
       });
 
       dashboardConfig = {
