@@ -90,16 +90,25 @@ const isOverviewTab = (tab: { tabId: string; tabName: string }): boolean =>
   tab.tabId === "executive_overview" || /overview/i.test(tab.tabName ?? "");
 
 /**
- * Scopes a config's insights to one tab, by intersecting each insight's
- * relatedTables with the set of sourceTable(s) that tab's own widgets
- * actually use. Without this, every tab showed the exact same full
- * insights list regardless of which sheet's tab was open -- there was no
- * per-tab filtering at all, insights were rendered once, globally, below
- * every tab. An insight with an empty relatedTables (a genuinely
- * cross-sheet finding, not tied to one table) is treated as
- * overview-level and shown only on the tab identified as the cross-sheet
- * overview, per the same "ONE TAB PER SHEET, plus one overview" rule the
- * config-generation prompt now enforces (apps/web/lib/directIngestion.ts).
+ * Scopes a config's insights to one tab. Purely structural -- it reads
+ * only relatedTables/sourceTable, which every config already carries
+ * regardless of dataset, so this holds for any future upload without
+ * needing a dataset-specific adjustment.
+ *
+ * An insight naming exactly one table is single-sheet: shown only on the
+ * non-overview tab whose own widgets source from that one table. An
+ * insight naming zero or 2+ tables is cross-sheet by definition (a
+ * per-sheet tab's widgets all share one sourceTable, enforced server-side
+ * by apps/web/lib/directIngestion.ts's findAiConfigProblems) and is shown
+ * only on the tab identified as the cross-sheet overview.
+ *
+ * The first version of this filter matched a cross-sheet insight onto
+ * EVERY tab it happened to mention -- e.g. a finding naming all 5 sheets
+ * matched every one of their tabs individually, not just Overview,
+ * reproducing the exact "same insight on every tab" bug this exists to
+ * fix. Classifying by how many tables an insight names, not just whether
+ * one of them overlaps, is what actually separates "about this one sheet"
+ * from "about the whole dataset."
  */
 const insightsForTab = (
   insights: ResolvedDashboardConfigShape["insights"] | undefined,
@@ -109,16 +118,21 @@ const insightsForTab = (
     return [];
   }
 
+  const overview = isOverviewTab(tab);
   const tabTables = new Set(tab.widgets.map((widget) => widget.sourceTable));
 
   return insights.filter((insight) => {
-    const related = (insight as any).relatedTables as string[] | undefined;
+    const related = ((insight as any).relatedTables as string[] | undefined) ?? [];
 
-    if (!Array.isArray(related) || related.length === 0) {
-      return isOverviewTab(tab);
+    if (related.length !== 1) {
+      // Cross-sheet or table-agnostic: belongs on the overview only.
+      return overview;
     }
 
-    return related.some((tableName) => tabTables.has(tableName));
+    // Single-sheet: belongs on the one tab whose widgets actually use
+    // that table, never on the overview tab too (it would otherwise show
+    // there as well, since the overview's widgets span every table).
+    return !overview && tabTables.has(related[0]!);
   });
 };
 
