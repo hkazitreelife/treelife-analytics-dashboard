@@ -3,6 +3,7 @@ import type { Payload } from "payload";
 import {
   normalizeDashboardConfigInput,
 } from "@analytics/shared";
+import { ensureSingleSourceSession } from "./sessionWrapper";
 
 export interface ParsedColumn {
   name: string;
@@ -714,13 +715,28 @@ export async function processIngestionDirectly(
     });
 
     // 5. Update Dataset record
-    await payload.update({
+    const updatedDataset = await payload.update({
       collection: "datasets",
       id: Number(datasetId),
       data: {
         status: "ready",
       } as any,
     });
+
+    // 5b. Wrap this dataset in its own single-source session, exactly like
+    // worker/src/processors/ingestion.ts does for the BullMQ path -- without
+    // this, /datasets/:id's "find the wrapping session" lookup 404s with
+    // "No session wraps this dataset yet" for every dataset ingested
+    // through this in-process path, which is what was happening in
+    // production before this call existed here. Uses the dataset's own
+    // stored name (not a re-derivation from filename) so it matches
+    // exactly what the dataset record and its UI already show.
+    await ensureSingleSourceSession(
+      payload,
+      "dataset",
+      datasetId,
+      (updatedDataset as any).name || filename.replace(/\.[^/.]+$/, ""),
+    );
 
     // 6. Mark Job Completed
     await payload.update({
