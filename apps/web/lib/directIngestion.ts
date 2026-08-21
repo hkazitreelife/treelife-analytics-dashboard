@@ -11,6 +11,7 @@ import {
   releaseDatasetLock,
   DatasetIngestionLockedError,
 } from "./datasetLock";
+import { logTokenUsage } from "./llmCache";
 
 export interface ParsedColumn {
   name: string;
@@ -207,6 +208,34 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
  * than storing a partially valid config (CLAUDE.md: "never store partially
  * valid output").
  */
+/**
+ * The proper worker pipeline's prompt enforces "col plus w must not exceed
+ * 12" (worker/src/services/claudeConfig.ts's SYSTEM_INSTRUCTION), but this
+ * path never checked it -- a widget with col+w > 12 would overflow its row
+ * visually. Clamped rather than treated as a rejection reason: unlike an
+ * unknown table/column or a wrong aggregation, a grid overflow is cosmetic
+ * layout math, not a data-accuracy problem, so an otherwise-good AI
+ * dashboard shouldn't be discarded over it when it can just be fixed in
+ * place. Mutates widget.position.w downward to fit; never touches col.
+ */
+function clampWidgetGrid(config: any): void {
+  for (const tab of config?.tabs ?? []) {
+    for (const widget of tab?.widgets ?? []) {
+      const position = widget?.position;
+
+      if (!position || typeof position.col !== "number" || typeof position.w !== "number") {
+        continue;
+      }
+
+      const maxW = 12 - position.col;
+
+      if (position.w > maxW && maxW > 0) {
+        position.w = maxW;
+      }
+    }
+  }
+}
+
 function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
   const problems: string[] = [];
   const tableByName = new Map(tables.map((t) => [t.name, t]));
@@ -666,6 +695,21 @@ export async function processIngestionDirectly(
 
             if (openRouterRes.ok) {
               const aiData = await openRouterRes.json();
+
+              // Was completely unlogged before -- every other AI call in
+              // this app (chat, prompt-edit) records token usage via
+              // logTokenUsage; this path discarded `usage` entirely, so
+              // there was no way to see what any given upload actually
+              // cost, at any model, ever.
+              logTokenUsage({
+                action: "dashboard_generation",
+                model: modelId,
+                datasetId,
+                inputTokens: aiData.usage?.prompt_tokens,
+                outputTokens: aiData.usage?.completion_tokens,
+                cached: false,
+              });
+
               const rawText = aiData.choices?.[0]?.message?.content || "";
               let clean = rawText.trim();
               if (clean.includes("```")) {
@@ -684,6 +728,7 @@ export async function processIngestionDirectly(
               const parsed = JSON.parse(clean);
               if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
                 const candidate = normalizeDashboardConfigInput(parsed);
+                clampWidgetGrid(candidate);
                 const problems = findAiConfigProblems(candidate, tables);
 
                 if (problems.length > 0) {
