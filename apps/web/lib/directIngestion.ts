@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { createHash } from "crypto";
 import type { Payload } from "payload";
 import {
   normalizeDashboardConfigInput,
@@ -293,6 +294,49 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
   }
 
   return problems;
+}
+
+/**
+ * Builds the Section 14 normalized-dataset shape (tableName, tableRole,
+ * columns with nullable/sampleValues, rows, rowHash) from what
+ * parseWorkbookBuffer already extracted, so it can be written to the
+ * Dataset's own `data` field.
+ *
+ * This was the other half of the gap that caused "Could not load data" on
+ * every widget and "No session wraps this dataset yet" on every dataset
+ * ingested through this in-process path: processIngestionDirectly wrote a
+ * dashboard config referencing table/column names, but never wrote the
+ * actual rows those widgets need at render time. /api/datasets/:id/data and
+ * apps/web/lib/chat.ts both read dataset.data.tables directly -- with it
+ * never populated, every chart/KPI that fetches rows to aggregate had
+ * nothing to compute from, while insight numbers baked directly into the
+ * config's insights array (not fetched live) kept showing correctly, which
+ * is why only some parts of a dashboard failed rather than all of it.
+ */
+function buildNormalizedTables(tables: ParsedTable[]) {
+  return tables.map((table) => ({
+    tableName: table.name,
+    tableRole: "data" as const,
+    // Not tracked as a distinct field on ParsedTable -- parseWorkbookBuffer
+    // already sliced rows to start after the detected header row, so by the
+    // time a table reaches here its own row 0 is a real data row.
+    headerRowIndex: 0,
+    columns: table.columnsWithTypes.map((column) => {
+      const values = table.allRows.map((row) => row[column.name]);
+      const nonNull = values.filter(
+        (value) => value !== null && value !== undefined && String(value).trim() !== "",
+      );
+
+      return {
+        name: column.name,
+        inferredType: column.inferredType,
+        nullable: nonNull.length < values.length,
+        sampleValues: nonNull.slice(0, 5).map((value) => String(value)),
+      };
+    }),
+    rows: table.allRows,
+    rowHash: createHash("sha256").update(JSON.stringify(table.allRows)).digest("hex"),
+  }));
 }
 
 export async function processIngestionDirectly(
@@ -714,12 +758,20 @@ export async function processIngestionDirectly(
       },
     });
 
-    // 5. Update Dataset record
+    // 5. Update Dataset record -- writes the actual normalized tables/rows
+    // (see buildNormalizedTables's doc comment for why this was missing and
+    // what broke without it), the real cross-sheet row total (totalRows had
+    // been left at its creation-time default of 0 forever), and the sheet
+    // names table (tableNames), all previously never written by this path.
+    const normalizedTables = buildNormalizedTables(tables);
     const updatedDataset = await payload.update({
       collection: "datasets",
       id: Number(datasetId),
       data: {
         status: "ready",
+        totalRows,
+        tableNames: tables.map((t) => ({ tableName: t.name })),
+        data: { tables: normalizedTables, relationships: [] },
       } as any,
     });
 
