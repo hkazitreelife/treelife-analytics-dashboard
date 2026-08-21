@@ -648,7 +648,15 @@ export async function processIngestionDirectly(
           "openai/gpt-4o",
         ];
 
-        for (const modelId of modelsToTry) {
+        // Tracks the last rejection's exact reasons so a stricter retry
+        // (below) can name them, same as the proper pipeline's
+        // ClaudeValidationError-triggered retry does.
+        let lastProblems: string[] = [];
+
+        // Factored out of the loop so the stricter-instruction retry below
+        // can reuse the exact same request/parse/validate logic on one
+        // more attempt, instead of a second copy of this whole block.
+        const attemptModel = async (modelId: string, promptText: string): Promise<any | null> => {
           // A fresh controller per attempt -- these were previously shared
           // across the whole loop, so once the first model's timeout fired
           // and aborted it, every later model in this same loop was already
@@ -671,7 +679,7 @@ export async function processIngestionDirectly(
               },
               body: JSON.stringify({
                 model: modelId,
-                messages: [{ role: "user", content: prompt }],
+                messages: [{ role: "user", content: promptText }],
                 // Was 4000, then 8000 -- both still small enough to
                 // truncate a large multi-sheet dashboard's JSON mid-object
                 // (see "ONE TAB PER SHEET" rule above) and silently fall
@@ -693,60 +701,101 @@ export async function processIngestionDirectly(
               signal: controller.signal,
             });
 
-            if (openRouterRes.ok) {
-              const aiData = await openRouterRes.json();
+            if (!openRouterRes.ok) {
+              return null;
+            }
 
-              // Was completely unlogged before -- every other AI call in
-              // this app (chat, prompt-edit) records token usage via
-              // logTokenUsage; this path discarded `usage` entirely, so
-              // there was no way to see what any given upload actually
-              // cost, at any model, ever.
-              logTokenUsage({
-                action: "dashboard_generation",
-                model: modelId,
-                datasetId,
-                inputTokens: aiData.usage?.prompt_tokens,
-                outputTokens: aiData.usage?.completion_tokens,
-                cached: false,
-              });
+            const aiData = await openRouterRes.json();
 
-              const rawText = aiData.choices?.[0]?.message?.content || "";
-              let clean = rawText.trim();
-              if (clean.includes("```")) {
-                const match = clean.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-                if (match && match[1]) {
-                  clean = match[1].trim();
-                } else {
-                  clean = clean.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-                }
-              }
-              const firstBrace = clean.indexOf("{");
-              const lastBrace = clean.lastIndexOf("}");
-              if (firstBrace !== -1 && lastBrace !== -1) {
-                clean = clean.slice(firstBrace, lastBrace + 1);
-              }
-              const parsed = JSON.parse(clean);
-              if (parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
-                const candidate = normalizeDashboardConfigInput(parsed);
-                clampWidgetGrid(candidate);
-                const problems = findAiConfigProblems(candidate, tables);
+            // Was completely unlogged before -- every other AI call in
+            // this app (chat, prompt-edit) records token usage via
+            // logTokenUsage; this path discarded `usage` entirely, so
+            // there was no way to see what any given upload actually
+            // cost, at any model, ever.
+            logTokenUsage({
+              action: "dashboard_generation",
+              model: modelId,
+              datasetId,
+              inputTokens: aiData.usage?.prompt_tokens,
+              outputTokens: aiData.usage?.completion_tokens,
+              cached: false,
+            });
 
-                if (problems.length > 0) {
-                  console.warn(
-                    `[DirectIngestion] Model ${modelId} produced an invalid config, rejecting: ${problems.join("; ")}`,
-                  );
-                  continue;
-                }
-
-                dashboardConfig = candidate;
-                console.log(`[DirectIngestion] Dashboard generated dynamically via AI using ${modelId}`);
-                break;
+            const rawText = aiData.choices?.[0]?.message?.content || "";
+            let clean = rawText.trim();
+            if (clean.includes("```")) {
+              const match = clean.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+              if (match && match[1]) {
+                clean = match[1].trim();
+              } else {
+                clean = clean.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
               }
             }
+            const firstBrace = clean.indexOf("{");
+            const lastBrace = clean.lastIndexOf("}");
+            if (firstBrace !== -1 && lastBrace !== -1) {
+              clean = clean.slice(firstBrace, lastBrace + 1);
+            }
+            const parsed = JSON.parse(clean);
+
+            if (!(parsed && Array.isArray(parsed.tabs) && parsed.tabs.length > 0)) {
+              return null;
+            }
+
+            const candidate = normalizeDashboardConfigInput(parsed);
+            clampWidgetGrid(candidate);
+            const problems = findAiConfigProblems(candidate, tables);
+
+            if (problems.length > 0) {
+              lastProblems = problems;
+              console.warn(
+                `[DirectIngestion] Model ${modelId} produced an invalid config, rejecting: ${problems.join("; ")}`,
+              );
+              return null;
+            }
+
+            return candidate;
           } catch (modelErr) {
             console.warn(`[DirectIngestion] Model ${modelId} failed:`, modelErr);
+            return null;
           } finally {
             clearTimeout(timeout);
+          }
+        };
+
+        for (const modelId of modelsToTry) {
+          const candidate = await attemptModel(modelId, prompt);
+
+          if (candidate) {
+            dashboardConfig = candidate;
+            console.log(`[DirectIngestion] Dashboard generated dynamically via AI using ${modelId}`);
+            break;
+          }
+        }
+
+        // Flaw #11 from the earlier review: every one of the 3 models'
+        // FIRST attempts failing jumped straight to the generic per-table
+        // fallback, unlike the proper pipeline (worker/src/services/
+        // claudeConfig.ts), which retries once with the exact violation
+        // named before giving up. One extra attempt, naming exactly what
+        // was wrong last time, costs one more model call but can turn a
+        // near-miss (one bad aggregation, one missing sheet tab) into a
+        // real AI-generated dashboard instead of the fallback template.
+        if (!dashboardConfig && lastProblems.length > 0) {
+          const stricterPrompt = [
+            prompt,
+            "",
+            "Your previous response was rejected for these exact reasons:",
+            ...lastProblems.map((problem) => `- ${problem}`),
+            "Fix every one of these in your next response. Return ONLY the corrected JSON, matching the exact same schema as above.",
+          ].join("\n");
+
+          console.log(`[DirectIngestion] Retrying with a stricter instruction on ${modelsToTry[0]}...`);
+          const retryCandidate = await attemptModel(modelsToTry[0]!, stricterPrompt);
+
+          if (retryCandidate) {
+            dashboardConfig = retryCandidate;
+            console.log(`[DirectIngestion] Dashboard generated on stricter retry using ${modelsToTry[0]}.`);
           }
         }
       } catch (aiErr: unknown) {
