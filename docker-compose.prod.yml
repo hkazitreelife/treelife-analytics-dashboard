@@ -71,8 +71,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Parsing a large xlsx/csv (up to the app's own 25 MB / 25k-row limits)
+    # holds the whole parse in heap, so idle RSS (250-400 MB) is not the
+    # number that matters -- ingestion-time spikes of 1-2 GB are normal for
+    # these libraries. mem_limit caps this container specifically so a spike
+    # kills only the worker (which BullMQ retries) instead of leaving it
+    # uncapped on a host with no swap cushion, where the OOM killer picks
+    # the fattest resident process on the box instead. max-old-space-size
+    # gives V8 a ceiling under that container limit, so it hits a normal
+    # allocation error before the container gets OOM-killed outright.
+    mem_limit: 2g
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=1536
       DATABASE_URI: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-treelife_secure_db_pass_2026}@postgres:5432/${POSTGRES_DB:-analytics_dashboard}
       REDIS_URL: redis://redis:6379
       GEMINI_API_KEY: ${GEMINI_API_KEY}
