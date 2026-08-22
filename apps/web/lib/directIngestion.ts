@@ -488,6 +488,19 @@ const preferAverage = (name: string) =>
     name,
   );
 
+// A plain "Records" count as an insight metric needs a sourceField that is
+// (almost) never blank -- resolveMetricReferences (packages/shared/src/
+// claudeConfigContract.ts) counts non-blank cells of the NAMED field for a
+// "count" aggregation, unlike the widget-level count (aggregate.ts), which
+// counts rows regardless of field. Naming an arbitrary column here would
+// silently undercount the moment that column has any blanks. An
+// "id"-typed column is the closest thing to a guarantee of full
+// population; table.columns[0] is a fallback only, not a safe default.
+const pickCountField = (table: ParsedTable): string => {
+  const idColumn = table.columnsWithTypes.find((c) => c.inferredType === "id");
+  return idColumn?.name ?? table.columns[0] ?? "id";
+};
+
 /**
  * Every table's fallback insight was previously the exact same three
  * sentences with only the table name substituted ("X captures N records
@@ -519,7 +532,7 @@ function buildTableInsight(table: ParsedTable, insightId: string) {
       kind: "aggregate",
       label: `${table.name} Records`,
       sourceTable: table.name,
-      sourceField: table.columns[0] ?? "id",
+      sourceField: pickCountField(table),
       aggregation: "count",
     },
   ];
@@ -1248,7 +1261,7 @@ export async function processIngestionDirectly(
                 kind: "aggregate",
                 label: `${largestTable.name} Records`,
                 sourceTable: largestTable.name,
-                sourceField: largestTable.columns[0] ?? "id",
+                sourceField: pickCountField(largestTable),
                 aggregation: "count",
               },
             ]
