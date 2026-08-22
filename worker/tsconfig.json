@@ -16,7 +16,11 @@
     // Payload config. That file is outside this package, so no rootDir is set
     // and nothing is emitted; the worker runs from source via tsx.
     "noEmit": true,
-    "baseUrl": ".",
+    // "paths" resolves relative to this tsconfig.json's own directory when
+    // no "baseUrl" is set, which is exactly "." anyway -- baseUrl itself is
+    // removed as of TypeScript 7 (TS5102), so this drops it rather than
+    // keep a setting that errors under a newer compiler while changing
+    // nothing about how "@payload-config" actually resolves.
     "paths": {
       "@payload-config": ["../apps/web/payload.config.ts"]
     }
