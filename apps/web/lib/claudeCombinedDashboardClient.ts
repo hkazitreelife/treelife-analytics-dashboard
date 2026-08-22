@@ -65,6 +65,10 @@ const SYSTEM_INSTRUCTION = [
   "- Generate comprehensive, executive-level insights that synthesize BOTH the",
   "  numerical facts from the dataset(s) and the narrative context, goals, or",
   "  recommendations from the document(s).",
+  "- A thin, generic finding ('this dataset captures N records') is not acceptable --",
+  "  every insight must say something an executive could act on: a concentration, an",
+  "  outlier, a risk, a trend, or a specific named driver, computed from the real",
+  "  aggregates given to you, not merely a record count.",
   "- `insights` MUST be a JSON array of objects (never a string or markdown).",
   "- Each insight object must have: finding (short headline), whyItMatters (1-2 sentences),",
   "  recommendedAction (1 concrete sentence), severity (info, warning, positive, negative),",
@@ -179,9 +183,43 @@ export const createClaudeCombinedDashboardClient = (
         ? `\n\nThe primary dataset "${primaryDataset!.datasetName}" has ${primaryDataTables.length} distinct data sheets, all real: ${primaryDataTables.map((t) => `"${t.tableName}"`).join(", ")}. rawSheetTableName is null because there is no single one to pick. Every one of these sheets must get at least one widget somewhere in the tabs you build -- a combined dashboard that shows only the largest sheet while silently dropping the others is the exact failure this rule exists to prevent. Prefer one tab per sheet, mirroring how the standalone per-dataset dashboard is built, unless two sheets are small enough to share a tab sensibly.`
         : "";
 
+      // Structural signal, not a guess about content: every data-role
+      // table across every dataset in the session, regardless of which is
+      // "primary". Used for two generic requirements below -- neither
+      // names a dataset, a column, or a session, only column TYPES and
+      // sheet COUNTS, the same pattern the chart-axis and sheet-coverage
+      // checks already use.
+      const allDataRoleTables = datasets.flatMap((d) => d.tables).filter((t) => t.tableRole === "data");
+
+      // Previously the only structural requirement was "at least one tab
+      // with meaningful charts/KPIs" -- satisfiable entirely with KPI
+      // cards and zero actual charts, which is exactly what "looks like a
+      // static summary, not a live dashboard" describes. If the data
+      // structurally supports a real chart (a numeric column paired with
+      // a genuinely low-cardinality categorical/boolean column, or a date
+      // column to trend against), require the model to actually build one.
+      const hasChartableStructure = allDataRoleTables.some((table) => {
+        const hasNumeric = table.columns.some((c) => c.inferredType === "numeric");
+        const hasChartableAxis = table.columns.some(
+          (c) => c.inferredType === "categorical" || c.inferredType === "boolean" || c.inferredType === "date",
+        );
+        return hasNumeric && hasChartableAxis;
+      });
+
+      const chartDiversityInstruction = hasChartableStructure
+        ? `\n\nThis session's data structurally supports at least one real chart: a numeric column paired with a genuinely low-cardinality categorical/boolean column, or a date column to trend against. You MUST include at least one bar, horizontal_bar, line, or pie widget somewhere in the tabs you build -- KPI cards alone are not a dashboard, they are a summary strip.`
+        : "";
+
+      // Mirrors directIngestion.ts's per-dataset minInsights floor (same
+      // reasoning: a floor scaled to how many real sheets exist to draw
+      // findings from, not an arbitrary constant that's either too easy
+      // for a rich session or impossible for a thin one).
+      const minCombinedInsights = Math.max(3, allDataRoleTables.length);
+      const insightFloorInstruction = `\n\nThis combined session has ${allDataRoleTables.length} real data sheet${allDataRoleTables.length === 1 ? "" : "s"} across its dataset(s). Your insights array must contain at least ${minCombinedInsights} genuinely distinct, substantive findings -- padding with restated record counts to hit the number is not acceptable; each one must say something an executive could act on.`;
+
       const systemInstruction = options?.stricterInstruction
-        ? `${SYSTEM_INSTRUCTION}${multiSheetInstruction}\n\nThe previous response was rejected. ${options.stricterInstruction}`
-        : `${SYSTEM_INSTRUCTION}${multiSheetInstruction}`;
+        ? `${SYSTEM_INSTRUCTION}${multiSheetInstruction}${chartDiversityInstruction}${insightFloorInstruction}\n\nThe previous response was rejected. ${options.stricterInstruction}`
+        : `${SYSTEM_INSTRUCTION}${multiSheetInstruction}${chartDiversityInstruction}${insightFloorInstruction}`;
 
       const userContent = [
         options?.adminIntent
@@ -337,6 +375,26 @@ export const createClaudeCombinedDashboardClient = (
       if (highCardinalityAxes.length > 0) {
         throw new CombinedDashboardValidationError(
           `Combined config from model "${activeModel}" would chart a near-unique column as a category axis: ${highCardinalityAxes.join("; ")}`,
+        );
+      }
+
+      const CHART_WIDGET_TYPES = new Set(["bar", "horizontal_bar", "line", "pie"]);
+
+      if (hasChartableStructure) {
+        const hasActualChart = result.data.tabs.some((tab) =>
+          tab.widgets.some((widget) => CHART_WIDGET_TYPES.has(widget.type)),
+        );
+
+        if (!hasActualChart) {
+          throw new CombinedDashboardValidationError(
+            `Combined config from model "${activeModel}" has no chart widget (bar/horizontal_bar/line/pie) anywhere, only KPI cards, despite the data structurally supporting one -- a dashboard of KPI numbers alone is a summary strip, not an executive dashboard.`,
+          );
+        }
+      }
+
+      if (result.data.insights.length < minCombinedInsights) {
+        throw new CombinedDashboardValidationError(
+          `Combined config from model "${activeModel}" has only ${result.data.insights.length} insight(s), need at least ${minCombinedInsights} genuinely distinct, substantive findings for ${allDataRoleTables.length} real data sheet${allDataRoleTables.length === 1 ? "" : "s"}.`,
         );
       }
 
