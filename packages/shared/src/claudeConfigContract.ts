@@ -456,11 +456,18 @@ export const resolveMetricReferences = (
     );
 
     if (ref.aggregation === "count") {
-      const count = targetRows.filter(
-        (row) => !isBlankCell(row[ref.sourceField]),
-      ).length;
-
-      resolved.push({ ...ref, value: count });
+      // Row count, full stop -- matching aggregationTypeSchema's own doc
+      // comment ("plain count... counts ROWS -- it always has, regardless
+      // of which field is named") and the widget-level count (aggregate.ts),
+      // which already counts rows this way. This used to filter out rows
+      // where sourceField was blank, an unannounced second meaning of
+      // "count" that nothing asked for and every caller/prompt/reader
+      // assumed away: a metric naming an arbitrary column for a plain
+      // "how many records" figure would silently undercount the moment
+      // that column had any blanks. If a genuine "how many rows have a
+      // non-blank X" figure is ever needed, it needs its own explicit
+      // metric kind, not a second, surprising meaning hiding inside "count".
+      resolved.push({ ...ref, value: targetRows.length });
       continue;
     }
 

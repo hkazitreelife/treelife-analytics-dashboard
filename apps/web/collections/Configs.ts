@@ -43,6 +43,7 @@ export const Configs: CollectionConfig = {
       options: [
         { label: "Initial auto generation", value: "initial_auto_generation" },
         { label: "Prompt edit", value: "prompt_edit" },
+        { label: "Direct edit", value: "direct_edit" },
       ],
     },
     {

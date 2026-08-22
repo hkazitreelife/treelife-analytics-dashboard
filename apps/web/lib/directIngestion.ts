@@ -116,9 +116,110 @@ export function inferColumnType(
   return "text";
 }
 
+/**
+ * Detects the header row within a single block of rows (top 10 rows, most
+ * non-empty string cells, minimum 2) and builds column names from it,
+ * de-duplicating repeats the same way a spreadsheet with two "Total"
+ * columns would need. Factored out of parseWorkbookBuffer so the same
+ * logic runs once per detected block, not once per whole sheet -- see that
+ * function's doc comment for why a sheet can contain more than one block.
+ */
+function detectHeaderAndBuildColumnNames(block: any[][]): { headerRowIdx: number; headers: string[] } {
+  let headerRowIdx = 0;
+  let maxCols = 0;
+  for (let r = 0; r < Math.min(10, block.length); r++) {
+    const row = block[r];
+    if (!Array.isArray(row)) continue;
+    const validHeaders = row.filter(
+      (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
+    );
+    if (validHeaders.length > maxCols && validHeaders.length >= 2) {
+      maxCols = validHeaders.length;
+      headerRowIdx = r;
+    }
+  }
+
+  const headerRow = block[headerRowIdx] || [];
+
+  // Trim trailing blank cells before building column names. XLSX's
+  // sheet_to_json pads every row out to the SHEET's widest row, not just
+  // this block's own width -- a genuinely 2-column block sharing a sheet
+  // with a 3-column block gets padded to 3 cells, and without this trim
+  // its synthetic 3rd "Column_3" placeholder would make its column count
+  // match the other block's, defeating the whole point of comparing
+  // column counts to tell two real blocks apart (caught by actually
+  // running the item-8 verification script against a real two-block
+  // sheet, not by inspection).
+  let lastRealCol = -1;
+  for (let c = headerRow.length - 1; c >= 0; c--) {
+    if (String(headerRow[c] ?? "").trim().length > 0) {
+      lastRealCol = c;
+      break;
+    }
+  }
+
+  const headers: string[] = [];
+  for (let c = 0; c <= lastRealCol; c++) {
+    const val = String(headerRow[c] || "").trim();
+    const colName = val.length > 0 ? val : `Column_${c + 1}`;
+    let uniqueName = colName;
+    let counter = 1;
+    while (headers.includes(uniqueName)) {
+      uniqueName = `${colName}_${counter++}`;
+    }
+    headers.push(uniqueName);
+  }
+
+  return { headerRowIdx, headers };
+}
+
+/**
+ * Item 8 of Prompt 16.0: a worksheet can hold more than one genuinely
+ * separate table -- a common real layout is a summary block, a blank row,
+ * then a differently-shaped table below it. The previous version of this
+ * function scanned the whole sheet for the single best-looking header row
+ * and then treated every row below it, to the end of the sheet, as that
+ * one table's rows, positionally. A second real table lower in the sheet
+ * had its rows crammed under the first table's column names -- not a
+ * cosmetic bug, an actual data-corruption one, since it then also poisons
+ * every downstream type-inference and cardinality check that assumes a
+ * column's values are all the same kind of thing.
+ *
+ * CLAUDE.md's documented design (Gemini gets a bounded row preview to
+ * find headerRowIndex) covers "the header isn't row 1 because of title/
+ * prose rows above it" -- it does not cover "two separate tables share one
+ * worksheet" at all; the normalized contract gives each table exactly one
+ * headerRowIndex. Fixing this properly would need either wiring in real
+ * model-assisted structure detection (a bigger lift, a new per-upload API
+ * dependency, and still requires the contract itself to grow a concept of
+ * "multiple tables per sheet" that doesn't exist today) or a deterministic
+ * heuristic. This is the deterministic heuristic, chosen because it needs
+ * no new dependency and is fully testable: split each sheet into blocks at
+ * blank-row boundaries, detect a header independently inside each block,
+ * and only keep two blocks as separate tables when their column COUNTS
+ * differ -- a strong, low-false-positive signal that they're genuinely
+ * different tables. Two blocks with the same column count get merged back
+ * into one table, because that's far more often an intentional blank row
+ * or a repeated header (pagination-style exports) inside one real table
+ * than a coincidence between two unrelated tables -- biased toward NOT
+ * over-splitting, since under-splitting (the original bug) was the
+ * actually-observed failure, not over-splitting.
+ *
+ * Known, named limitation: this cannot catch two genuinely different
+ * tables that happen to share the same column count -- that needs either
+ * comparing actual header text/column names (which breaks the "repeated
+ * header for pagination" case, a real layout this must not regress) or
+ * model judgment. Model-assisted extraction remains the fuller fix; this
+ * closes the specific, demonstrated failure (two differently-shaped tables
+ * merged into one), not every conceivable multi-table layout.
+ */
 export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const tables: ParsedTable[] = [];
+
+  const isBlankRow = (row: any[] | undefined): boolean =>
+    !Array.isArray(row) ||
+    row.every((cell) => cell === null || cell === undefined || String(cell).trim() === "");
 
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
@@ -127,71 +228,102 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
     const aoa = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, defval: "" });
     if (aoa.length === 0) continue;
 
-    // Scan top 10 rows to locate the true multi-column header row
-    let headerRowIdx = 0;
-    let maxCols = 0;
-    for (let r = 0; r < Math.min(10, aoa.length); r++) {
-      const row = aoa[r];
-      if (!Array.isArray(row)) continue;
-      const validHeaders = row.filter(
-        (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
-      );
-      if (validHeaders.length > maxCols && validHeaders.length >= 2) {
-        maxCols = validHeaders.length;
-        headerRowIdx = r;
+    const blocks: any[][][] = [];
+    let currentBlock: any[][] = [];
+    for (const row of aoa) {
+      if (isBlankRow(row)) {
+        if (currentBlock.length > 0) {
+          blocks.push(currentBlock);
+          currentBlock = [];
+        }
+        continue;
       }
+      currentBlock.push(row);
+    }
+    if (currentBlock.length > 0) blocks.push(currentBlock);
+
+    type BlockResult = {
+      columns: string[];
+      columnsWithTypes: ParsedColumn[];
+      allRows: Record<string, unknown>[];
+    };
+
+    const buildRows = (
+      block: any[][],
+      headers: string[],
+      startRow: number,
+    ): Record<string, unknown>[] => {
+      const rows: Record<string, unknown>[] = [];
+      for (let r = startRow; r < block.length; r++) {
+        const row = block[r];
+        if (!Array.isArray(row)) continue;
+
+        const rowObj: Record<string, unknown> = {};
+        let hasData = false;
+        for (let c = 0; c < headers.length; c++) {
+          const h = headers[c];
+          const cell = row[c];
+          rowObj[h] = cell !== undefined && cell !== "" ? cell : null;
+          if (rowObj[h] !== null) hasData = true;
+        }
+        if (hasData) rows.push(rowObj);
+      }
+      return rows;
+    };
+
+    // Merging isn't just "concatenate rows after the fact" -- a block that
+    // is really a continuation of the previous table (after a stray blank
+    // row) has NO header row of its own. Independently header-detecting
+    // every block first, then merging by column count, was tried and
+    // caught a real bug by actually running it: the continuation block's
+    // own first data row (often all-string cells, e.g. an ID/Name/
+    // Department row) got misdetected as a header and silently eaten,
+    // losing that row entirely. So the column-count comparison has to
+    // happen BEFORE deciding whether to consume a header row at all: if a
+    // block's tentative header width matches the previous accepted
+    // block's real column count, treat the whole block as data under the
+    // previous block's real headers, consuming no header row from it.
+    const blockResults: BlockResult[] = [];
+
+    for (const block of blocks) {
+      if (block.length === 0) continue;
+
+      const previous = blockResults[blockResults.length - 1];
+      const tentative = detectHeaderAndBuildColumnNames(block);
+
+      if (previous && tentative.headers.length === previous.columns.length) {
+        // Continuation of the previous table: no header row here at all.
+        const rows = buildRows(block, previous.columns, 0);
+        previous.allRows.push(...rows);
+        continue;
+      }
+
+      if (block.length < 2) continue; // a genuinely new table needs a header row plus one data row
+      if (tentative.headers.length === 0) continue;
+
+      const rows = buildRows(block, tentative.headers, tentative.headerRowIdx + 1);
+      if (rows.length === 0) continue;
+
+      const columnsWithTypes = tentative.headers.map((colName) => {
+        const sampleVals = rows.slice(0, 100).map((r) => r[colName]);
+        const inferredType = inferColumnType(colName, sampleVals);
+        return { name: colName, inferredType };
+      });
+
+      blockResults.push({ columns: tentative.headers, columnsWithTypes, allRows: rows });
     }
 
-    const headerRow = aoa[headerRowIdx] || [];
-    const headers: string[] = [];
-    for (let c = 0; c < headerRow.length; c++) {
-      const val = String(headerRow[c] || "").trim();
-      const colName = val.length > 0 ? val : `Column_${c + 1}`;
-      let uniqueName = colName;
-      let counter = 1;
-      while (headers.includes(uniqueName)) {
-        uniqueName = `${colName}_${counter++}`;
-      }
-      headers.push(uniqueName);
-    }
+    const merged = blockResults;
 
-    if (headers.length === 0) continue;
-
-    const rows: Record<string, unknown>[] = [];
-    for (let r = headerRowIdx + 1; r < aoa.length; r++) {
-      const row = aoa[r];
-      if (!Array.isArray(row)) continue;
-      const isBlank = row.every(
-        (cell) => cell === null || cell === undefined || String(cell).trim() === "",
-      );
-      if (isBlank) continue;
-
-      const rowObj: Record<string, unknown> = {};
-      let hasData = false;
-      for (let c = 0; c < headers.length; c++) {
-        const h = headers[c];
-        const cell = row[c];
-        rowObj[h] = cell !== undefined && cell !== "" ? cell : null;
-        if (rowObj[h] !== null) hasData = true;
-      }
-      if (hasData) rows.push(rowObj);
-    }
-
-    if (rows.length === 0) continue;
-
-    const columnsWithTypes = headers.map((colName) => {
-      const sampleVals = rows.slice(0, 100).map((r) => r[colName]);
-      const inferredType = inferColumnType(colName, sampleVals);
-      return { name: colName, inferredType };
-    });
-
-    tables.push({
-      name: sheetName,
-      columns: headers,
-      columnsWithTypes,
-      rowCount: rows.length,
-      sampleRows: rows.slice(0, 10),
-      allRows: rows,
+    merged.forEach((block, idx) => {
+      tables.push({
+        name: idx === 0 ? sheetName : `${sheetName} (${idx + 1})`,
+        columns: block.columns,
+        columnsWithTypes: block.columnsWithTypes,
+        rowCount: block.allRows.length,
+        sampleRows: block.allRows.slice(0, 10),
+        allRows: block.allRows,
+      });
     });
   }
 
@@ -240,7 +372,7 @@ function clampWidgetGrid(config: any): void {
   }
 }
 
-function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
+export function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
   const problems: string[] = [];
   const tableByName = new Map(tables.map((t) => [t.name, t]));
 
@@ -488,14 +620,12 @@ const preferAverage = (name: string) =>
     name,
   );
 
-// A plain "Records" count as an insight metric needs a sourceField that is
-// (almost) never blank -- resolveMetricReferences (packages/shared/src/
-// claudeConfigContract.ts) counts non-blank cells of the NAMED field for a
-// "count" aggregation, unlike the widget-level count (aggregate.ts), which
-// counts rows regardless of field. Naming an arbitrary column here would
-// silently undercount the moment that column has any blanks. An
-// "id"-typed column is the closest thing to a guarantee of full
-// population; table.columns[0] is a fallback only, not a safe default.
+// resolveMetricReferences's "count" now always means row count (fixed --
+// it used to count only non-blank cells of the named field, an unannounced
+// second meaning nothing asked for). sourceField is still required by the
+// schema and still has to be a real column, so an "id"-typed column is
+// used here as the clearest, least-arbitrary label for what the count is
+// counting; it no longer affects the computed number itself.
 const pickCountField = (table: ParsedTable): string => {
   const idColumn = table.columnsWithTypes.find((c) => c.inferredType === "id");
   return idColumn?.name ?? table.columns[0] ?? "id";
@@ -569,21 +699,29 @@ function buildTableInsight(table: ParsedTable, insightId: string) {
     }
   }
 
-  if (numCols[0]) {
-    const values = table.allRows.map((row) => toNumericValue(row[numCols[0].name])).filter((v): v is number => v !== null);
+  // Up to 2 numeric columns, not just numCols[0]. A deterministic template
+  // has no domain judgment to know WHICH numeric column is "the" important
+  // one when a table has several -- picking the first by position and
+  // calling it "Total" implicitly claims a significance that column
+  // position alone doesn't earn. Rather than guess, this reports a small,
+  // bounded set of them evenly: every figure shown is genuinely correct
+  // and correctly labeled, none is falsely singled out as more important
+  // than the others just because it happened to come first.
+  for (const numCol of numCols.slice(0, 2)) {
+    const values = table.allRows.map((row) => toNumericValue(row[numCol.name])).filter((v): v is number => v !== null);
 
     if (values.length > 0) {
       const sum = values.reduce((total, value) => total + value, 0);
       const avg = sum / values.length;
       findingParts.push(
-        `${numCols[0].name} totals ${sum.toLocaleString("en-IN", { maximumFractionDigits: 2 })} across those records, averaging ${avg.toLocaleString("en-IN", { maximumFractionDigits: 2 })} per record.`,
+        `${numCol.name} totals ${sum.toLocaleString("en-IN", { maximumFractionDigits: 2 })} across those records, averaging ${avg.toLocaleString("en-IN", { maximumFractionDigits: 2 })} per record.`,
       );
-      const useAvg = preferAverage(numCols[0].name);
+      const useAvg = preferAverage(numCol.name);
       metrics.push({
         kind: "aggregate",
-        label: `${numCols[0].name} ${useAvg ? "Average" : "Total"}`,
+        label: `${numCol.name} ${useAvg ? "Average" : "Total"}`,
         sourceTable: table.name,
-        sourceField: numCols[0].name,
+        sourceField: numCol.name,
         aggregation: useAvg ? "avg" : "sum",
       });
     }
@@ -732,10 +870,10 @@ export async function processIngestionDirectly(
             " prose text.",
           ].join(""),
           "",
-          "Return ONLY valid JSON matching this schema:",
+          "Return ONLY valid JSON matching this schema exactly -- no fields beyond these four at the",
+          " root (datasetId is filled in by the server, never write it yourself):",
           "{",
           '  "title": "Executive Intelligence Dashboard Title",',
-          '  "description": "High-level strategic briefing on metrics and performance",',
           '  "tabs": [',
           "    {",
           '      "tabId": "executive_overview",',

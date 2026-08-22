@@ -1,5 +1,6 @@
 import {
   buildDatasetMetadata,
+  resolvedDashboardConfigSchema,
   resolveInsightMetrics,
   resolveSessionFindings,
   type DocumentSectionShape,
@@ -40,6 +41,37 @@ export type SessionSynthesisResult =
 
 type StoredDatasetData = { tables?: NormalizedTableShape[]; relationships?: unknown[] };
 type StoredDocumentData = { fullText?: string; sections?: DocumentSectionShape[] };
+
+/**
+ * Prompt 16.0 item 3: claudeCombinedDashboardClient.ts already validates
+ * its own output against dashboardConfigSchema before returning, but that
+ * is validation of the RAW (unresolved-metrics) shape, earlier in the
+ * call chain than this file's own write. This function is the check
+ * immediately before THIS write site's payload.update -- resolving
+ * metrics could, in principle, produce a shape resolveDashboardConfigSchema
+ * would reject even when the raw shape passed, and nothing before this
+ * point actually confirms that. "Validated earlier in the chain" and
+ * "validated right before this specific write" are different claims; this
+ * codebase had exactly one write site (directIngestion.ts's initial
+ * generation) where the first was quietly assumed to imply the second and
+ * it did not. Throws a plain Error (not CombinedDashboardValidationError)
+ * so a failure here logs and falls back gracefully via the existing catch
+ * below, rather than triggering an unrelated retry path meant for the
+ * client's own validation errors.
+ */
+const validateResolvedCombinedConfig = (
+  candidate: ResolvedDashboardConfigShape,
+): ResolvedDashboardConfigShape => {
+  const check = resolvedDashboardConfigSchema.safeParse(candidate);
+
+  if (!check.success) {
+    throw new Error(
+      `Resolved combined dashboard config failed schema validation immediately before storage: ${JSON.stringify(check.error.issues)}`,
+    );
+  }
+
+  return check.data;
+};
 
 const relationshipIds = (value: unknown): string[] => {
   if (!Array.isArray(value)) {
@@ -183,10 +215,7 @@ export const runSessionSynthesis = async (
       );
 
       const resolvedInsights = resolveInsightMetrics(rawConfig.insights, allTables);
-      resolvedConfig = {
-        ...rawConfig,
-        insights: resolvedInsights,
-      };
+      resolvedConfig = validateResolvedCombinedConfig({ ...rawConfig, insights: resolvedInsights });
     } catch (configError: unknown) {
       if (configError instanceof CombinedDashboardValidationError) {
         payload.logger.info(`Retrying combined dashboard generation with stricter instructions...`);
@@ -197,10 +226,7 @@ export const runSessionSynthesis = async (
             { adminIntent: adminIntent || session.name, stricterInstruction: configError.message },
           );
           const resolvedInsights = resolveInsightMetrics(rawConfig.insights, allTables);
-          resolvedConfig = {
-            ...rawConfig,
-            insights: resolvedInsights,
-          };
+          resolvedConfig = validateResolvedCombinedConfig({ ...rawConfig, insights: resolvedInsights });
         } catch (retryError) {
           payload.logger.warn(`Combined retry failed: ${retryError}`);
         }

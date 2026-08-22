@@ -566,6 +566,13 @@ export type ResolvedDashboardConfigShape = z.infer<typeof resolvedDashboardConfi
 export const CONFIG_SOURCE = {
   initialAutoGeneration: "initial_auto_generation",
   promptEdit: "prompt_edit",
+  // Prompt 16.0 item 9: an unambiguous, deterministic widget edit (change
+  // type/fields/aggregation/position on one existing widget, matched by
+  // widgetId) applied with no LLM call at all -- distinct from promptEdit,
+  // which is a natural-language request Claude interprets. Recorded
+  // separately so it's visible in config history which edits were a
+  // mechanical, guaranteed-correct change versus a model's judgment call.
+  directEdit: "direct_edit",
 } as const;
 
 export type ConfigSource = (typeof CONFIG_SOURCE)[keyof typeof CONFIG_SOURCE];
