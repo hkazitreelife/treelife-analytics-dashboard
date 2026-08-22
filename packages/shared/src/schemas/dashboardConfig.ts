@@ -324,9 +324,8 @@ const normalizeWidgetType = (
   ) {
     return "pie";
   }
-  // Convert any raw table widgets to horizontal_bar charts for rich executive visualization
   if (str.includes("table") || str.includes("grid")) {
-    return "horizontal_bar";
+    return "table";
   }
   return "bar";
 };

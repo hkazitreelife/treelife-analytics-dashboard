@@ -2,8 +2,12 @@ import * as XLSX from "xlsx";
 import { createHash } from "crypto";
 import type { Payload } from "payload";
 import {
-  normalizeDashboardConfigInput,
+  dashboardConfigSchema,
+  findHighCardinalityChartAxes,
   findUnresolvableMetrics,
+  normalizeDashboardConfigInput,
+  resolveInsightMetrics,
+  resolvedDashboardConfigSchema,
 } from "@analytics/shared";
 import { ensureSingleSourceSession } from "./sessionWrapper";
 import {
@@ -472,6 +476,18 @@ const toNumericValue = (value: unknown): number | null => {
   return null;
 };
 
+// A handful of numeric measures where SUM produces a number nobody reads --
+// a per-entity rate/duration/score is meaningful averaged, not summed.
+// Mirrors the "NO ID OR DATE SUMS" rule already given to the AI prompt path;
+// the deterministic fallback has no model to apply that judgment, so it
+// needs its own explicit list. Module-level so both buildTableInsight below
+// and the multi-sheet synthesis block share the exact same rule instead of
+// two copies drifting apart.
+const preferAverage = (name: string) =>
+  /(tenure|age|score|rate|ratio|percent|%|duration|salary|price|days|balance|index|rating)/i.test(
+    name,
+  );
+
 /**
  * Every table's fallback insight was previously the exact same three
  * sentences with only the table name substituted ("X captures N records
@@ -490,8 +506,22 @@ function buildTableInsight(table: ParsedTable, insightId: string) {
     (c) => c.inferredType === "categorical" || c.inferredType === "text",
   );
 
-  const metrics: { label: string; value: string }[] = [
-    { label: `${table.name} Records`, value: String(table.rowCount) },
+  // Structured references, not bare {label, value} pairs -- insightMetricRefSchema
+  // (packages/shared/src/schemas/dashboardConfig.ts) is a strict discriminated
+  // union that requires kind/sourceTable/sourceField/aggregation (or the "row"
+  // variant's labelColumn/labelValue/valueColumn); "value" is deliberately
+  // absent here and gets attached by resolveInsightMetrics, computed from real
+  // rows, same as the AI-generated path's insights are resolved. table.columns[0]
+  // as sourceField is arbitrary for a count -- count always counts rows
+  // regardless of which field is named (aggregationTypeSchema's own doc comment).
+  const metrics: Array<Record<string, unknown>> = [
+    {
+      kind: "aggregate",
+      label: `${table.name} Records`,
+      sourceTable: table.name,
+      sourceField: table.columns[0] ?? "id",
+      aggregation: "count",
+    },
   ];
 
   let dominantShare = 0;
@@ -518,7 +548,11 @@ function buildTableInsight(table: ParsedTable, insightId: string) {
       findingParts.push(
         `By ${catCols[0].name}, "${topValue}" leads with ${topCount} of ${table.rowCount} records (${pct}%), across ${counts.size} distinct value${counts.size === 1 ? "" : "s"} in that column.`,
       );
-      metrics.push({ label: `Top ${catCols[0].name}`, value: `${topValue} (${pct}%)` });
+      // Not added to `metrics`: "top category name + its share" doesn't fit
+      // either metric-reference kind (not a single column aggregation, not
+      // one row's stored value) -- it stays in the finding sentence above,
+      // computed the same way, directly from real rows, just not also
+      // duplicated as a metric badge.
     }
   }
 
@@ -531,7 +565,14 @@ function buildTableInsight(table: ParsedTable, insightId: string) {
       findingParts.push(
         `${numCols[0].name} totals ${sum.toLocaleString("en-IN", { maximumFractionDigits: 2 })} across those records, averaging ${avg.toLocaleString("en-IN", { maximumFractionDigits: 2 })} per record.`,
       );
-      metrics.push({ label: `${numCols[0].name} Total`, value: sum.toLocaleString("en-IN", { maximumFractionDigits: 2 }) });
+      const useAvg = preferAverage(numCols[0].name);
+      metrics.push({
+        kind: "aggregate",
+        label: `${numCols[0].name} ${useAvg ? "Average" : "Total"}`,
+        sourceTable: table.name,
+        sourceField: numCols[0].name,
+        aggregation: useAvg ? "avg" : "sum",
+      });
     }
   }
 
@@ -921,15 +962,6 @@ export async function processIngestionDirectly(
         t.columnsWithTypes.filter(
           (c) => c.inferredType === "categorical" || c.inferredType === "boolean",
         );
-      // A handful of numeric measures where SUM produces a number nobody
-      // reads -- a per-entity rate/duration/score is meaningful averaged,
-      // not summed. Mirrors the "NO ID OR DATE SUMS" rule already given to
-      // the AI prompt path (below); the deterministic fallback has no
-      // model to apply that judgment, so it needs its own explicit list.
-      const preferAverage = (name: string) =>
-        /(tenure|age|score|rate|ratio|percent|%|duration|salary|price|days|balance|index|rating)/i.test(
-          name,
-        );
 
       // 1. Executive Overview Tab
       const overviewWidgets: any[] = [];
@@ -1204,17 +1236,37 @@ export async function processIngestionDirectly(
           owner: "Operations Lead",
         },
         relatedTables: tables.map((t) => t.name),
-        metrics: [
-          { label: "Total Records", value: String(totalRows) },
-          ...(largestTable
-            ? [{ label: `${largestTable.name} Records`, value: String(largestTable.rowCount) }]
-            : []),
-        ],
+        // "Total Records" (the cross-table sum) is deliberately not a
+        // structured metric here: aggregateMetricRefSchema requires exactly
+        // one sourceTable, and this figure sums across every sheet, so it
+        // doesn't fit either metric-reference kind -- it stays in the
+        // finding sentence above, which already states it. largestTable's
+        // own count does fit (one table, a plain row count).
+        metrics: largestTable
+          ? [
+              {
+                kind: "aggregate",
+                label: `${largestTable.name} Records`,
+                sourceTable: largestTable.name,
+                sourceField: largestTable.columns[0] ?? "id",
+                aggregation: "count",
+              },
+            ]
+          : [],
       });
 
+      // No "description" field: dashboardConfigSchema (packages/shared/src/
+      // schemas/dashboardConfig.ts) is .strict() with exactly
+      // {datasetId, title, tabs, insights} at the root -- title is the
+      // only human-readable label the contract has. An earlier version of
+      // this object carried a "description" field that was never part of
+      // that contract; because nothing validated this object against the
+      // real schema before storage (fixed below), it went straight into
+      // Configs anyway, and every later prompt edit that echoed the
+      // "complete config" back (as instructed) inherited that illegal key
+      // and failed schema validation on a field the admin never touched.
       dashboardConfig = {
         title: `${filename.replace(/\.[^/.]+$/, "").replace(/[_-]/g, " ")} Executive Dashboard`,
-        description: `Executive intelligence synthesized across ${totalRows} records in ${tables.length} functional areas.`,
         tabs: generatedTabs,
         insights: generatedInsights,
       };
@@ -1227,6 +1279,71 @@ export async function processIngestionDirectly(
         relatedTables: Array.isArray(ins.relatedTables) ? ins.relatedTables : [],
       }));
     }
+
+    // CLAUDE.md rule 1 ("never trust model output... never store partially
+    // valid output") and this contract's own header comment ("anything
+    // outside it is rejected before storage, so an unvalidated config can
+    // never reach the renderer") both describe an invariant this write
+    // site was not actually upholding: dashboardConfig -- whether from the
+    // AI path (already passed findAiConfigProblems, a hand-rolled check,
+    // but never the real Zod schema) or the deterministic fallback above
+    // (hand-built, so presumed correct, but never actually checked) -- went
+    // straight to payload.create with no schema validation at all. That is
+    // exactly how an invalid root-level field (see the "description"
+    // removal above) reached storage undetected, then poisoned every later
+    // prompt edit against this dataset once that edit dutifully echoed the
+    // "complete config" back and hit the same schema for real. Validating
+    // here, the same way promptEdit.ts and claudeCombinedDashboardClient.ts
+    // already validate their own output before storage, closes that gap
+    // for both paths at once rather than patching each defect it could let
+    // through one at a time.
+    dashboardConfig.datasetId = String(datasetId);
+
+    const normalizedTablesForValidation = buildNormalizedTables(tables);
+    const schemaCheck = dashboardConfigSchema.safeParse(dashboardConfig);
+
+    if (!schemaCheck.success) {
+      throw new Error(
+        `Generated dashboard config failed schema validation, refusing to store: ${JSON.stringify(schemaCheck.error.issues)}`,
+      );
+    }
+
+    const chartAxisProblems = findHighCardinalityChartAxes(
+      schemaCheck.data,
+      normalizedTablesForValidation as any,
+    );
+
+    if (chartAxisProblems.length > 0) {
+      throw new Error(
+        `Generated dashboard config charts a near-unique column as a category axis, refusing to store: ${chartAxisProblems.join("; ")}`,
+      );
+    }
+
+    const unresolvableFinalMetrics = findUnresolvableMetrics(
+      schemaCheck.data.insights,
+      normalizedTablesForValidation as any,
+    );
+
+    if (unresolvableFinalMetrics.length > 0) {
+      throw new Error(
+        `Generated dashboard config has insight metrics that don't resolve against real data, refusing to store: ${unresolvableFinalMetrics.join("; ")}`,
+      );
+    }
+
+    const resolvedFinalConfig = {
+      ...schemaCheck.data,
+      insights: resolveInsightMetrics(schemaCheck.data.insights, normalizedTablesForValidation as any),
+    };
+
+    const resolvedSchemaCheck = resolvedDashboardConfigSchema.safeParse(resolvedFinalConfig);
+
+    if (!resolvedSchemaCheck.success) {
+      throw new Error(
+        `Resolved dashboard config failed schema validation, refusing to store: ${JSON.stringify(resolvedSchemaCheck.error.issues)}`,
+      );
+    }
+
+    dashboardConfig = resolvedSchemaCheck.data;
 
     // 4. Save Config -- version was previously hardcoded to 1 always, which
     // is correct for a dataset's first-ever ingestion but creates a second,
