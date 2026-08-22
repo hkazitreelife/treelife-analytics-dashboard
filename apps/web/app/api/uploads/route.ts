@@ -1,6 +1,6 @@
 import { requireUser } from "@/lib/auth";
 import { enqueueDocumentIngestion } from "@/lib/documentQueue";
-import { enqueueIngestion } from "@/lib/queue";
+import { inngest } from "@/lib/inngest";
 import {
   baseNameWithoutExtension,
   isDocumentCandidateFileType,
@@ -11,14 +11,14 @@ import {
 } from "@/lib/uploads";
 
 export const runtime = "nodejs";
-// Reverted from a same-day Inngest migration: Inngest existed specifically
-// to work around Vercel having no persistent worker process. Now that this
-// deploys to a VPS with a real, persistent worker (worker/src/index.ts,
-// fixed earlier the same day to actually run processIngestionJob instead
-// of dead code), that workaround is unnecessary -- enqueueIngestion below
-// hands off to that real worker over BullMQ+Redis, no external job
-// service needed. This route stays fast either way: it only enqueues, it
-// never runs the parse or AI call itself.
+// Datasets now go through Inngest (inngest.send below, handled by
+// /api/inngest -> lib/inngestFunctions.ts), which runs
+// processIngestionDirectly as a durable background job instead of this
+// request blocking on it -- so this route itself no longer needs a large
+// maxDuration; inngest.send is a fast outbound HTTP call, not the parse +
+// AI generation. Documents still go through enqueueDocumentIngestion
+// (BullMQ) unchanged -- migrating that path is a separate follow-up, since
+// its extraction logic lives only in the worker package today.
 export const maxDuration = 30;
 
 export async function POST(request: Request): Promise<Response> {
@@ -349,29 +349,34 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
 
-    // Fire-and-forget via BullMQ, picked up by the real persistent worker
-    // (worker/src/index.ts -> processIngestionJob) -- this request never
-    // blocks on parsing or an AI call, matching the documented design
-    // ("returns 202 immediately, never blocking on an AI call"). Reverted
-    // from the same-day Inngest migration now that this deploys to a VPS
-    // with an actual persistent worker process, which is what Inngest was
-    // standing in for on Vercel.
+    // Fire-and-forget via Inngest, which calls back into /api/inngest to
+    // actually run processIngestionDirectly as a durable background job --
+    // this request never blocks on parsing or an AI call, matching the
+    // documented design ("returns 202 immediately, never blocking on an AI
+    // call"). Previously this ran processIngestionDirectly synchronously,
+    // with BullMQ+Redis as a fallback only if that threw; Inngest replaces
+    // both the synchronous call and that fallback, and needs no Redis at
+    // all for this path.
     try {
-      await enqueueIngestion({
-        jobId: String(job.id),
-        fileId: String(created.id),
-        datasetId: String(dataset.id),
-        fileHash: hash,
+      await inngest.send({
+        name: "dataset/uploaded",
+        data: {
+          jobId: String(job.id),
+          datasetId: String(dataset.id),
+          fileId: String(created.id),
+          filename: uploaded.name,
+          intentPrompt,
+        },
       });
-    } catch (queueErr: unknown) {
-      payload.logger.error({ err: queueErr }, "Failed to enqueue dataset ingestion.");
+    } catch (sendErr: unknown) {
+      payload.logger.error({ err: sendErr }, "Failed to enqueue dataset ingestion via Inngest.");
 
       await payload.update({
         collection: "jobs",
         id: job.id,
         data: {
           status: "failed",
-          error: `Could not schedule ingestion: ${queueErr instanceof Error ? queueErr.message : String(queueErr)}`,
+          error: `Could not schedule ingestion: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`,
         },
       });
 
