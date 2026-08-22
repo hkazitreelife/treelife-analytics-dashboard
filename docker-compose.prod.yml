@@ -56,6 +56,14 @@ services:
       ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-AdminPassword123!}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Required whenever ANTHROPIC_API_KEY is an OpenRouter key
+      # (sk-or-v1-...) rather than a native Anthropic key -- resolveClaudeModel
+      # (packages/shared/src/claudeConfigContract.ts) checks this exact
+      # variable to decide whether to alias model names to OpenRouter's
+      # "anthropic/claude-*" format. Leaving it unset with an OpenRouter key
+      # doesn't fail outright (each client also checks the key's own prefix),
+      # but this keeps model resolution consistent everywhere it's checked.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
     volumes:
       - media_prod_data:/app/apps/web/media
@@ -88,6 +96,14 @@ services:
       REDIS_URL: redis://redis:6379
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Required whenever ANTHROPIC_API_KEY is an OpenRouter key
+      # (sk-or-v1-...) rather than a native Anthropic key -- resolveClaudeModel
+      # (packages/shared/src/claudeConfigContract.ts) checks this exact
+      # variable to decide whether to alias model names to OpenRouter's
+      # "anthropic/claude-*" format. Leaving it unset with an OpenRouter key
+      # doesn't fail outright (each client also checks the key's own prefix),
+      # but this keeps model resolution consistent everywhere it's checked.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
     volumes:
       - media_prod_data:/app/apps/web/media
