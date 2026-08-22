@@ -147,6 +147,13 @@ export async function GET(request: Request): Promise<Response> {
         status: session.status,
         datasetCount,
         documentCount,
+        // Full id arrays, not just counts -- lets the "combine existing
+        // sessions" action on /new gather every underlying source from
+        // whichever sessions the admin selects (single- or already
+        // multi-source), regardless of whether they were ever uploaded
+        // together in one batch.
+        datasetIds,
+        documentIds,
         // Only meaningful, and only sent, for the single-source case the
         // reprocess action targets -- a combined session has no one
         // dataset to reprocess.

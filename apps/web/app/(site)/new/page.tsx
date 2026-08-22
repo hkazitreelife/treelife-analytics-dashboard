@@ -86,6 +86,8 @@ type RecentSession = {
   updatedAt: string;
   datasetCount: number;
   documentCount: number;
+  datasetIds?: string[];
+  documentIds?: string[];
   singleDatasetId?: string | null;
   singleSource?: {
     kind: "dataset" | "document";
@@ -596,6 +598,66 @@ export default function NewSessionPage() {
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Sessions selected to merge into one combined session. Distinct from
+  // the batch-upload combine flow further up this file: that one only
+  // ever fires for files uploaded together in the same action. This lets
+  // an admin combine sources that were uploaded separately (at different
+  // times, in different batches, or one at a time) after the fact,
+  // without re-uploading anything.
+  const [selectedForCombine, setSelectedForCombine] = useState<Set<string>>(new Set());
+  const [combining, setCombining] = useState(false);
+
+  const toggleSelectedForCombine = (sessionId: string): void => {
+    setSelectedForCombine((current) => {
+      const next = new Set(current);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
+  };
+
+  const combineSelectedSessions = async (): Promise<void> => {
+    const selected = recentSessions.filter((s) => selectedForCombine.has(s.id));
+
+    const datasetIds = Array.from(new Set(selected.flatMap((s) => s.datasetIds ?? [])));
+    const documentIds = Array.from(new Set(selected.flatMap((s) => s.documentIds ?? [])));
+
+    if (datasetIds.length + documentIds.length < 2) {
+      window.alert("Select at least two sessions with a combined total of 2+ sources.");
+      return;
+    }
+
+    setCombining(true);
+
+    try {
+      const response = await fetch("/api/sessions", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          datasetIds,
+          documentIds,
+          name: selected.map((s) => s.name).join(" + ").slice(0, 80),
+        }),
+      });
+
+      const body = (await response.json()) as { sessionId?: string; error?: string };
+
+      if (!response.ok || !body.sessionId) {
+        window.alert(body.error ?? `Could not combine these sessions (status ${response.status}).`);
+        return;
+      }
+
+      router.push(`/sessions/${body.sessionId}`);
+    } catch (error: unknown) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCombining(false);
+    }
+  };
 
   // Closes the session card's "..." menu on any click elsewhere. The
   // menu's own toggle button and its items call stopPropagation, so this
@@ -894,12 +956,36 @@ export default function NewSessionPage() {
               </div>
             </div>
 
-            {recentSessions.length > 0 ? (
-              <span className="rounded-full bg-[color:var(--color-forest-surface)] px-2.5 py-0.5 text-[11px] font-semibold text-[color:var(--color-forest)] border border-[color:var(--color-forest-bright)]/20 shadow-2xs">
-                {recentSessions.length} session{recentSessions.length === 1 ? "" : "s"} in memory
-              </span>
-            ) : null}
+            <div className="flex items-center gap-2">
+              {selectedForCombine.size > 0 ? (
+                <button
+                  type="button"
+                  disabled={selectedForCombine.size < 2 || combining}
+                  onClick={() => void combineSelectedSessions()}
+                  title={
+                    selectedForCombine.size < 2
+                      ? "Select at least one more session to combine"
+                      : "Merge the selected sessions into one combined dashboard"
+                  }
+                  className="rounded-full bg-[color:var(--color-forest)] px-3 py-1 text-[11px] font-semibold text-white shadow-2xs hover:bg-[color:var(--color-forest-mid)] disabled:opacity-40"
+                >
+                  {combining ? "Combining…" : `Combine Selected (${selectedForCombine.size})`}
+                </button>
+              ) : null}
+
+              {recentSessions.length > 0 ? (
+                <span className="rounded-full bg-[color:var(--color-forest-surface)] px-2.5 py-0.5 text-[11px] font-semibold text-[color:var(--color-forest)] border border-[color:var(--color-forest-bright)]/20 shadow-2xs">
+                  {recentSessions.length} session{recentSessions.length === 1 ? "" : "s"} in memory
+                </span>
+              ) : null}
+            </div>
           </div>
+
+          {recentSessions.length > 1 ? (
+            <p className="text-[11px] text-[color:var(--color-steel)]">
+              Sources uploaded separately don&apos;t combine automatically — tick two or more sessions below, then click Combine Selected to merge them into one dashboard.
+            </p>
+          ) : null}
 
           {sessionsLoading ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3" aria-busy="true">
@@ -925,14 +1011,28 @@ export default function NewSessionPage() {
 
                     <div className="relative pointer-events-none">
                       <div className="flex items-center justify-between gap-2 pb-2">
-                        <span className="inline-flex items-center gap-1 rounded-md bg-[color:var(--color-cloud-light)] px-2 py-0.5 text-[10px] font-bold text-[color:var(--color-forest)]">
-                          <span>{isSingleDataset ? "📊" : isSingleDoc ? "📑" : "⚡"}</span>
-                          <span>
-                            {isSingleDataset
-                              ? "Spreadsheet"
-                              : isSingleDoc
-                              ? "Document"
-                              : "Cross-Source Synthesis"}
+                        <span className="inline-flex items-center gap-1.5 pointer-events-auto">
+                          <input
+                            type="checkbox"
+                            checked={selectedForCombine.has(s.id)}
+                            onChange={(event) => {
+                              event.stopPropagation();
+                              toggleSelectedForCombine(s.id);
+                            }}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Select ${s.name} to combine`}
+                            title="Select to combine with other sessions"
+                            className="h-3.5 w-3.5 rounded border-[color:var(--color-cloud)]"
+                          />
+                          <span className="inline-flex items-center gap-1 rounded-md bg-[color:var(--color-cloud-light)] px-2 py-0.5 text-[10px] font-bold text-[color:var(--color-forest)]">
+                            <span>{isSingleDataset ? "📊" : isSingleDoc ? "📑" : "⚡"}</span>
+                            <span>
+                              {isSingleDataset
+                                ? "Spreadsheet"
+                                : isSingleDoc
+                                ? "Document"
+                                : "Cross-Source Synthesis"}
+                            </span>
                           </span>
                         </span>
 
