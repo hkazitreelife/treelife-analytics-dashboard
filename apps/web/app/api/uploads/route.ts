@@ -1,7 +1,6 @@
 import { requireUser } from "@/lib/auth";
 import { enqueueDocumentIngestion } from "@/lib/documentQueue";
-import { enqueueIngestion } from "@/lib/queue";
-import { processIngestionDirectly } from "@/lib/directIngestion";
+import { inngest } from "@/lib/inngest";
 import {
   baseNameWithoutExtension,
   isDocumentCandidateFileType,
@@ -12,17 +11,15 @@ import {
 } from "@/lib/uploads";
 
 export const runtime = "nodejs";
-// processIngestionDirectly runs synchronously inside this request (parse +
-// up to 3 sequential AI model attempts at up to 90s each -- worst case
-// ~270s) with no separate worker process to fall back to on Vercel.
-// Without this, the route is capped at the platform default (10-15s),
-// which would kill AI generation before its own per-attempt timeout ever
-// gets a chance to fire, forcing every upload into the deterministic
-// fallback regardless of the fixes above. Vercel clamps this to whatever
-// the project's actual plan allows (300 is the practical ceiling on
-// current Vercel Node.js function plans), so it's a safe upper bound to
-// ask for, not a guarantee.
-export const maxDuration = 300;
+// Datasets now go through Inngest (inngest.send below, handled by
+// /api/inngest -> lib/inngestFunctions.ts), which runs
+// processIngestionDirectly as a durable background job instead of this
+// request blocking on it -- so this route itself no longer needs a large
+// maxDuration; inngest.send is a fast outbound HTTP call, not the parse +
+// AI generation. Documents still go through enqueueDocumentIngestion
+// (BullMQ) unchanged -- migrating that path is a separate follow-up, since
+// its extraction logic lives only in the worker package today.
+export const maxDuration = 30;
 
 export async function POST(request: Request): Promise<Response> {
   const auth = await requireUser(request);
@@ -352,33 +349,41 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
 
-    // Direct in-process ingestion using uploaded file buffer
-    let ingestionSuccessful = false;
+    // Fire-and-forget via Inngest, which calls back into /api/inngest to
+    // actually run processIngestionDirectly as a durable background job --
+    // this request never blocks on parsing or an AI call, matching the
+    // documented design ("returns 202 immediately, never blocking on an AI
+    // call"). Previously this ran processIngestionDirectly synchronously,
+    // with BullMQ+Redis as a fallback only if that threw; Inngest replaces
+    // both the synchronous call and that fallback, and needs no Redis at
+    // all for this path.
     try {
-      await processIngestionDirectly(
-        payload,
-        job.id,
-        dataset.id,
-        bytes,
-        uploaded.name,
-        intentPrompt,
-      );
-      ingestionSuccessful = true;
-    } catch (ingestErr) {
-      console.warn("[Uploads] Direct ingestion error, falling back to BullMQ:", ingestErr);
-    }
-
-    if (!ingestionSuccessful) {
-      try {
-        await enqueueIngestion({
+      await inngest.send({
+        name: "dataset/uploaded",
+        data: {
           jobId: String(job.id),
-          fileId: String(created.id),
           datasetId: String(dataset.id),
-          fileHash: hash,
-        });
-      } catch (queueErr) {
-        console.warn("[Uploads] BullMQ enqueue warning:", queueErr);
-      }
+          fileId: String(created.id),
+          filename: uploaded.name,
+          intentPrompt,
+        },
+      });
+    } catch (sendErr: unknown) {
+      payload.logger.error({ err: sendErr }, "Failed to enqueue dataset ingestion via Inngest.");
+
+      await payload.update({
+        collection: "jobs",
+        id: job.id,
+        data: {
+          status: "failed",
+          error: `Could not schedule ingestion: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`,
+        },
+      });
+
+      return Response.json(
+        { error: "Upload saved, but ingestion could not be scheduled. Try again." },
+        { status: 502 },
+      );
     }
 
     return Response.json(
@@ -386,10 +391,10 @@ export async function POST(request: Request): Promise<Response> {
         jobId: String(job.id),
         fileId: String(created.id),
         datasetId: String(dataset.id),
-        status: ingestionSuccessful ? "completed" : "queued",
+        status: "queued",
         requiresUserChoice: false,
       },
-      { status: ingestionSuccessful ? 200 : 202 },
+      { status: 202 },
     );
   } catch (error: unknown) {
     payload.logger.error({ err: error }, "Upload failed.");

@@ -47,6 +47,12 @@ Two runtime processes only. Adding a third requires explicit approval (spec 36).
 
 Flow: upload creates File + Job records and returns 202 immediately, never blocking on an AI call. The worker picks up the job, publishes to Redis pub/sub on completion, and the SSE route pushes `job.updated` / `dataset.updated` / `config.updated` to the browser, which refetches the affected resource rather than mutating state from the event payload.
 
+**This section describes the target design, not necessarily what's running.** Confirmed true for the worker process description above, `worker/src/index.ts` was a completely different, broken implementation until a 2026-08-22 fix repointed it at the actual pipeline this section describes (`worker/src/processors/ingestion.ts`) -- verify a description against the real entrypoint before trusting it, the same lesson that fix came from.
+
+**Dataset ingestion trigger, as of 2026-08-22: Inngest, not BullMQ.** `POST /api/uploads`'s dataset branch now calls `inngest.send({name: "dataset/uploaded", ...})` (`apps/web/lib/inngest.ts`) instead of running `processIngestionDirectly` synchronously or falling back to BullMQ. Inngest calls back into `POST /api/inngest` (`apps/web/lib/inngestFunctions.ts`), which runs the *same* `processIngestionDirectly` logic as a durable background job -- the ingestion logic itself is unchanged, only what triggers and retries it. This needs `INNGEST_SIGNING_KEY` (and `INNGEST_EVENT_KEY` in production) configured via the Inngest dashboard; without it the function endpoint exists but Inngest has nothing authorized to call it.
+
+Document ingestion (`POST /api/uploads`'s document branch) still goes through `enqueueDocumentIngestion` (BullMQ) unchanged -- its extraction logic (`worker/src/services/geminiDocument.ts`, `claudeDocumentSummary.ts`) lives only in the `worker` package, with no `apps/web` equivalent to wrap in an Inngest function yet. Migrating that path is a deliberate, separate follow-up, not an oversight -- don't assume documents are on Inngest just because datasets are.
+
 Payload collections: `Users`, `Files`, `Datasets`, `Configs`, `Jobs` (spec 19).
 
 ### AI responsibility split
