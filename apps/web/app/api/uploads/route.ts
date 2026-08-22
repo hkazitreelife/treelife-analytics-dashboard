@@ -1,5 +1,4 @@
 import { requireUser } from "@/lib/auth";
-import { enqueueDocumentIngestion } from "@/lib/documentQueue";
 import { inngest } from "@/lib/inngest";
 import {
   baseNameWithoutExtension,
@@ -11,14 +10,15 @@ import {
 } from "@/lib/uploads";
 
 export const runtime = "nodejs";
-// Datasets now go through Inngest (inngest.send below, handled by
-// /api/inngest -> lib/inngestFunctions.ts), which runs
-// processIngestionDirectly as a durable background job instead of this
-// request blocking on it -- so this route itself no longer needs a large
-// maxDuration; inngest.send is a fast outbound HTTP call, not the parse +
-// AI generation. Documents still go through enqueueDocumentIngestion
-// (BullMQ) unchanged -- migrating that path is a separate follow-up, since
-// its extraction logic lives only in the worker package today.
+// Both branches go through Inngest (inngest.send below, handled by
+// /api/inngest -> lib/inngestFunctions.ts), which runs the real ingestion
+// logic as a durable background job instead of this request blocking on
+// it -- so this route itself no longer needs a large maxDuration;
+// inngest.send is a fast outbound HTTP call, not the parse + AI
+// generation. Documents were migrated after datasets (their extraction
+// logic had to be ported into apps/web first: geminiDocument.ts,
+// claudeDocumentSummary.ts, documentDetector.ts, directDocumentIngestion.ts)
+// -- this route no longer uses BullMQ/Redis for job processing at all.
 export const maxDuration = 30;
 
 export async function POST(request: Request): Promise<Response> {
@@ -206,11 +206,21 @@ export async function POST(request: Request): Promise<Response> {
         },
       });
 
-      await enqueueDocumentIngestion({
-        jobId: String(job.id),
-        fileId: String(created.id),
-        documentId: String(document.id),
-        fileHash: hash,
+      // Reverted from BullMQ+Redis to Inngest, same as the dataset branch:
+      // documents were the deliberately-deferred half of the earlier
+      // Inngest migration (their extraction logic lived only in the
+      // worker package), now ported into apps/web
+      // (lib/directDocumentIngestion.ts) so this can move too. Removes
+      // the last Redis dependency for job processing.
+      await inngest.send({
+        name: "document/uploaded",
+        data: {
+          jobId: String(job.id),
+          fileId: String(created.id),
+          documentId: String(document.id),
+          fileHash: hash,
+          intentPrompt,
+        },
       });
 
       return Response.json(

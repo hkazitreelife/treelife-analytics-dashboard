@@ -1,6 +1,7 @@
 import { inngest } from "./inngest";
 import { getPayloadClient } from "./payload";
 import { processIngestionDirectly } from "./directIngestion";
+import { processDocumentIngestionDirectly } from "./directDocumentIngestion";
 
 export type DatasetUploadedEventData = {
   jobId: string;
@@ -53,5 +54,46 @@ export const ingestDatasetFunction = inngest.createFunction(
     await processIngestionDirectly(payload, jobId, datasetId, buffer, filename, intentPrompt);
 
     return { datasetId, jobId, status: "completed" };
+  },
+);
+
+export type DocumentUploadedEventData = {
+  jobId: string;
+  documentId: string;
+  fileId: string;
+  fileHash: string;
+  intentPrompt?: string | null;
+};
+
+/**
+ * The document-side counterpart to ingestDatasetFunction above, running
+ * directDocumentIngestion.ts's processDocumentIngestionDirectly (ported
+ * from worker/src/processors/documentIngestion.ts) as a durable Inngest
+ * job instead of the BullMQ+Redis path documents previously used
+ * exclusively. Removes the last Redis dependency for job processing on
+ * this deployment -- the earlier Inngest migration only covered datasets,
+ * deliberately deferring this because the extraction logic lived only in
+ * the worker package; it's ported into apps/web now (geminiDocument.ts,
+ * claudeDocumentSummary.ts, documentDetector.ts) so this function has
+ * something to call.
+ */
+export const ingestDocumentFunction = inngest.createFunction(
+  { id: "ingest-document", retries: 2, triggers: [{ event: "document/uploaded" }] },
+  async ({ event }) => {
+    const { jobId, documentId, fileId, fileHash, intentPrompt } =
+      event.data as DocumentUploadedEventData;
+
+    const payload = await getPayloadClient();
+
+    await processDocumentIngestionDirectly(
+      payload,
+      jobId,
+      documentId,
+      fileId,
+      fileHash,
+      intentPrompt,
+    );
+
+    return { documentId, jobId, status: "completed" };
   },
 );

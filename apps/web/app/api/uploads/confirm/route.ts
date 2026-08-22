@@ -1,8 +1,7 @@
 import { z } from "zod";
 
 import { requireUser } from "@/lib/auth";
-import { enqueueDocumentIngestion } from "@/lib/documentQueue";
-import { enqueueIngestion } from "@/lib/queue";
+import { inngest } from "@/lib/inngest";
 import { baseNameWithoutExtension } from "@/lib/uploads";
 
 export const runtime = "nodejs";
@@ -134,11 +133,14 @@ export async function POST(request: Request): Promise<Response> {
         },
       });
 
-      await enqueueDocumentIngestion({
-        jobId: String(job.id),
-        fileId: String(file.id),
-        documentId: String(documentId),
-        fileHash: file.sha256,
+      await inngest.send({
+        name: "document/uploaded",
+        data: {
+          jobId: String(job.id),
+          fileId: String(file.id),
+          documentId: String(documentId),
+          fileHash: file.sha256,
+        },
       });
 
       return Response.json(
@@ -188,11 +190,14 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
 
-    await enqueueIngestion({
-      jobId: String(job.id),
-      fileId: String(file.id),
-      datasetId: String(datasetId),
-      fileHash: file.sha256,
+    await inngest.send({
+      name: "dataset/uploaded",
+      data: {
+        jobId: String(job.id),
+        fileId: String(file.id),
+        datasetId: String(datasetId),
+        filename: file.filename ?? baseNameWithoutExtension("dataset"),
+      },
     });
 
     return Response.json(

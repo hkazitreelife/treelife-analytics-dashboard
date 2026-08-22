@@ -23,6 +23,9 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.116.0
         version: 0.116.0(zod@4.4.3)
+      '@google/genai':
+        specifier: ^2.16.0
+        version: 2.16.0
       '@payloadcms/db-postgres':
         specifier: 3.87.1
         version: 3.87.1(@opentelemetry/api@1.9.1)(payload@3.87.1(graphql@16.14.2)(typescript@5.9.3))

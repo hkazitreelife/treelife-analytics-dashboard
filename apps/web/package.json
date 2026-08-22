@@ -22,6 +22,7 @@
   "dependencies": {
     "@analytics/shared": "workspace:*",
     "@anthropic-ai/sdk": "^0.116.0",
+    "@google/genai": "^2.16.0",
     "@payloadcms/db-postgres": "3.87.1",
     "@payloadcms/next": "3.87.1",
     "@payloadcms/storage-s3": "3.87.1",

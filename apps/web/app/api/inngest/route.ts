@@ -1,11 +1,11 @@
 import { serve } from "inngest/next";
 
 import { inngest } from "@/lib/inngest";
-import { ingestDatasetFunction } from "@/lib/inngestFunctions";
+import { ingestDatasetFunction, ingestDocumentFunction } from "@/lib/inngestFunctions";
 
 export const runtime = "nodejs";
 
 export const { GET, POST, PUT } = serve({
   client: inngest,
-  functions: [ingestDatasetFunction],
+  functions: [ingestDatasetFunction, ingestDocumentFunction],
 });
