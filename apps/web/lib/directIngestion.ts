@@ -273,6 +273,29 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
           );
         }
       }
+
+      // Same rule the deterministic fallback template enforces structurally
+      // (chartCatCols there): a bar/horizontal_bar/pie's category axis
+      // (fields[0]) must be a genuinely low-cardinality column. "id" and
+      // "text" are exactly the types this file's inferColumnType assigns
+      // once a column's distinct-value count is too close to row count to
+      // be a real category -- a Name column, a free-text note, a serial
+      // number. Nothing previously stopped the AI-generated path from
+      // doing this even though the fallback template was fixed to avoid
+      // it; a pie chart with one slice per row is the exact defect this
+      // closes.
+      if (
+        (widget.type === "bar" || widget.type === "horizontal_bar" || widget.type === "pie") &&
+        fields[0]
+      ) {
+        const axisType = columnType.get(fields[0]);
+
+        if (axisType === "id" || axisType === "text") {
+          problems.push(
+            `widget "${widget.widgetId}" (${widget.type}) uses "${fields[0]}" as its category axis, but that column is typed "${axisType}" -- too many distinct values (near one per row) to chart as a category`,
+          );
+        }
+      }
     }
   }
 
@@ -373,12 +396,21 @@ function findAiConfigProblems(config: any, tables: ParsedTable[]): string[] {
     }
   }
 
-  const minInsights = Math.max(6, tables.length + 1);
+  // A floor of 6 assumes there are at least two sheets to draw genuine
+  // cross-sheet findings from (the prompt's own rule 4 only asks for those
+  // "in addition" to per-sheet ones). For a single-sheet dataset there is
+  // nothing to cross-reference, so demanding 6 anyway forces either
+  // padding with generic filler (banned by the same prompt rule) or
+  // outright validation failure -- which was silently forcing every
+  // single-sheet upload onto the deterministic fallback template,
+  // regardless of how well the AI path actually performed. Scale the
+  // floor to what the sheet count can actually support instead.
+  const minInsights = tables.length >= 2 ? Math.max(6, tables.length + 1) : 3;
   const insightCount = Array.isArray(config.insights) ? config.insights.length : 0;
 
   if (insightCount < minInsights) {
     problems.push(
-      `only ${insightCount} insight(s) total, need at least ${minInsights} (one substantive finding per sheet plus real cross-sheet insights)`,
+      `only ${insightCount} insight(s) total, need at least ${minInsights} (one substantive finding per sheet${tables.length >= 2 ? " plus real cross-sheet insights" : ""})`,
     );
   }
 
@@ -608,18 +640,24 @@ export async function processIngestionDirectly(
             " view on top; the same rule applies within a single workbook's sheets now.",
           ].join(""),
           [
-            "4. QUANTIFIED INSIGHTS, ONE PER SHEET MINIMUM PLUS A REAL CROSS-SHEET VIEW: You must provide at least",
+            `4. QUANTIFIED INSIGHTS, ONE PER SHEET MINIMUM${tables.length >= 2 ? " PLUS A REAL CROSS-SHEET VIEW" : ""}: You must provide at least`,
             ` one substantive insight for EVERY sheet listed above (${tables.map((t) => t.name).join(", ")}) --`,
             " each one specific to that sheet's own data (relatedTables naming exactly that one sheet), citing a",
             " real figure via metrics per rule 5 below, with a concrete implication and a concrete recommended",
             " action naming who owns it. A thin, generic finding ('captures N records') is not acceptable --",
             " every per-sheet insight must say something an executive could act on: a concentration, an outlier,",
-            " a risk, a trend, or a specific named driver, not merely a record count. In addition, provide at",
-            " least 1-2 genuine cross-sheet insights that synthesize across multiple sheets (relatedTables naming",
-            " 2 or more sheets) -- these are the strategic, executive-level findings, and must be real",
-            " connections between sheets, never a restatement of one sheet's own finding.",
-            ` Total insights must be at least ${Math.max(6, tables.length + 1)}: one substantive finding per sheet`,
-            " (each tagged to that one sheet) plus the cross-sheet ones. Every insight needs implications,",
+            " a risk, a trend, or a specific named driver, not merely a record count.",
+            tables.length >= 2
+              ? " In addition, provide at least 1-2 genuine cross-sheet insights that synthesize across multiple" +
+                " sheets (relatedTables naming 2 or more sheets) -- these are the strategic, executive-level" +
+                " findings, and must be real connections between sheets, never a restatement of one sheet's" +
+                " own finding."
+              : " This sheet is the only one in the file, so there is nothing to cross-reference -- do not invent" +
+                " a cross-sheet finding; instead go deeper within this sheet (multiple distinct angles: a" +
+                " concentration, an outlier, a trend, a named driver).",
+            ` Total insights must be at least ${tables.length >= 2 ? Math.max(6, tables.length + 1) : 3}: one substantive finding per sheet`,
+            tables.length >= 2 ? " (each tagged to that one sheet) plus the cross-sheet ones." : ".",
+            " Every insight needs implications,",
             " recommended actions, and department owners with presentation shape: 'tracker-item'.",
           ].join(""),
           [
@@ -860,9 +898,37 @@ export async function processIngestionDirectly(
 
       const realNumCols = (t: ParsedTable) =>
         t.columnsWithTypes.filter((c) => c.inferredType === "numeric");
+      // Broad: any column usable for a "Distinct X" KPI, where a large
+      // distinct count is still a meaningful (if unglamorous) single
+      // number -- including a high-cardinality "text" column such as a
+      // free-text field.
       const realCatCols = (t: ParsedTable) =>
         t.columnsWithTypes.filter(
           (c) => c.inferredType === "categorical" || c.inferredType === "text",
+        );
+      // Narrow: columns safe to hand to a chart as the category axis
+      // (bar/pie x-axis, breakdown grouping). Deliberately excludes
+      // "text" -- inferColumnType (above) already assigns "text" instead
+      // of "categorical" specifically when a column's distinct-value
+      // count is too high relative to row count, which is exactly what a
+      // per-row identifier (a Name column, a free-text note) looks like.
+      // Charting that column draws one slice/bar per row -- a pie chart
+      // with 72 name slices being the motivating, actually-observed case.
+      // "categorical" already passed that cardinality check, so it is the
+      // only type safe to use as a chart axis; "boolean" is always
+      // exactly two values, equally safe.
+      const chartCatCols = (t: ParsedTable) =>
+        t.columnsWithTypes.filter(
+          (c) => c.inferredType === "categorical" || c.inferredType === "boolean",
+        );
+      // A handful of numeric measures where SUM produces a number nobody
+      // reads -- a per-entity rate/duration/score is meaningful averaged,
+      // not summed. Mirrors the "NO ID OR DATE SUMS" rule already given to
+      // the AI prompt path (below); the deterministic fallback has no
+      // model to apply that judgment, so it needs its own explicit list.
+      const preferAverage = (name: string) =>
+        /(tenure|age|score|rate|ratio|percent|%|duration|salary|price|days|balance|index|rating)/i.test(
+          name,
         );
 
       // 1. Executive Overview Tab
@@ -881,13 +947,14 @@ export async function processIngestionDirectly(
       tables.slice(0, 3).forEach((table, idx) => {
         const nums = realNumCols(table);
         if (nums[0]) {
+          const useAvg = preferAverage(nums[0].name);
           overviewWidgets.push({
             widgetId: `ov_kpi_${idx + 2}`,
             type: "kpi_card",
-            title: `Total ${nums[0].name}`,
+            title: `${useAvg ? "Average" : "Total"} ${nums[0].name}`,
             sourceTable: table.name,
             fields: [nums[0].name],
-            aggregation: "sum",
+            aggregation: useAvg ? "avg" : "sum",
             position: { col: (idx + 1) * 3, row: 0, w: 3, h: 2 },
           });
         } else {
@@ -908,38 +975,67 @@ export async function processIngestionDirectly(
 
       if (tables[0]) {
         const t0 = tables[0];
-        const cats = realCatCols(t0);
+        const cats = chartCatCols(t0);
         const nums = realNumCols(t0);
-        const catCol = cats[0]?.name || t0.columns[1] || t0.columns[0];
+        const dates = t0.columnsWithTypes.filter((c) => c.inferredType === "date");
+        const catCol = cats[0]?.name || dates[0]?.name;
         const numCol = nums[0]?.name;
 
-        overviewWidgets.push({
-          widgetId: "ov_chart_1",
-          type: "bar",
-          title: `${t0.name} by ${catCol}`,
-          sourceTable: t0.name,
-          fields: numCol ? [catCol, numCol] : [catCol],
-          aggregation: numCol ? "sum" : "count",
-          position: { col: 0, row: 2, w: 6, h: 4 },
-        });
+        if (catCol) {
+          overviewWidgets.push({
+            widgetId: "ov_chart_1",
+            type: "bar",
+            title: `${t0.name} by ${catCol}`,
+            sourceTable: t0.name,
+            fields: numCol ? [catCol, numCol] : [catCol],
+            aggregation: numCol ? "sum" : "count",
+            position: { col: 0, row: 2, w: 6, h: 4 },
+          });
+        } else {
+          // No column with a genuinely low cardinality exists to chart --
+          // every candidate is effectively a per-row value (an id, a name,
+          // free text). A bar/pie chart there draws one bar/slice per row,
+          // which is unreadable, not merely unpolished. A raw-rows table
+          // is always valid regardless of column shape, so it replaces the
+          // broken chart rather than leaving a hardcoded column guess.
+          overviewWidgets.push({
+            widgetId: "ov_chart_1",
+            type: "table",
+            title: `${t0.name} Records`,
+            sourceTable: t0.name,
+            fields: t0.columns.slice(0, 6),
+            aggregation: "none",
+            position: { col: 0, row: 2, w: 6, h: 4 },
+          });
+        }
       }
 
       const t1 = tables[1] || tables[0];
       if (t1) {
-        const cats = realCatCols(t1);
-        const nums = realNumCols(t1);
-        const catCol = cats[0]?.name || t1.columns[0];
-        const numCol = nums[0]?.name;
+        const cats = chartCatCols(t1);
+        const catCol = cats[0]?.name;
 
-        overviewWidgets.push({
-          widgetId: "ov_chart_2",
-          type: "pie",
-          title: `${t1.name} Distribution`,
-          sourceTable: t1.name,
-          fields: [catCol],
-          aggregation: "count",
-          position: { col: 6, row: 2, w: 6, h: 4 },
-        });
+        if (catCol) {
+          overviewWidgets.push({
+            widgetId: "ov_chart_2",
+            type: "pie",
+            title: `${t1.name} Distribution`,
+            sourceTable: t1.name,
+            fields: [catCol],
+            aggregation: "count",
+            position: { col: 6, row: 2, w: 6, h: 4 },
+          });
+        } else {
+          overviewWidgets.push({
+            widgetId: "ov_chart_2",
+            type: "table",
+            title: `${t1.name} Records`,
+            sourceTable: t1.name,
+            fields: t1.columns.slice(0, 6),
+            aggregation: "none",
+            position: { col: 6, row: 2, w: 6, h: 4 },
+          });
+        }
       }
 
       generatedTabs.push({
@@ -953,6 +1049,9 @@ export async function processIngestionDirectly(
         const widgets: any[] = [];
         const numCols = realNumCols(table);
         const catCols = realCatCols(table);
+        // Only genuinely low-cardinality columns get handed to a chart --
+        // see chartCatCols above for why "text" is excluded.
+        const chartCats = chartCatCols(table);
         const dateCols = table.columnsWithTypes.filter((c) => c.inferredType === "date");
 
         widgets.push({
@@ -966,13 +1065,14 @@ export async function processIngestionDirectly(
         });
 
         if (numCols[0]) {
+          const useAvg = preferAverage(numCols[0].name);
           widgets.push({
             widgetId: `t_${tIdx + 1}_kpi_2`,
             type: "kpi_card",
-            title: `Total ${numCols[0].name}`,
+            title: `${useAvg ? "Average" : "Total"} ${numCols[0].name}`,
             sourceTable: table.name,
             fields: [numCols[0].name],
-            aggregation: "sum",
+            aggregation: useAvg ? "avg" : "sum",
             position: { col: 4, row: 0, w: 4, h: 2 },
           });
         }
@@ -1000,17 +1100,40 @@ export async function processIngestionDirectly(
           });
         }
 
-        const xCol = catCols[0]?.name || table.columns[0];
+        // Chart axis: a genuinely low-cardinality categorical column, or
+        // (for a bar, which tolerates more ticks than a pie) a date
+        // column bucketed. Never table.columns[0] blindly -- that used to
+        // fall through to whatever the first column in the sheet happened
+        // to be (frequently a Name or ID column), which is the exact
+        // defect that put 72 individual names on one chart.
+        const xCol = chartCats[0]?.name || dateCols[0]?.name;
         const yCol = numCols[0]?.name;
-        widgets.push({
-          widgetId: `t_${tIdx + 1}_chart_1`,
-          type: "bar",
-          title: `${table.name} Breakdown by ${xCol}`,
-          sourceTable: table.name,
-          fields: yCol && xCol ? [xCol, yCol] : [xCol || "Category"],
-          aggregation: yCol ? "sum" : "count",
-          position: { col: 0, row: 2, w: 6, h: 4 },
-        });
+
+        if (xCol) {
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_chart_1`,
+            type: "bar",
+            title: `${table.name} Breakdown by ${xCol}`,
+            sourceTable: table.name,
+            fields: yCol ? [xCol, yCol] : [xCol],
+            aggregation: yCol ? "sum" : "count",
+            position: { col: 0, row: 2, w: 6, h: 4 },
+          });
+        } else {
+          // No column on this sheet has low enough cardinality to chart
+          // (every candidate is effectively one distinct value per row).
+          // A raw-rows table is always valid and, unlike a guessed chart
+          // axis, never misrepresents the data.
+          widgets.push({
+            widgetId: `t_${tIdx + 1}_chart_1`,
+            type: "table",
+            title: `${table.name} Records`,
+            sourceTable: table.name,
+            fields: table.columns.slice(0, 6),
+            aggregation: "none",
+            position: { col: 0, row: 2, w: 6, h: 4 },
+          });
+        }
 
         if (dateCols[0] && numCols[0]) {
           widgets.push({
@@ -1022,25 +1145,28 @@ export async function processIngestionDirectly(
             aggregation: "sum",
             position: { col: 6, row: 2, w: 6, h: 4 },
           });
-        } else if (catCols[1] || numCols[1]) {
-          const secondX = catCols[1]?.name || catCols[0]?.name || table.columns[1] || table.columns[0];
+        } else if (chartCats[1] || (chartCats[0] && numCols[1])) {
+          const secondX = chartCats[1]?.name || chartCats[0]!.name;
           const secondY = numCols[1]?.name || numCols[0]?.name;
           widgets.push({
             widgetId: `t_${tIdx + 1}_chart_2`,
             type: "horizontal_bar",
             title: `${table.name} Analysis (${secondX})`,
             sourceTable: table.name,
-            fields: secondY && secondX ? [secondX, secondY] : [secondX || "Category"],
+            fields: secondY ? [secondX, secondY] : [secondX],
             aggregation: secondY ? "avg" : "count",
             position: { col: 6, row: 2, w: 6, h: 4 },
           });
-        } else {
+        } else if (chartCats[0]) {
+          // A pie tolerates fewer slices than a bar can tolerate ticks, so
+          // unlike xCol above this branch never falls back to a date
+          // column -- only a genuinely low-cardinality categorical works.
           widgets.push({
             widgetId: `t_${tIdx + 1}_chart_2`,
             type: "pie",
             title: `${table.name} Share Distribution`,
             sourceTable: table.name,
-            fields: [xCol || "Category"],
+            fields: [chartCats[0].name],
             aggregation: "count",
             position: { col: 6, row: 2, w: 6, h: 4 },
           });

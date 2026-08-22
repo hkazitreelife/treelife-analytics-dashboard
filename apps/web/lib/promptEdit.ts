@@ -2,6 +2,7 @@ import {
   buildDatasetMetadata,
   CONFIG_SOURCE,
   dashboardConfigSchema,
+  findHighCardinalityChartAxes,
   findUnknownReferences,
   findUnresolvableMetrics,
   normalizeDashboardConfigInput,
@@ -234,6 +235,21 @@ export const runPromptEdit = async (
       ok: false,
       status: 502,
       error: `Edited config references names absent from the dataset: ${unknownReferences.join("; ")}`,
+    };
+  }
+
+  // A prompt edit ("chart it by name", "make a pie chart of employees")
+  // can introduce a per-row-identifier column as a chart's category axis
+  // exactly as easily as initial generation can -- findUnknownReferences
+  // above only catches a reference to a column that doesn't exist, not a
+  // reference to the wrong kind of column for the chart type it's on.
+  const highCardinalityAxes = findHighCardinalityChartAxes(revalidated.data, tables);
+
+  if (highCardinalityAxes.length > 0) {
+    return {
+      ok: false,
+      status: 502,
+      error: `Edited config would chart a near-unique column as a category axis: ${highCardinalityAxes.join("; ")}`,
     };
   }
 

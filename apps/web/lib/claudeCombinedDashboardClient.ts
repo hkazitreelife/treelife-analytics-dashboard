@@ -2,6 +2,7 @@ import {
   dashboardConfigSchema,
   dashboardConfigToolSchema,
   findExtraTabWidgets,
+  findHighCardinalityChartAxes,
   findUnknownReferences,
   findUnresolvableMetrics,
   isClaudeBillingRejection,
@@ -55,8 +56,10 @@ const SYSTEM_INSTRUCTION = [
   "  that table, verbatim. Never invent a table or a column.",
   "- A widget's aggregation is one of exactly: none, sum, count, avg, distinct.",
   "  Never use other strings like 'total' or 'percentage'.",
-  "- The primary dataset's rawSheetTableName names the table every visual widget",
-  "  must source from at this stage.",
+  "- If the primary dataset's rawSheetTableName is non-null, it names the single table",
+  "  every visual widget must source from. If a separate instruction below instead lists",
+  "  multiple named sheets for the primary dataset, ignore rawSheetTableName and follow",
+  "  that instruction: every one of those sheets must get at least one widget.",
   "",
   "Unified Insights (Combining Quantitative Data and Qualitative Documents):",
   "- Generate comprehensive, executive-level insights that synthesize BOTH the",
@@ -151,13 +154,34 @@ export const createClaudeCombinedDashboardClient = (
         logger.info(`Retrying combined dashboard generation with model "${activeModel}".`);
       }
 
-      const systemInstruction = options?.stricterInstruction
-        ? `${SYSTEM_INSTRUCTION}\n\nThe previous response was rejected. ${options.stricterInstruction}`
-        : SYSTEM_INSTRUCTION;
-
       const primaryDataset = datasets[0];
       const allTables = datasets.flatMap((d) => d.tables);
       const rawSheetTableName = primaryDataset?.metadata?.rawSheetTableName ?? null;
+
+      // identifyRawSheet (packages/shared/src/claudeConfigContract.ts)
+      // deliberately returns null once a dataset has more than one
+      // "data"-role table -- there is no single canonical sheet to name.
+      // Section 9.0's SYSTEM_INSTRUCTION language above is written for the
+      // single-sheet case, though, and says nothing about what to do when
+      // it's null. Left unaddressed, a multi-sheet primary dataset (a
+      // workbook with several real data tabs, not one) had every widget
+      // silently funneled onto whichever one sheet the model happened to
+      // pick, with the rest never getting a widget -- the sheets "don't
+      // get mapped into their own fields" failure. Naming every sheet
+      // explicitly here, and requiring coverage of all of them below,
+      // closes that gap without touching the single-sheet path at all.
+      const primaryDataTables = (primaryDataset?.tables ?? []).filter(
+        (t) => t.tableRole === "data",
+      );
+      const primaryIsMultiSheet = rawSheetTableName === null && primaryDataTables.length >= 2;
+
+      const multiSheetInstruction = primaryIsMultiSheet
+        ? `\n\nThe primary dataset "${primaryDataset!.datasetName}" has ${primaryDataTables.length} distinct data sheets, all real: ${primaryDataTables.map((t) => `"${t.tableName}"`).join(", ")}. rawSheetTableName is null because there is no single one to pick. Every one of these sheets must get at least one widget somewhere in the tabs you build -- a combined dashboard that shows only the largest sheet while silently dropping the others is the exact failure this rule exists to prevent. Prefer one tab per sheet, mirroring how the standalone per-dataset dashboard is built, unless two sheets are small enough to share a tab sensibly.`
+        : "";
+
+      const systemInstruction = options?.stricterInstruction
+        ? `${SYSTEM_INSTRUCTION}${multiSheetInstruction}\n\nThe previous response was rejected. ${options.stricterInstruction}`
+        : `${SYSTEM_INSTRUCTION}${multiSheetInstruction}`;
 
       const userContent = [
         options?.adminIntent
@@ -291,6 +315,28 @@ export const createClaudeCombinedDashboardClient = (
       if (extraTabWidgets.length > 0) {
         throw new CombinedDashboardValidationError(
           `Combined config from model "${activeModel}" created a widget for a table other than the raw sheet "${rawSheetTableName}": ${extraTabWidgets.join("; ")}`,
+        );
+      }
+
+      if (primaryIsMultiSheet) {
+        const coveredTables = new Set(
+          result.data.tabs.flatMap((tab) => tab.widgets.map((widget) => widget.sourceTable)),
+        );
+        const missingSheets = primaryDataTables.filter(
+          (table) => !coveredTables.has(table.tableName),
+        );
+
+        if (missingSheets.length > 0) {
+          throw new CombinedDashboardValidationError(
+            `Combined config from model "${activeModel}" has no widget at all for these sheets of the primary dataset: ${missingSheets.map((t) => `"${t.tableName}"`).join(", ")}. Every sheet needs at least one widget.`,
+          );
+        }
+      }
+
+      const highCardinalityAxes = findHighCardinalityChartAxes(result.data, allTables);
+      if (highCardinalityAxes.length > 0) {
+        throw new CombinedDashboardValidationError(
+          `Combined config from model "${activeModel}" would chart a near-unique column as a category axis: ${highCardinalityAxes.join("; ")}`,
         );
       }
 

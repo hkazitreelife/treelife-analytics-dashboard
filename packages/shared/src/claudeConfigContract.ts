@@ -801,6 +801,65 @@ export const findUnknownReferences = (
   return problems;
 };
 
+const CHART_TYPES_NEEDING_CATEGORY_AXIS = new Set(["bar", "horizontal_bar", "pie"]);
+
+/**
+ * Rejects a bar/horizontal_bar/pie widget whose category axis (fields[0])
+ * is a column typed "id" or "text" -- exactly the types the shared column
+ * classification assigns once a column's distinct-value count is too high
+ * relative to row count to be a genuine category (a Name column, a
+ * free-text note, a serial number). Charting that column draws one
+ * bar/slice per row, which is unreadable, not merely unpolished -- the
+ * actually-observed failure this closes was a pie chart with 72 individual
+ * employee names as its 72 slices.
+ *
+ * Schema validation and findUnknownReferences cannot catch this: it is a
+ * well-formed reference to a real column, just the wrong kind of column
+ * for this chart type. Called from every path that can produce or edit a
+ * widget -- initial generation, combined-dashboard generation, and
+ * prompt-driven edits -- because a prompt edit ("chart it by name") can
+ * introduce this exactly as easily as initial generation can, and nothing
+ * about the edit path is otherwise different from the generation path in
+ * this respect.
+ */
+export const findHighCardinalityChartAxes = (
+  config: DashboardConfigShape,
+  tables: NormalizedTableShape[],
+): string[] => {
+  const columnTypeByTable = new Map(
+    tables.map((table) => [
+      table.tableName,
+      new Map(table.columns.map((column) => [column.name, column.inferredType])),
+    ]),
+  );
+
+  const problems: string[] = [];
+
+  for (const tab of config.tabs) {
+    for (const widget of tab.widgets) {
+      if (!CHART_TYPES_NEEDING_CATEGORY_AXIS.has(widget.type)) {
+        continue;
+      }
+
+      const categoryField = widget.fields[0];
+
+      if (!categoryField) {
+        continue;
+      }
+
+      const columnType = columnTypeByTable.get(widget.sourceTable)?.get(categoryField);
+
+      if (columnType === "id" || columnType === "text") {
+        problems.push(
+          `widget "${widget.widgetId}" (${widget.type}) uses "${categoryField}" as its category axis, but that column is typed "${columnType}" -- too many distinct values (near one per row) to chart as a category. Pick a genuinely low-cardinality categorical column instead, or use a table widget.`,
+        );
+      }
+    }
+  }
+
+  return problems;
+};
+
 /**
  * The emit_dashboard_config tool's input schema. Shared so the initial
  * generation call and the prompt-edit call force the exact same structural
