@@ -9,6 +9,11 @@ import {
   resolveInsightMetrics,
   resolvedDashboardConfigSchema,
 } from "@analytics/shared";
+import {
+  createGeminiHeaderClient,
+  PREVIEW_ROW_COUNT,
+  type GeminiHeaderClient,
+} from "./geminiSpreadsheetHeader";
 import { ensureSingleSourceSession } from "./sessionWrapper";
 import {
   acquireDatasetLock,
@@ -124,21 +129,7 @@ export function inferColumnType(
  * logic runs once per detected block, not once per whole sheet -- see that
  * function's doc comment for why a sheet can contain more than one block.
  */
-function detectHeaderAndBuildColumnNames(block: any[][]): { headerRowIdx: number; headers: string[] } {
-  let headerRowIdx = 0;
-  let maxCols = 0;
-  for (let r = 0; r < Math.min(10, block.length); r++) {
-    const row = block[r];
-    if (!Array.isArray(row)) continue;
-    const validHeaders = row.filter(
-      (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
-    );
-    if (validHeaders.length > maxCols && validHeaders.length >= 2) {
-      maxCols = validHeaders.length;
-      headerRowIdx = r;
-    }
-  }
-
+function buildColumnNamesAtRow(block: any[][], headerRowIdx: number): { headers: string[] } {
   const headerRow = block[headerRowIdx] || [];
 
   // Trim trailing blank cells before building column names. XLSX's
@@ -169,6 +160,26 @@ function detectHeaderAndBuildColumnNames(block: any[][]): { headerRowIdx: number
     }
     headers.push(uniqueName);
   }
+
+  return { headers };
+}
+
+function detectHeaderAndBuildColumnNames(block: any[][]): { headerRowIdx: number; headers: string[] } {
+  let headerRowIdx = 0;
+  let maxCols = 0;
+  for (let r = 0; r < Math.min(10, block.length); r++) {
+    const row = block[r];
+    if (!Array.isArray(row)) continue;
+    const validHeaders = row.filter(
+      (c) => typeof c === "string" && c.trim().length > 0 && !c.trim().startsWith("__EMPTY"),
+    );
+    if (validHeaders.length > maxCols && validHeaders.length >= 2) {
+      maxCols = validHeaders.length;
+      headerRowIdx = r;
+    }
+  }
+
+  const { headers } = buildColumnNamesAtRow(block, headerRowIdx);
 
   return { headerRowIdx, headers };
 }
@@ -212,8 +223,19 @@ function detectHeaderAndBuildColumnNames(block: any[][]): { headerRowIdx: number
  * model judgment. Model-assisted extraction remains the fuller fix; this
  * closes the specific, demonstrated failure (two differently-shaped tables
  * merged into one), not every conceivable multi-table layout.
+ *
+ * Follow-up: Gemini now assists the header-ROW-POSITION half of this
+ * (geminiSpreadsheetHeader.ts), matching CLAUDE.md's documented
+ * previewRows exception. It runs only for a block already decided to be
+ * a genuinely new table (the column-count comparison below still decides
+ * that, deterministically, unchanged) -- never spent on a continuation
+ * block that gets no header of its own anyway. Any Gemini failure falls
+ * back to the same heuristic this function already had.
  */
-export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
+export async function parseWorkbookBuffer(
+  buffer: Buffer,
+  geminiHeaderClient?: GeminiHeaderClient,
+): Promise<ParsedTable[]> {
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const tables: ParsedTable[] = [];
 
@@ -289,6 +311,11 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
       if (block.length === 0) continue;
 
       const previous = blockResults[blockResults.length - 1];
+      // Cheap and discardable: only used to compare column COUNTS for the
+      // continuation-merge decision below. A continuation block gets no
+      // header row of its own regardless of what this finds, so spending
+      // a Gemini call on it here would be pure waste -- Gemini only runs
+      // below, once a block is already decided to be a genuinely new table.
       const tentative = detectHeaderAndBuildColumnNames(block);
 
       if (previous && tentative.headers.length === previous.columns.length) {
@@ -301,16 +328,32 @@ export function parseWorkbookBuffer(buffer: Buffer): ParsedTable[] {
       if (block.length < 2) continue; // a genuinely new table needs a header row plus one data row
       if (tentative.headers.length === 0) continue;
 
-      const rows = buildRows(block, tentative.headers, tentative.headerRowIdx + 1);
+      // This block is a genuinely new table -- worth Gemini's real
+      // judgment on where its header actually sits, since that's a value
+      // that reaches storage and every downstream column reference,
+      // unlike the discarded tentative check above. Falls back to the
+      // heuristic's own headerRowIdx on any Gemini failure.
+      const geminiIdx = geminiHeaderClient
+        ? await geminiHeaderClient.detectHeaderRowIndex(block.slice(0, PREVIEW_ROW_COUNT))
+        : null;
+      const headerRowIdx = geminiIdx ?? tentative.headerRowIdx;
+      const { headers } =
+        headerRowIdx === tentative.headerRowIdx
+          ? tentative
+          : buildColumnNamesAtRow(block, headerRowIdx);
+
+      if (headers.length === 0) continue;
+
+      const rows = buildRows(block, headers, headerRowIdx + 1);
       if (rows.length === 0) continue;
 
-      const columnsWithTypes = tentative.headers.map((colName) => {
+      const columnsWithTypes = headers.map((colName) => {
         const sampleVals = rows.slice(0, 100).map((r) => r[colName]);
         const inferredType = inferColumnType(colName, sampleVals);
         return { name: colName, inferredType };
       });
 
-      blockResults.push({ columns: tentative.headers, columnsWithTypes, allRows: rows });
+      blockResults.push({ columns: headers, columnsWithTypes, allRows: rows });
     }
 
     const merged = blockResults;
@@ -785,8 +828,16 @@ export async function processIngestionDirectly(
       data: { status: "processing" },
     });
 
-    // 2. Parse workbook
-    const tables = parseWorkbookBuffer(buffer);
+    // 2. Parse workbook -- Gemini assists header-row detection per table
+    // (geminiSpreadsheetHeader.ts); constructed here, once, from the real
+    // env var, and passed in rather than constructed inside
+    // parseWorkbookBuffer so it stays a plain, injectable dependency (a
+    // stub client in a test needs no real API key). Missing/invalid key
+    // degrades to the existing heuristic silently, never blocks ingestion.
+    const geminiHeaderClient = createGeminiHeaderClient(process.env.GEMINI_API_KEY, undefined, {
+      warn: (msg) => console.warn(`[DirectIngestion] ${msg}`),
+    });
+    const tables = await parseWorkbookBuffer(buffer, geminiHeaderClient);
     if (tables.length === 0) {
       throw new Error(`The uploaded file "${filename}" contains no valid sheets or tabular data.`);
     }
