@@ -239,6 +239,24 @@ export async function DELETE(
       deleted.documentId = String(documentId);
     }
 
+    // Missing before this fix: ConversationTurns.session relates to
+    // Sessions with no cascade delete, so any session with chat/edit
+    // history failed here with a raw Postgres foreign-key error on the
+    // sessions delete itself -- confirmed live (4 of 7 real sessions
+    // failed this exact way; the 3 that succeeded had no conversation
+    // turns yet). clear-nimbus.ts already deletes conversation-turns
+    // before its session delete; this endpoint never did.
+    const turns = await payload.find({
+      collection: "conversation-turns",
+      where: { session: { equals: id } },
+      limit: 1000,
+      depth: 0,
+    });
+
+    for (const turn of turns.docs) {
+      await payload.delete({ collection: "conversation-turns", id: turn.id });
+    }
+
     await payload.delete({ collection: "sessions", id });
     invalidateCache("session");
 
