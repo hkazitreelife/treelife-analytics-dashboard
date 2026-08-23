@@ -262,7 +262,7 @@ export interface Config1 {
     | number
     | boolean
     | null;
-  generatedBy: 'initial_auto_generation' | 'prompt_edit' | 'direct_edit';
+  generatedBy: 'initial_auto_generation' | 'prompt_edit' | 'direct_edit' | 'initial_fallback';
   editedBy?: (number | null) | User;
   updatedAt: string;
   createdAt: string;

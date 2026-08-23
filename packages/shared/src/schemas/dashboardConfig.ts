@@ -573,6 +573,17 @@ export const CONFIG_SOURCE = {
   // separately so it's visible in config history which edits were a
   // mechanical, guaranteed-correct change versus a model's judgment call.
   directEdit: "direct_edit",
+  // The fast, zero-AI-call deterministic template written immediately on
+  // ingestion (Phase A of the async-upgrade architecture) so the dataset
+  // reaches "ready" in seconds, never blocked on a model call that might
+  // be slow or fail. Distinct from initialAutoGeneration, which now means
+  // specifically "a genuine AI-generated config" -- whether that arrived
+  // as the very first version (rare: only if Phase A itself found no fast
+  // fallback needed) or, far more commonly, as the version that silently
+  // replaced this one once the decoupled upgrade attempt (Phase B)
+  // actually succeeded. Config history should say honestly which one any
+  // given version was, not blur a template into "auto generation."
+  initialFallback: "initial_fallback",
 } as const;
 
 export type ConfigSource = (typeof CONFIG_SOURCE)[keyof typeof CONFIG_SOURCE];

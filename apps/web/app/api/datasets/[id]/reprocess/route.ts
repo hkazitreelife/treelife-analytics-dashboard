@@ -2,11 +2,16 @@ import { requireUser } from "@/lib/auth";
 import { processIngestionDirectly } from "@/lib/directIngestion";
 import { DatasetIngestionLockedError } from "@/lib/datasetLock";
 import { invalidateCache } from "@/lib/cache";
+import { inngest } from "@/lib/inngest";
 
 export const runtime = "nodejs";
-// Same reasoning as apps/web/app/api/uploads/route.ts's maxDuration: this
-// calls the same synchronous, potentially multi-model-attempt ingestion.
-export const maxDuration = 300;
+// processIngestionDirectly is Phase A only now (parse, fast fallback,
+// store, ready) -- no AI model call happens inside this request anymore,
+// so the old "potentially multi-model-attempt" justification for a long
+// maxDuration no longer applies. Kept generous anyway since this is still
+// a real parse of a real file, just no longer the reason this could run
+// for minutes.
+export const maxDuration = 60;
 
 /**
  * Repairs a dataset that was ingested before directIngestion.ts wrote
@@ -83,7 +88,17 @@ export async function POST(
   });
 
   try {
-    await processIngestionDirectly(payload, job.id, Number(id), buffer, filename, undefined);
+    const phaseA = await processIngestionDirectly(payload, job.id, Number(id), buffer, filename, undefined);
+
+    // Phase A only rebuilds the fast fallback -- without sending this,
+    // a reprocessed dataset would sit at Job status "generating_config"
+    // forever, since nothing else would ever trigger the AI-upgrade
+    // attempt for it. Same event ingestDatasetFunction sends after a
+    // fresh upload's own Phase A.
+    await inngest.send({
+      name: "dataset/config-upgrade-requested",
+      data: phaseA,
+    });
   } catch (error: unknown) {
     if (error instanceof DatasetIngestionLockedError) {
       // Thrown before processIngestionDirectly's own try/catch, so it

@@ -44,6 +44,7 @@ export const Configs: CollectionConfig = {
         { label: "Initial auto generation", value: "initial_auto_generation" },
         { label: "Prompt edit", value: "prompt_edit" },
         { label: "Direct edit", value: "direct_edit" },
+        { label: "Initial fallback (fast template)", value: "initial_fallback" },
       ],
     },
     {
