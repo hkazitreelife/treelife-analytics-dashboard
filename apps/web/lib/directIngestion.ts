@@ -51,9 +51,23 @@ export function inferColumnType(
     return "id";
   }
 
-  // Strict semantic identification for Date and Time columns
+  // Strict semantic identification for Date and Time columns. Only
+  // near-unambiguous date indicators are trusted as a raw substring here
+  // -- "day", "month", "year", "time", "exit", "joining" were removed
+  // from that list because they match constantly inside real, non-date
+  // column names ("Notice served (days)", "Exit reason", "Exit category",
+  // "Exit interview done", "Tenure (months)") and were overriding values
+  // that were plainly numeric or categorical, purely because of a
+  // substring in the name. Caught by actually running this against a
+  // real dataset: "Tenure (months)" holding 37.4 came back typed "date".
+  // The value-based inspection below already handles a genuinely
+  // date-shaped column correctly; those six words still count if a
+  // column is named exactly that word (a column literally called
+  // "Month" or "Day" is a real, unambiguous date reference), just not
+  // merely for containing it.
   if (
-    /(date|joining|exit|dob|month|year|timestamp|day|time|lwd|last_working_day)/i.test(lowerName)
+    /(date|dob|timestamp|lwd|last_working_day)/i.test(lowerName) ||
+    /^(day|month|year|time|exit|joining)$/i.test(lowerName)
   ) {
     return "date";
   }
