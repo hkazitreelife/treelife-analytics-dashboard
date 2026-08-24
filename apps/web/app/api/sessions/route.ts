@@ -1,21 +1,10 @@
 import { fileTypeFromFilename } from "@/lib/fileType";
 import { requireUser } from "@/lib/auth";
-import { createSessionSynthesisClient } from "@/lib/claudeSessionSynthesisClient";
-import { createClaudeCombinedDashboardClient } from "@/lib/claudeCombinedDashboardClient";
-import { runSessionSynthesis } from "@/lib/sessionSynthesis";
+import { writeDeterministicSessionOverview } from "@/lib/sessionFallback";
+import { inngest } from "@/lib/inngest";
 import { getCache, setCache, invalidateCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
-
-const requireEnv = (name: string): string => {
-  const value = process.env[name];
-
-  if (!value) {
-    throw new Error(`Missing required environment variable ${name}.`);
-  }
-
-  return value;
-};
 
 type SingleSourceInfo = {
   kind: "dataset" | "document";
@@ -239,43 +228,84 @@ export async function POST(request: Request): Promise<Response> {
     },
   });
 
-  let synthesisClient;
-  let combinedDashboardClient;
+  // Phase A (the fast half of the same Phase A/Phase B split datasets got):
+  // build and store the deterministic combined overview RIGHT NOW, from the
+  // sources' already-stored rows -- zero AI calls, sub-second. The session
+  // leaves this request ready with a real, validated Overview tab no matter
+  // what any model does later. This replaces the old behavior of awaiting
+  // runSessionSynthesis inline, which measured 231s end to end when its
+  // primary model truncated mid-JSON and a retry followed -- all inside one
+  // HTTP request.
+  let fallbackWritten = false;
 
   try {
-    const apiKey = requireEnv("ANTHROPIC_API_KEY");
-    synthesisClient = createSessionSynthesisClient(apiKey);
-    combinedDashboardClient = createClaudeCombinedDashboardClient(apiKey);
+    const outcome = await writeDeterministicSessionOverview(payload, String(session.id), {
+      adminIntent: typeof name === "string" ? name.trim() : undefined,
+    });
+    fallbackWritten = outcome.written;
   } catch (error: unknown) {
-    payload.logger.error({ err: error }, "Could not construct session synthesis client.");
-
-    return Response.json(
-      { error: "Server is not configured to run session synthesis." },
-      { status: 500 },
+    // A failed fallback build must not fail the request with a 5xx after
+    // the session row exists; record why and fall through to the honest
+    // empty-overview outcome below (the same thing a total AI failure used
+    // to produce, now at least labeled).
+    payload.logger.warn(
+      `Deterministic session overview for session ${session.id} failed to build: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 
-  const result = await runSessionSynthesis(String(session.id), {
-    payload,
-    synthesisClient,
-    combinedDashboardClient,
-    adminIntent: typeof name === "string" ? name.trim() : undefined,
-  });
+  if (!fallbackWritten) {
+    // No dataset in this session has stored tables (documents-only batch,
+    // or every dataset lost its data). There is genuinely nothing
+    // deterministic to show and nothing for an AI dashboard upgrade to
+    // build from either -- so no Phase B event is fired. Findings could
+    // still theoretically apply to a documents-only session, but without
+    // any dataset metric side they can never satisfy the finding contract;
+    // recording the honest empty state beats pretending otherwise.
+    await payload.update({
+      collection: "sessions",
+      id: session.id,
+      data: { status: "ready", overview: { findings: [] } },
+    });
 
-  if (!result.ok) {
-    payload.logger.warn(`Session synthesis for session ${session.id} failed: ${result.error}`);
+    invalidateCache("session");
 
-    return Response.json(
-      { sessionId: String(session.id), status: "failed", error: result.error },
-      { status: result.status },
+    return Response.json({
+      sessionId: String(session.id),
+      status: "ready",
+      upgraded: false,
+      reason: "no_dataset_tables",
+    });
+  }
+
+  // Phase B handoff: a fast outbound event send, not an AI wait. If Inngest
+  // itself is unreachable, the fallback is ALREADY live and stored, so the
+  // admin loses only the future upgrade, never the session -- logged, not
+  // failed.
+  let handoffWarning: string | null = null;
+
+  try {
+    await inngest.send({
+      name: "session/synthesis-requested",
+      data: {
+        sessionId: String(session.id),
+        adminIntent: typeof name === "string" ? name.trim() : null,
+      },
+    });
+  } catch (error: unknown) {
+    handoffWarning =
+      error instanceof Error ? error.message : String(error);
+    payload.logger.warn(
+      `Could not queue the AI upgrade for session ${session.id}; the deterministic fallback stays live. ${handoffWarning}`,
     );
   }
 
   invalidateCache("session");
 
   return Response.json({
-    sessionId: result.sessionId,
+    sessionId: String(session.id),
     status: "ready",
-    findings: result.findings,
+    upgraded: false,
+    pendingUpgrade: !handoffWarning,
+    ...(handoffWarning ? { warning: "AI upgrade could not be queued; showing the deterministic overview." } : {}),
   });
 }

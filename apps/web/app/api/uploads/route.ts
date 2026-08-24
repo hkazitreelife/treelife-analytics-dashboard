@@ -390,8 +390,16 @@ export async function POST(request: Request): Promise<Response> {
         },
       });
 
+      // Actionable, not generic: the File/Dataset rows already exist, so
+      // "try again" alone would re-upload needlessly. Name the dataset and
+      // give the two real remediations -- start the local Inngest runtime,
+      // or hit the existing Repair/Reprocess flow once it's up.
       return Response.json(
-        { error: "Upload saved, but ingestion could not be scheduled. Try again." },
+        {
+          error:
+            "Upload saved, but ingestion could not be scheduled -- Inngest is unreachable locally. Start it with `npx inngest-cli@latest dev -u http://localhost:3000/api/inngest`, then open this dataset and choose Repair/Reprocess.",
+          datasetId: String(dataset.id),
+        },
         { status: 502 },
       );
     }

@@ -1,4 +1,5 @@
 import {
+  CONFIG_SOURCE,
   resolveInsightMetrics,
   type ResolvedDashboardConfigShape,
 } from "@analytics/shared";
@@ -123,6 +124,13 @@ export const runSessionEdit = async (
                     tabs: newConfig.tabs,
                   }
                 : newConfig,
+              // Stamp provenance: whatever this overview was before (e.g.
+              // Phase A's "initial_fallback" template), an applied edit is a
+              // deliberate human-directed change -- and crucially, it must
+              // no longer read as "initial_fallback", or the session page's
+              // upgrade-polling would keep waiting on an AI pass that this
+              // edit has already superseded.
+              configSource: CONFIG_SOURCE.promptEdit,
             },
           },
         });
@@ -234,6 +242,11 @@ export const runSessionEdit = async (
     const updatedOverview = {
       ...currentOverview,
       config: resolvedConfig,
+      // Same provenance rule as applyToDataset above: a combined-session
+      // edit supersedes whatever pipeline produced the previous overview,
+      // and must clear any "initial_fallback" marker so upgrade-polling
+      // stops.
+      configSource: CONFIG_SOURCE.promptEdit,
     };
 
     await payload.update({

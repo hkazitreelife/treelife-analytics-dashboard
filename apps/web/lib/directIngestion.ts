@@ -38,7 +38,29 @@ export interface ParsedTable {
   rowCount: number;
   sampleRows: any[];
   allRows: any[];
+  /**
+   * Text captured from skipped non-tabular leading fragments of this
+   * sheet (a merged brand/title cell above the true header, subtitle
+   * lines). Never rendered anywhere by itself -- it exists so AI prompts
+   * can say what each sheet IS, which measurably improves insight
+   * relevance versus a bare column list.
+   */
+  titleContext?: string | null;
 }
+
+/**
+ * Strips a parser-assigned duplicate-block suffix ("Employee Master (2)"
+ * -> "Employee Master") to reveal the LOGICAL sheet a parsed table belongs
+ * to. Tab grouping keys off this: every table of one logical sheet renders
+ * inside that sheet's single dashboard tab (as stacked widget sections),
+ * which is what kills the duplicated-tabs experience for workbooks whose
+ * sheets legitimately contain more than one block -- without discarding
+ * any real companion-table data.
+ */
+export const logicalSheetGroup = (tableName: string): string => {
+  const stripped = tableName.replace(/\s+\(\d+\)\s*$/, "").trim();
+  return stripped.length > 0 ? stripped : tableName;
+};
 
 export function inferColumnType(
   name: string,
@@ -324,6 +346,9 @@ export async function parseWorkbookBuffer(
     // block's real column count, treat the whole block as data under the
     // previous block's real headers, consuming no header row from it.
     const blockResults: BlockResult[] = [];
+    // Captured from skipped non-tabular leading fragments (a merged
+    // brand/title cell above the true header). See ParsedTable.titleContext.
+    let sheetTitleContext: string | null = null;
 
     for (const block of blocks) {
       if (block.length === 0) continue;
@@ -343,8 +368,26 @@ export async function parseWorkbookBuffer(
         continue;
       }
 
-      if (block.length < 2) continue; // a genuinely new table needs a header row plus one data row
-      if (tentative.headers.length === 0) continue;
+      // A block that cannot be a real data table -- fewer than two columns,
+      // or fewer than two rows -- is a title/prose fragment (e.g. the merged
+      // "Brand - Sheet Name" cell plus subtitle line sitting above the true
+      // header in branded workbooks). Storing it as a table produced exactly
+      // one junk 1x1 table per sheet and a duplicate-looking tab next to the
+      // real one. Never stored; its text becomes this sheet's title context.
+      // A genuine second table with real shape (>=2 cols AND >=2 rows) still
+      // passes through unchanged -- verified against live datasets where such
+      // companion blocks carry actual data.
+      if (tentative.headers.length < 2 || block.length < 2) {
+        const fragmentText = block
+          .flat()
+          .map((cell) => String(cell ?? "").trim())
+          .filter(Boolean)
+          .join(" | ");
+        if (!sheetTitleContext && fragmentText.length > 0) {
+          sheetTitleContext = fragmentText;
+        }
+        continue;
+      }
 
       // This block is a genuinely new table -- worth Gemini's real
       // judgment on where its header actually sits, since that's a value
@@ -384,6 +427,7 @@ export async function parseWorkbookBuffer(
         rowCount: block.allRows.length,
         sampleRows: block.allRows.slice(0, 10),
         allRows: block.allRows,
+        titleContext: sheetTitleContext,
       });
     });
   }
@@ -701,7 +745,10 @@ const toNumericValue = (value: unknown): number | null => {
 // needs its own explicit list. Module-level so both buildTableInsight below
 // and the multi-sheet synthesis block share the exact same rule instead of
 // two copies drifting apart.
-const preferAverage = (name: string) =>
+// Exported for lib/sessionFallback.ts: the combined-session deterministic
+// overview reuses this exact rule rather than growing a second copy that
+// could drift from the dataset template's judgment over time.
+export const preferAverage = (name: string) =>
   /(tenure|age|score|rate|ratio|percent|%|duration|salary|price|days|balance|index|rating)/i.test(
     name,
   );
@@ -712,7 +759,7 @@ const preferAverage = (name: string) =>
 // schema and still has to be a real column, so an "id"-typed column is
 // used here as the clearest, least-arbitrary label for what the count is
 // counting; it no longer affects the computed number itself.
-const pickCountField = (table: ParsedTable): string => {
+export const pickCountField = (table: ParsedTable): string => {
   const idColumn = table.columnsWithTypes.find((c) => c.inferredType === "id");
   return idColumn?.name ?? table.columns[0] ?? "id";
 };
@@ -729,7 +776,10 @@ const pickCountField = (table: ParsedTable): string => {
  * template sentence structure, but every number and name in it is read
  * from this table's real rows, never invented or shared across tables.
  */
-function buildTableInsight(table: ParsedTable, insightId: string) {
+// Exported for lib/sessionFallback.ts, same reasoning as preferAverage above:
+// the combined-session fallback computes each table's insight from real rows
+// through this exact function instead of a drifting copy.
+export function buildTableInsight(table: ParsedTable, insightId: string) {
   const numCols = table.columnsWithTypes.filter((c) => c.inferredType === "numeric");
   const catCols = table.columnsWithTypes.filter(
     (c) => c.inferredType === "categorical" || c.inferredType === "text",
@@ -962,6 +1012,22 @@ export async function processIngestionDirectly(
         );
 
       // 1. Executive Overview Tab
+      // KPI slots draw from GROUP LEADERS (first parsed table of each
+      // logical sheet), never from a sibling continuation block -- otherwise
+      // a branded workbook's overview would feature "README" twice.
+      const groupLeaderTables: ParsedTable[] = [];
+      {
+        const seenGroups = new Set<string>();
+        for (const t of tables) {
+          const key = logicalSheetGroup(t.name);
+          if (!seenGroups.has(key)) {
+            seenGroups.add(key);
+            groupLeaderTables.push(t);
+          }
+        }
+      }
+      // Overview pie source uses the SECOND logical sheet, not a sibling block.
+
       const overviewWidgets: any[] = [];
 
       overviewWidgets.push({
@@ -974,7 +1040,7 @@ export async function processIngestionDirectly(
         position: { col: 0, row: 0, w: 3, h: 2 },
       });
 
-      tables.slice(0, 3).forEach((table, idx) => {
+      groupLeaderTables.slice(0, 3).forEach((table, idx) => {
         const nums = realNumCols(table);
         if (nums[0]) {
           const useAvg = preferAverage(nums[0].name);
@@ -1040,7 +1106,8 @@ export async function processIngestionDirectly(
         }
       }
 
-      const t1 = tables[1] || tables[0];
+      const t1b = groupLeaderTables[1] ?? groupLeaderTables[0];
+      const t1 = groupLeaderTables[1] ?? groupLeaderTables[0] ?? tables[0];
       if (t1) {
         const cats = chartCatCols(t1);
         const catCol = cats[0]?.name;
@@ -1074,142 +1141,171 @@ export async function processIngestionDirectly(
         widgets: overviewWidgets,
       });
 
-      // 2. Specialized Tab for each Sheet
-      tables.forEach((table, tIdx) => {
-        const widgets: any[] = [];
-        const numCols = realNumCols(table);
-        const catCols = realCatCols(table);
-        // Only genuinely low-cardinality columns get handed to a chart --
-        // see chartCatCols above for why "text" is excluded.
-        const chartCats = chartCatCols(table);
-        const dateCols = table.columnsWithTypes.filter((c) => c.inferredType === "date");
-
-        widgets.push({
-          widgetId: `t_${tIdx + 1}_kpi_1`,
-          type: "kpi_card",
-          title: `${table.name} Records`,
-          sourceTable: table.name,
-          fields: [table.columns[0] || "id"],
-          aggregation: "count",
-          position: { col: 0, row: 0, w: 4, h: 2 },
-        });
-
-        if (numCols[0]) {
-          const useAvg = preferAverage(numCols[0].name);
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_kpi_2`,
-            type: "kpi_card",
-            title: `${useAvg ? "Average" : "Total"} ${numCols[0].name}`,
-            sourceTable: table.name,
-            fields: [numCols[0].name],
-            aggregation: useAvg ? "avg" : "sum",
-            position: { col: 4, row: 0, w: 4, h: 2 },
-          });
-        }
-
-        if (numCols[1] || numCols[0]) {
-          const colToUse = numCols[1] || numCols[0];
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_kpi_3`,
-            type: "kpi_card",
-            title: `Average ${colToUse.name}`,
-            sourceTable: table.name,
-            fields: [colToUse.name],
-            aggregation: "avg",
-            position: { col: 8, row: 0, w: 4, h: 2 },
-          });
-        } else if (catCols[0]) {
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_kpi_3`,
-            type: "kpi_card",
-            title: `Distinct ${catCols[0].name}`,
-            sourceTable: table.name,
-            fields: [catCols[0].name],
-            aggregation: "distinct",
-            position: { col: 8, row: 0, w: 4, h: 2 },
-          });
-        }
-
-        // Chart axis: a genuinely low-cardinality categorical column, or
-        // (for a bar, which tolerates more ticks than a pie) a date
-        // column bucketed. Never table.columns[0] blindly -- that used to
-        // fall through to whatever the first column in the sheet happened
-        // to be (frequently a Name or ID column), which is the exact
-        // defect that put 72 individual names on one chart.
-        const xCol = chartCats[0]?.name || dateCols[0]?.name;
-        const yCol = numCols[0]?.name;
-
-        if (xCol) {
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_chart_1`,
-            type: "bar",
-            title: `${table.name} Breakdown by ${xCol}`,
-            sourceTable: table.name,
-            fields: yCol ? [xCol, yCol] : [xCol],
-            aggregation: yCol ? "sum" : "count",
-            position: { col: 0, row: 2, w: 6, h: 4 },
-          });
+      // 2. One specialized tab per LOGICAL sheet: every parsed block of the
+      // same underlying worksheet ("Onboarding" + "Onboarding (2)") renders
+      // inside that sheet's single tab as vertically stacked sections. This
+      // removes the duplicated-tabs experience for branded / multi-block
+      // workbooks WITHOUT discarding real companion tables (verified live:
+      // Treelife's "README (2)" docs table and "Onboarding (2)" quarterly
+      // actuals are genuine data). See logicalSheetGroup above.
+      const sheetGroups = new Map<string, ParsedTable[]>();
+      for (const table of tables) {
+        const key = logicalSheetGroup(table.name);
+        const list = sheetGroups.get(key);
+        if (list) {
+          list.push(table);
         } else {
-          // No column on this sheet has low enough cardinality to chart
-          // (every candidate is effectively one distinct value per row).
-          // A raw-rows table is always valid and, unlike a guessed chart
-          // axis, never misrepresents the data.
+          sheetGroups.set(key, [table]);
+        }
+      }
+
+      let tabIndex = 0;
+      let widgetIdCounter = 0;
+
+      for (const [groupName, groupTables] of sheetGroups) {
+        const widgets: any[] = [];
+        let rowOffset = 0;
+
+        for (const table of groupTables) {
+          const tid = ++widgetIdCounter;
+          const numCols = realNumCols(table);
+          const catCols = realCatCols(table);
+          // Only genuinely low-cardinality columns get handed to a chart --
+          // see chartCatCols above for why "text" is excluded.
+          const chartCats = chartCatCols(table);
+          const dateCols = table.columnsWithTypes.filter((c) => c.inferredType === "date");
+
           widgets.push({
-            widgetId: `t_${tIdx + 1}_chart_1`,
-            type: "table",
+            widgetId: `t_${tid}_kpi_1`,
+            type: "kpi_card",
             title: `${table.name} Records`,
             sourceTable: table.name,
-            fields: table.columns.slice(0, 6),
-            aggregation: "none",
-            position: { col: 0, row: 2, w: 6, h: 4 },
-          });
-        }
-
-        if (dateCols[0] && numCols[0]) {
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_chart_2`,
-            type: "line",
-            title: `${numCols[0].name} Trend over ${dateCols[0].name}`,
-            sourceTable: table.name,
-            fields: [dateCols[0].name, numCols[0].name],
-            aggregation: "sum",
-            position: { col: 6, row: 2, w: 6, h: 4 },
-          });
-        } else if (chartCats[1] || (chartCats[0] && numCols[1])) {
-          const secondX = chartCats[1]?.name || chartCats[0]!.name;
-          const secondY = numCols[1]?.name || numCols[0]?.name;
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_chart_2`,
-            type: "horizontal_bar",
-            title: `${table.name} Analysis (${secondX})`,
-            sourceTable: table.name,
-            fields: secondY ? [secondX, secondY] : [secondX],
-            aggregation: secondY ? "avg" : "count",
-            position: { col: 6, row: 2, w: 6, h: 4 },
-          });
-        } else if (chartCats[0]) {
-          // A pie tolerates fewer slices than a bar can tolerate ticks, so
-          // unlike xCol above this branch never falls back to a date
-          // column -- only a genuinely low-cardinality categorical works.
-          widgets.push({
-            widgetId: `t_${tIdx + 1}_chart_2`,
-            type: "pie",
-            title: `${table.name} Share Distribution`,
-            sourceTable: table.name,
-            fields: [chartCats[0].name],
+            fields: [table.columns[0] || "id"],
             aggregation: "count",
-            position: { col: 6, row: 2, w: 6, h: 4 },
+            position: { col: 0, row: rowOffset, w: 4, h: 2 },
           });
+
+          if (numCols[0]) {
+            const useAvg = preferAverage(numCols[0].name);
+            widgets.push({
+              widgetId: `t_${tid}_kpi_2`,
+              type: "kpi_card",
+              title: `${useAvg ? "Average" : "Total"} ${numCols[0].name}`,
+              sourceTable: table.name,
+              fields: [numCols[0].name],
+              aggregation: useAvg ? "avg" : "sum",
+              position: { col: 4, row: rowOffset, w: 4, h: 2 },
+            });
+          }
+
+          if (numCols[1] || numCols[0]) {
+            const colToUse = numCols[1] || numCols[0];
+            widgets.push({
+              widgetId: `t_${tid}_kpi_3`,
+              type: "kpi_card",
+              title: `Average ${colToUse.name}`,
+              sourceTable: table.name,
+              fields: [colToUse.name],
+              aggregation: "avg",
+              position: { col: 8, row: rowOffset, w: 4, h: 2 },
+            });
+          } else if (catCols[0]) {
+            widgets.push({
+              widgetId: `t_${tid}_kpi_3`,
+              type: "kpi_card",
+              title: `Distinct ${catCols[0].name}`,
+              sourceTable: table.name,
+              fields: [catCols[0].name],
+              aggregation: "distinct",
+              position: { col: 8, row: rowOffset, w: 4, h: 2 },
+            });
+          }
+
+          // Chart axis: a genuinely low-cardinality categorical column, or
+          // (for a bar, which tolerates more ticks than a pie) a date
+          // column bucketed. Never table.columns[0] blindly -- that used to
+          // fall through to whatever the first column in the sheet happened
+          // to be (frequently a Name or ID column), which is the exact
+          // defect that put 72 individual names on one chart.
+          const xCol = chartCats[0]?.name || dateCols[0]?.name;
+          const yCol = numCols[0]?.name;
+
+          if (xCol) {
+            widgets.push({
+              widgetId: `t_${tid}_chart_1`,
+              type: "bar",
+              title: `${table.name} Breakdown by ${xCol}`,
+              sourceTable: table.name,
+              fields: yCol ? [xCol, yCol] : [xCol],
+              aggregation: yCol ? "sum" : "count",
+              position: { col: 0, row: rowOffset + 2, w: 6, h: 4 },
+            });
+          } else {
+            // No column on this sheet has low enough cardinality to chart
+            // (every candidate is effectively one distinct value per row).
+            // A raw-rows table is always valid and, unlike a guessed chart
+            // axis, never misrepresents the data.
+            widgets.push({
+              widgetId: `t_${tid}_chart_1`,
+              type: "table",
+              title: `${table.name} Records`,
+              sourceTable: table.name,
+              fields: table.columns.slice(0, 6),
+              aggregation: "none",
+              position: { col: 0, row: rowOffset + 2, w: 6, h: 4 },
+            });
+          }
+
+          if (dateCols[0] && numCols[0]) {
+            widgets.push({
+              widgetId: `t_${tid}_chart_2`,
+              type: "line",
+              title: `${numCols[0].name} Trend over ${dateCols[0].name}`,
+              sourceTable: table.name,
+              fields: [dateCols[0].name, numCols[0].name],
+              aggregation: "sum",
+              position: { col: 6, row: rowOffset + 2, w: 6, h: 4 },
+            });
+          } else if (chartCats[1] || (chartCats[0] && numCols[1])) {
+            const secondX = chartCats[1]?.name || chartCats[0]!.name;
+            const secondY = numCols[1]?.name || numCols[0]?.name;
+            widgets.push({
+              widgetId: `t_${tid}_chart_2`,
+              type: "horizontal_bar",
+              title: `${table.name} Analysis (${secondX})`,
+              sourceTable: table.name,
+              fields: secondY ? [secondX, secondY] : [secondX],
+              aggregation: secondY ? "avg" : "count",
+              position: { col: 6, row: rowOffset + 2, w: 6, h: 4 },
+            });
+          } else if (chartCats[0]) {
+            // A pie tolerates fewer slices than a bar can tolerate ticks, so
+            // unlike xCol above this branch never falls back to a date
+            // column -- only a genuinely low-cardinality categorical works.
+            widgets.push({
+              widgetId: `t_${tid}_chart_2`,
+              type: "pie",
+              title: `${table.name} Share Distribution`,
+              sourceTable: table.name,
+              fields: [chartCats[0].name],
+              aggregation: "count",
+              position: { col: 6, row: rowOffset + 2, w: 6, h: 4 },
+            });
+          }
+
+          // Each table's section occupies 4 grid rows (KPI strip + charts)
+          // plus two breathing rows before the next table in this tab.
+          rowOffset += 6;
+
+          generatedInsights.push(buildTableInsight(table, `ins_${tid}`));
         }
 
         generatedTabs.push({
-          tabId: `tab_${tIdx + 1}`,
-          tabName: table.name,
+          tabId: `tab_${++tabIndex}`,
+          tabName: groupName,
           widgets,
         });
-
-        generatedInsights.push(buildTableInsight(table, `ins_${tIdx + 1}`));
-      });
+      }
 
       // A genuine cross-sheet insight, not just the per-table ones above --
       // without this, even a successful fallback left the overview page
@@ -1297,51 +1393,14 @@ export async function processIngestionDirectly(
     // through one at a time.
     dashboardConfig.datasetId = String(datasetId);
 
-    const normalizedTablesForValidation = buildNormalizedTables(tables);
-    const schemaCheck = dashboardConfigSchema.safeParse(dashboardConfig);
-
-    if (!schemaCheck.success) {
-      throw new Error(
-        `Generated dashboard config failed schema validation, refusing to store: ${JSON.stringify(schemaCheck.error.issues)}`,
-      );
-    }
-
-    const chartAxisProblems = findHighCardinalityChartAxes(
-      schemaCheck.data,
-      normalizedTablesForValidation as any,
+    // Same four-check gate every other config write site uses -- see
+    // validateAndResolveCandidateConfig above for why it's one shared
+    // function rather than a third inline copy.
+    dashboardConfig = await validateAndResolveCandidateConfig(
+      dashboardConfig,
+      tables,
+      "dashboard config",
     );
-
-    if (chartAxisProblems.length > 0) {
-      throw new Error(
-        `Generated dashboard config charts a near-unique column as a category axis, refusing to store: ${chartAxisProblems.join("; ")}`,
-      );
-    }
-
-    const unresolvableFinalMetrics = findUnresolvableMetrics(
-      schemaCheck.data.insights,
-      normalizedTablesForValidation as any,
-    );
-
-    if (unresolvableFinalMetrics.length > 0) {
-      throw new Error(
-        `Generated dashboard config has insight metrics that don't resolve against real data, refusing to store: ${unresolvableFinalMetrics.join("; ")}`,
-      );
-    }
-
-    const resolvedFinalConfig = {
-      ...schemaCheck.data,
-      insights: resolveInsightMetrics(schemaCheck.data.insights, normalizedTablesForValidation as any),
-    };
-
-    const resolvedSchemaCheck = resolvedDashboardConfigSchema.safeParse(resolvedFinalConfig);
-
-    if (!resolvedSchemaCheck.success) {
-      throw new Error(
-        `Resolved dashboard config failed schema validation, refusing to store: ${JSON.stringify(resolvedSchemaCheck.error.issues)}`,
-      );
-    }
-
-    dashboardConfig = resolvedSchemaCheck.data;
 
     // 4. Save Config -- version was previously hardcoded to 1 always, which
     // is correct for a dataset's first-ever ingestion but creates a second,
@@ -1701,24 +1760,28 @@ export async function attemptSingleAiModel(
 }
 
 /**
- * Phase B's own write: validates an AI-generated candidate exactly the
- * way Phase A validates its fallback (same four-check gate: schema,
- * chart-axis cardinality, metric resolution, resolved schema), then
- * writes it as the NEXT config version and marks the Job completed.
- * Called from upgradeDatasetConfigFunction after a model attempt
- * succeeds. Throws on validation failure -- the caller treats that as
- * "this candidate didn't pan out," not as a fatal ingestion error; Phase
- * A's fallback is already live and is never touched by this failing.
+ * The four-check gate every dashboard-config write in this app goes
+ * through before storage: raw schema -> chart-axis cardinality ->
+ * insight-metric resolvability -> metric resolution -> resolved schema.
+ * Extracted from the two inline copies below (processIngestionDirectly's
+ * Phase A fallback gate and finalizeConfigUpgrade's Phase B upgrade gate)
+ * because lib/sessionFallback.ts now needs the identical discipline for a
+ * third write site -- the combined-session deterministic overview -- and a
+ * fourth copy of this sequence pasted there would be exactly how the
+ * copies start drifting apart. `label` only parameterizes the error
+ * messages so each call site's logs stay as specific as they were when
+ * the checks were inline.
+ *
+ * Normalizes insights arrays (metrics/relatedTables defaulting) in place,
+ * same as both former inline copies did. Throws on any check failure --
+ * callers treat that as "this candidate doesn't get stored," never as a
+ * fatal pipeline error, because whatever was already live stays live.
  */
-export async function finalizeConfigUpgrade(
-  payload: Payload,
-  datasetId: number | string,
-  jobId: number | string,
+export async function validateAndResolveCandidateConfig(
   candidate: any,
   tables: ParsedTable[],
-): Promise<{ configVersion: number }> {
-  candidate.datasetId = String(datasetId);
-
+  label: string,
+): Promise<ResolvedDashboardConfigShape> {
   if (Array.isArray(candidate.insights)) {
     candidate.insights = candidate.insights.map((ins: any) => ({
       ...ins,
@@ -1732,7 +1795,7 @@ export async function finalizeConfigUpgrade(
 
   if (!schemaCheck.success) {
     throw new Error(
-      `AI-generated upgrade config failed schema validation, refusing to store: ${JSON.stringify(schemaCheck.error.issues)}`,
+      `${label} failed schema validation, refusing to store: ${JSON.stringify(schemaCheck.error.issues)}`,
     );
   }
 
@@ -1743,7 +1806,7 @@ export async function finalizeConfigUpgrade(
 
   if (chartAxisProblems.length > 0) {
     throw new Error(
-      `AI-generated upgrade config charts a near-unique column as a category axis, refusing to store: ${chartAxisProblems.join("; ")}`,
+      `${label} charts a near-unique column as a category axis, refusing to store: ${chartAxisProblems.join("; ")}`,
     );
   }
 
@@ -1754,7 +1817,7 @@ export async function finalizeConfigUpgrade(
 
   if (unresolvableMetrics.length > 0) {
     throw new Error(
-      `AI-generated upgrade config has insight metrics that don't resolve against real data, refusing to store: ${unresolvableMetrics.join("; ")}`,
+      `${label} has insight metrics that don't resolve against real data, refusing to store: ${unresolvableMetrics.join("; ")}`,
     );
   }
 
@@ -1767,11 +1830,37 @@ export async function finalizeConfigUpgrade(
 
   if (!resolvedSchemaCheck.success) {
     throw new Error(
-      `Resolved AI-generated upgrade config failed schema validation, refusing to store: ${JSON.stringify(resolvedSchemaCheck.error.issues)}`,
+      `Resolved ${label} failed schema validation, refusing to store: ${JSON.stringify(resolvedSchemaCheck.error.issues)}`,
     );
   }
 
-  const resolved: ResolvedDashboardConfigShape = resolvedSchemaCheck.data;
+  return resolvedSchemaCheck.data;
+}
+
+/**
+ * Phase B's own write: validates an AI-generated candidate through the
+ * exact same four-check gate Phase A validates its fallback with (see
+ * validateAndResolveCandidateConfig above), then writes it as the NEXT
+ * config version and marks the Job completed. Called from
+ * upgradeDatasetConfigFunction after a model attempt succeeds. Throws on
+ * validation failure -- the caller treats that as "this candidate didn't
+ * pan out," not as a fatal ingestion error; Phase A's fallback is already
+ * live and is never touched by this failing.
+ */
+export async function finalizeConfigUpgrade(
+  payload: Payload,
+  datasetId: number | string,
+  jobId: number | string,
+  candidate: any,
+  tables: ParsedTable[],
+): Promise<{ configVersion: number }> {
+  candidate.datasetId = String(datasetId);
+
+  const resolved: ResolvedDashboardConfigShape = await validateAndResolveCandidateConfig(
+    candidate,
+    tables,
+    "AI-generated upgrade config",
+  );
 
   const existingConfigs = await payload.find({
     collection: "configs",

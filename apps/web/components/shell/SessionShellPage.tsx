@@ -8,7 +8,7 @@ import type { ActiveSource, SingleSourceInfo } from "@/components/shell/types";
 import { DashboardRenderer, CombinedDashboardRenderer } from "@/components/dashboard/DashboardRenderer";
 import { DocumentSummaryRenderer } from "@/components/documents/DocumentSummaryRenderer";
 import { InsightsPanel } from "@/components/dashboard/InsightsPanel";
-import type { ResolvedDashboardConfigShape } from "@analytics/shared";
+import { CONFIG_SOURCE, type ResolvedDashboardConfigShape } from "@analytics/shared";
 import { formatNumber } from "@/lib/aggregate";
 import {
   Card,
@@ -54,6 +54,11 @@ type SessionInfo = {
   overview: {
     findings?: Finding[];
     config?: ResolvedDashboardConfigShape;
+    // Which pipeline produced the live overview: "initial_fallback" means
+    // the fast deterministic template POST /api/sessions wrote, and the
+    // decoupled AI upgrade (upgradeSessionOverviewFunction) may still
+    // replace it -- which is what the polling below waits for.
+    configSource?: string;
   };
 };
 
@@ -62,16 +67,33 @@ type Phase =
   | { kind: "error"; title: string; detail?: string | null }
   | { kind: "ready"; session: SessionInfo };
 
+// While the live overview is still Phase A's deterministic fallback, poll
+// for the decoupled AI upgrade landing. 15s cadence, capped at ~10 minutes:
+// long enough to outlast any realistic model chain (the old synchronous path
+// measured 231s), short enough that a permanently-failed upgrade (no API
+// key, exhausted quota) stops polling instead of running forever -- the
+// fallback stays fully usable either way, so the cap costs nothing.
+const UPGRADE_POLL_INTERVAL_MS = 15_000;
+const UPGRADE_MAX_POLLS = 40;
+
 export const SessionShellPage = ({ sessionId }: { sessionId: string }) => {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [refreshToken, setRefreshToken] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const stopPolling = (): void => {
+      if (pollTimer !== null) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
 
     void (async () => {
       try {
-        const session = await fetchJsonCached<SessionInfo>(
+        let session = await fetchJsonCached<SessionInfo>(
           `/api/sessions/${sessionId}`,
           refreshToken > 0 ? 0 : 60_000,
         );
@@ -81,6 +103,48 @@ export const SessionShellPage = ({ sessionId }: { sessionId: string }) => {
         }
 
         setPhase({ kind: "ready", session });
+
+        // Poll ONLY while the overview is still the deterministic fallback
+        // (overview.configSource === "initial_fallback"). Any other value --
+        // an AI upgrade, a manual edit, or no marker at all (single-source
+        // sessions never have one) -- means nothing is coming that this page
+        // needs to notice, so no polling happens at all.
+        let polls = 0;
+
+        while (
+          !cancelled &&
+          polls < UPGRADE_MAX_POLLS &&
+          session?.overview?.configSource === CONFIG_SOURCE.initialFallback
+        ) {
+          polls += 1;
+
+          await new Promise<void>((resolve) => {
+            pollTimer = setTimeout(resolve, UPGRADE_POLL_INTERVAL_MS);
+          });
+
+          if (cancelled) {
+            return;
+          }
+
+          try {
+            // ttl 0 + allowStale=false forces a real network fetch each
+            // time: fetchJsonCached's default stale-while-revalidate would
+            // keep returning the cached fallback snapshot without ever
+            // re-rendering on its background update.
+            session = await fetchJsonCached<SessionInfo>(
+              `/api/sessions/${sessionId}`,
+              0,
+              false,
+            );
+
+            if (!cancelled) {
+              setPhase({ kind: "ready", session });
+            }
+          } catch {
+            // A transient poll failure is not fatal -- the next tick
+            // retries; the currently rendered fallback stays valid.
+          }
+        }
       } catch (error: unknown) {
         if (!cancelled) {
           setPhase({
@@ -89,11 +153,14 @@ export const SessionShellPage = ({ sessionId }: { sessionId: string }) => {
             detail: error instanceof Error ? error.message : String(error),
           });
         }
+      } finally {
+        stopPolling();
       }
     })();
 
     return () => {
       cancelled = true;
+      stopPolling();
     };
   }, [sessionId, refreshToken]);
 
@@ -224,6 +291,16 @@ const SessionReady = ({ session, refreshToken }: { session: SessionInfo; refresh
           tables={overviewTables}
         />
       </header>
+
+      {/* Honest provenance note: while the Overview tab shows Phase A's fast
+          deterministic template, say so, and promise the upgrade the page is
+          actively polling for -- instead of silently swapping content later. */}
+      {session.overview?.configSource === CONFIG_SOURCE.initialFallback ? (
+        <p className="rounded-xl border border-[color:var(--color-cloud)] bg-[color:var(--color-cloud-light)]/60 px-4 py-2 text-xs font-medium text-[color:var(--color-steel)]">
+          Showing the instant template overview built from your files' real rows. An
+          AI-synthesized version is being prepared and will replace this automatically.
+        </p>
+      ) : null}
 
       {session.status === "failed" ? (
         <ErrorState

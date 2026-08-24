@@ -1,6 +1,7 @@
 import { fileTypeFromFilename } from "@/lib/fileType";
 import { requireUser } from "@/lib/auth";
 import { getCache, setCache, invalidateCache } from "@/lib/cache";
+import { CONFIG_SOURCE } from "@analytics/shared";
 
 export const runtime = "nodejs";
 
@@ -101,7 +102,21 @@ export async function GET(
       updatedAt: session.updatedAt,
     };
 
-    setCache(cacheKey, payloadResponse, 30_000);
+    // Cache the detail response EXCEPT while the overview is still the
+    // deterministic fallback: Phase B (upgradeSessionOverviewFunction) runs
+    // in a different process, so its finalize write cannot clear THIS
+    // process's in-memory cache -- and the session page polls this exact
+    // endpoint every ~15s precisely to notice that upgrade landing. Serving
+    // 30s-stale "still fallback" responses to those polls would defeat the
+    // whole mechanism. Once any upgrade lands, configSource flips away from
+    // initial_fallback and normal 30s caching resumes.
+    const overviewSource = (
+      session.overview as { configSource?: string } | null | undefined
+    )?.configSource;
+
+    if (overviewSource !== CONFIG_SOURCE.initialFallback) {
+      setCache(cacheKey, payloadResponse, 30_000);
+    }
 
     return Response.json(payloadResponse);
   } catch {

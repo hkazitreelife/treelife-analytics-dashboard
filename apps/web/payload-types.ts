@@ -351,7 +351,7 @@ export interface Session {
   documents?: (number | Document)[] | null;
   status: 'synthesizing' | 'ready' | 'failed';
   /**
-   * { findings: ResolvedSessionFindingShape[] }. Written only after every finding resolves and verifies; an empty findings array is a valid, common result.
+   * { config?: ResolvedDashboardConfigShape, findings: ResolvedSessionFindingShape[], configSource?: 'initial_fallback' | 'initial_auto_generation' | 'prompt_edit' }. Phase A (POST /api/sessions) writes the deterministic combined dashboard immediately with configSource 'initial_fallback'; Phase B (the upgrade-session-overview Inngest function) replaces it only when a genuine AI improvement verifies, flipping configSource to 'initial_auto_generation'. Findings are written only after every one resolves and verifies; an empty findings array is a valid, common result.
    */
   overview?:
     | {
